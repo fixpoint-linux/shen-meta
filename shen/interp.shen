@@ -2,8 +2,14 @@
 (load "shen/util.shen")
 (load "shen/zinc.shen")
 
-\* Global symbol table - association list of [name . closure] pairs *\
+\* Defun table - association list of [name . closure] pairs *\
 (set global-table [])
+
+\* Values table - separate association list of [name . value] pairs.
+   The metacircular interp's value/set resolve through these two tables:
+   global-table for defuns (read by lookup-global), value-table for
+   runtime (set X V) bindings (read by interp-value). *\
+(set value-table [])
 
 (define lookup-global { symbol --> zinc-value }
   G -> (let Table (value global-table)
@@ -11,6 +17,21 @@
            (if (empty? Pair)
                (simple-error (cn "global not found: " (str G)))
                (hd (tl Pair))))))
+
+\* interp-value: resolve (value S) in interpreted code.  Search the Shen
+   value-table (namespace 2) first; if not found there, fall through to the
+   C values table (namespace 1) via %% value.  %% value / %% set reach the
+   C primitives directly (the Shen value-table list is itself stored as the
+   C values-table key "value-table"). *\
+(define interp-value { symbol --> zinc-value }
+  S -> (let Pair (assoc S (%% value value-table))
+         (if (empty? Pair)
+             (%% value S)
+             (hd (tl Pair)))))
+
+(define interp-set { symbol --> zinc-value --> zinc-value }
+  S V -> (do (%% set value-table (cons [S V] (%% value value-table)))
+             V))
 
 \* Reference implementation, this is basically a transliteration
   of the rules in the paper *\
@@ -255,7 +276,7 @@
 (set-toplevel string->n safe.string->n)
 (set-toplevel str safe.str)
 (set-toplevel tlstr safe.tlstr)
-(set-toplevel value safe.value)
+(set-toplevel value interp-value)
 (set-toplevel intern safe.intern)
 (set-toplevel error-to-string safe.error-to-string)
 (set-toplevel trap-error safe.trap-error)
@@ -275,7 +296,7 @@
 (set-toplevel >= safe.>=)
 (set-toplevel < safe.<)
 (set-toplevel > safe.>)
-(set-toplevel set safe.set)
+(set-toplevel set interp-set)
 (set-toplevel - safe.-)
 (set-toplevel * safe.*)
 (set-toplevel / safe./)

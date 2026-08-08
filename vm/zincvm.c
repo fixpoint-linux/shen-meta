@@ -2472,6 +2472,12 @@ int vm_load_bundle(const char *buf) {
        interp-eval / set-toplevel to register new defuns at runtime. */
     value_set("global-table", val_nil());
 
+    /* Initialize the Shen value-table variable.  The metacircular
+       interp's interp-value / interp-set read/write (value value-table)
+       as a separate values assoc list (namespace 2); it must start as an
+       empty alist so a not-found assoc returns [] (not the bare symbol). */
+    value_set("value-table", val_nil());
+
     return n;
 }
 
