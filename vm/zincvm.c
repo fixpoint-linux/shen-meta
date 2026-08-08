@@ -375,14 +375,37 @@ int defun_table_used = 0;
 TableEntry values_table[VALUES_TABLE_CAP];
 int values_table_used = 0;
 
-/* Capacity registers for the GC: because both tables are open-addressed,
- * live entries are scattered across the full array, so the GC must scan
- * the whole capacity and skip empty (name==NULL) slots rather than
- * trusting the dense `used` count. */
+/* Capacity registers for the GC: the defun table is a minimal perfect
+ * hash (slots [0, N) filled, overflow tail [N, N+64) partially filled),
+ * and the values table is open-addressed — in both cases live entries are
+ * not dense, so the GC must scan the whole capacity and skip empty
+ * (name==NULL) slots rather than trusting the `used` count.  The GC reads
+ * these via pointer at scan time, so defun_freeze() updating
+ * defun_table_cap to N+DEFUN_OVERFLOW_CAP is safe. */
 int defun_table_cap = DEFUN_TABLE_CAP;
 int values_table_cap = VALUES_TABLE_CAP;
 
-/* FNV-1a hash over the name, reduced mod the table capacity. */
+/* Minimal perfect hash state.  After defun_freeze(), defun_table holds
+   the N unique bundle keys in a collision-free (bucket, displacement)
+   layout.  Runtime defun_set/get use this table plus a small overflow
+   tail for keys that appear after bundle load (zinctest test keys). */
+int defun_table_size = 0;        /* N: perfect slots */
+int defun_buckets = 0;           /* B */
+uint32_t *defun_displacement = NULL;
+
+/* Bootstrap mode: before defun_freeze() (during init_globals + parse_bundle
+   + keyword registration) all defun_set() calls accumulate into this growable
+   list instead of touching defun_table.  defun_freeze() consumes it once. */
+typedef struct { const char *name; Value value; } BootstrapEntry;
+static BootstrapEntry *bootstrap_keys = NULL;
+static int bootstrap_count = 0;
+static int bootstrap_cap = 0;
+static enum { DEFUN_BOOTSTRAP, DEFUN_RUNTIME } defun_mode = DEFUN_BOOTSTRAP;
+
+/* FNV-1a over the name.  hash_name (reduced mod cap) is retained for the
+   open-addressed VALUES table.  hash_name_h0 (raw) is the primary bucket
+   hash; hash_name_h1 (raw, seeded) is the displacement/slot hash used to
+   place keys during the perfect-hash build and to look them up at runtime. */
 static uint32_t hash_name(const char *name, int cap) {
     uint32_t h = 2166136261u;
     for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
@@ -392,37 +415,103 @@ static uint32_t hash_name(const char *name, int cap) {
     return h % (uint32_t)cap;
 }
 
-/* defun_table stores name→closure/primitiv/keyword bindings, reached by
-   [global X].  Open-address insert with linear probing; each store marks
-   the GC dirty bit so the nursery scavenge re-scans the slot. */
-void defun_set(const char *name, Value v) {
-    if (defun_table_used >= DEFUN_TABLE_CAP - 1) {
-        fprintf(stderr, "defun table full (%d entries) on '%s'\n",
-                DEFUN_TABLE_CAP, name);
-        exit(1);
+static uint32_t hash_name_h0(const char *name) {
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        h ^= (uint32_t)*p;
+        h *= 16777619u;
     }
-    uint32_t idx = hash_name(name, DEFUN_TABLE_CAP);
-    while (defun_table[idx].name != NULL) {
-        if (strcmp(defun_table[idx].name, name) == 0) {
-            defun_table[idx].value = v;
-            gc_dirty_defuns_mark((int)idx);
+    return h;
+}
+
+static uint32_t hash_name_h1(const char *name, uint32_t seed) {
+    uint32_t h = seed;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        h ^= (uint32_t)*p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* defun_set stores name→closure/primitive/keyword bindings, reached by
+   [global X].  Two modes:
+     DEFUN_BOOTSTRAP — accumulate into bootstrap_keys (never touches the
+       GC-scanned defun_table; used during init_globals/parse_bundle).
+     DEFUN_RUNTIME   — perfect-hash insert/update, then overflow tail.
+   Each store marks the GC dirty bit so the nursery scavenge re-scans the
+   slot (runtime slots may reference nursery objects). */
+void defun_set(const char *name, Value v) {
+    if (defun_mode == DEFUN_BOOTSTRAP) {
+        for (int i = 0; i < bootstrap_count; i++) {
+            if (strcmp(bootstrap_keys[i].name, name) == 0) {
+                bootstrap_keys[i].value = v;   /* later store wins */
+                return;
+            }
+        }
+        if (bootstrap_count >= bootstrap_cap) {
+            int nc = bootstrap_cap ? bootstrap_cap * 2 : 64;
+            BootstrapEntry *nk = realloc(bootstrap_keys, (size_t)nc * sizeof(BootstrapEntry));
+            if (!nk) { fprintf(stderr, "defun bootstrap OOM\n"); exit(1); }
+            bootstrap_keys = nk;
+            bootstrap_cap = nc;
+        }
+        bootstrap_keys[bootstrap_count].name = strdup(name);
+        bootstrap_keys[bootstrap_count].value = v;
+        bootstrap_count++;
+        defun_table_used = bootstrap_count;
+        return;
+    }
+
+    /* RUNTIME: perfect-hash slot */
+    uint32_t b = hash_name_h0(name) % (uint32_t)defun_buckets;
+    uint32_t d = defun_displacement[b];
+    uint32_t slot = hash_name_h1(name, d) % (uint32_t)defun_table_size;
+    if (defun_table[slot].name != NULL &&
+        strcmp(defun_table[slot].name, name) == 0) {
+        defun_table[slot].value = v;
+        gc_dirty_defuns_mark((int)slot);
+        return;
+    }
+    /* overflow tail: update existing */
+    for (int i = defun_table_size; i < defun_table_cap; i++) {
+        if (defun_table[i].name != NULL &&
+            strcmp(defun_table[i].name, name) == 0) {
+            defun_table[i].value = v;
+            gc_dirty_defuns_mark(i);
             return;
         }
-        idx = (idx + 1) % DEFUN_TABLE_CAP;
     }
-    defun_table[idx].name = strdup(name);
-    defun_table[idx].value = v;
-    gc_dirty_defuns_mark((int)idx);
-    defun_table_used++;
+    /* overflow tail: insert into first NULL slot */
+    for (int i = defun_table_size; i < defun_table_cap; i++) {
+        if (defun_table[i].name == NULL) {
+            defun_table[i].name = strdup(name);
+            defun_table[i].value = v;
+            gc_dirty_defuns_mark(i);
+            defun_table_used++;
+            return;
+        }
+    }
+    fprintf(stderr, "defun overflow table full on '%s'\n", name);
+    exit(1);
 }
 
 static int exec_primitive_valid(const char *name);
 Value defun_get(const char *name) {
-    uint32_t idx = hash_name(name, DEFUN_TABLE_CAP);
-    while (defun_table[idx].name != NULL) {
-        if (strcmp(defun_table[idx].name, name) == 0)
-            return defun_table[idx].value;
-        idx = (idx + 1) % DEFUN_TABLE_CAP;
+    if (defun_mode == DEFUN_BOOTSTRAP) {
+        for (int i = 0; i < bootstrap_count; i++)
+            if (strcmp(bootstrap_keys[i].name, name) == 0)
+                return bootstrap_keys[i].value;
+    } else {
+        uint32_t b = hash_name_h0(name) % (uint32_t)defun_buckets;
+        uint32_t d = defun_displacement[b];
+        uint32_t slot = hash_name_h1(name, d) % (uint32_t)defun_table_size;
+        if (defun_table[slot].name != NULL &&
+            strcmp(defun_table[slot].name, name) == 0)
+            return defun_table[slot].value;
+        for (int i = defun_table_size; i < defun_table_cap; i++)
+            if (defun_table[i].name != NULL &&
+                strcmp(defun_table[i].name, name) == 0)
+                return defun_table[i].value;
     }
     /* Only return VAL_PRIM for known C primitives. Unknown names
        (e.g., *macros*, *stinput*) must be VAL_SYMBOL so that
@@ -471,10 +560,18 @@ Value value_get(const char *name) {
 /* defun_is_defined: is `name` a known defun-table global or C primitive? */
 static int defun_is_defined(const char *name) {
     if (!name) return 0;
-    uint32_t idx = hash_name(name, DEFUN_TABLE_CAP);
-    while (defun_table[idx].name != NULL) {
-        if (strcmp(defun_table[idx].name, name) == 0) return 1;
-        idx = (idx + 1) % DEFUN_TABLE_CAP;
+    if (defun_mode == DEFUN_BOOTSTRAP) {
+        for (int i = 0; i < bootstrap_count; i++)
+            if (strcmp(bootstrap_keys[i].name, name) == 0) return 1;
+    } else {
+        uint32_t b = hash_name_h0(name) % (uint32_t)defun_buckets;
+        uint32_t d = defun_displacement[b];
+        uint32_t slot = hash_name_h1(name, d) % (uint32_t)defun_table_size;
+        if (defun_table[slot].name != NULL &&
+            strcmp(defun_table[slot].name, name) == 0) return 1;
+        for (int i = defun_table_size; i < defun_table_cap; i++)
+            if (defun_table[i].name != NULL &&
+                strcmp(defun_table[i].name, name) == 0) return 1;
     }
     if (exec_primitive_valid(name)) return 1;
     return 0;
@@ -2411,6 +2508,154 @@ int parse_bundle(const char *str) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  defun_freeze: build the minimal perfect hash                       */
+/* ------------------------------------------------------------------ */
+
+/* Build a bucket+displacement minimal perfect hash over the deduplicated
+ * bootstrap key set and lay it out in defun_table.  Called ONCE at the end
+ * of vm_load_bundle, when the full key set is known.  The C VM never
+ * executes `defun`, so bootstrap keys are exactly primitives + bundle
+ * closures + keywords.  After this, defun_mode flips to DEFUN_RUNTIME and
+ * the overflow tail handles any keys set after bundle load. */
+static void defun_freeze(void) {
+    /* 1. Deduplicate (later entries win — keywords override primitives/
+          closures with the same name, e.g. `cons`). */
+    BootstrapEntry *uniq = malloc((size_t)(bootstrap_count ? bootstrap_count : 1)
+                                  * sizeof(BootstrapEntry));
+    if (!uniq) { fprintf(stderr, "defun freeze OOM\n"); abort(); }
+    int N = 0;
+    for (int i = 0; i < bootstrap_count; i++) {
+        const char *nm = bootstrap_keys[i].name;
+        int found = -1;
+        for (int j = 0; j < N; j++)
+            if (strcmp(uniq[j].name, nm) == 0) { found = j; break; }
+        if (found >= 0)
+            uniq[found].value = bootstrap_keys[i].value;   /* later wins */
+        else {
+            uniq[N].name = strdup(nm);
+            uniq[N].value = bootstrap_keys[i].value;
+            N++;
+        }
+    }
+
+    /* The defun table was never written during bootstrap; zero it so the
+       perfect layout starts clean and the overflow tail is NULL. */
+    for (int i = 0; i < DEFUN_TABLE_CAP; i++)
+        defun_table[i].name = NULL;
+
+    /* 2..7. Bucket+displacement construction with a doubling safety valve
+       (should never fire). */
+    int B = (N / 2 < 1) ? 1 : N / 2;
+    uint32_t *disp = NULL;
+    bool *used = NULL;
+    int built = 0;
+
+    while (!built) {
+        /* Partition keys into B buckets by h0(key) % B. */
+        int *bsize = calloc((size_t)B, sizeof(int));
+        for (int k = 0; k < N; k++)
+            bsize[hash_name_h0(uniq[k].name) % (uint32_t)B]++;
+
+        int *boff = malloc((size_t)(B + 1) * sizeof(int));
+        boff[0] = 0;
+        for (int i = 0; i < B; i++) boff[i + 1] = boff[i] + bsize[i];
+        int *bkeys = malloc((size_t)N * sizeof(int));
+        int *fill = calloc((size_t)B, sizeof(int));
+        for (int k = 0; k < N; k++) {
+            int b = hash_name_h0(uniq[k].name) % (uint32_t)B;
+            bkeys[boff[b] + fill[b]++] = k;
+        }
+
+        /* Sort bucket ids by size descending (largest first). */
+        int *order = malloc((size_t)B * sizeof(int));
+        for (int i = 0; i < B; i++) order[i] = i;
+        for (int i = 1; i < B; i++) {
+            int t = order[i], j = i - 1;
+            while (j >= 0 && bsize[order[j]] < bsize[t]) { order[j + 1] = order[j]; j--; }
+            order[j + 1] = t;
+        }
+
+        used = calloc((size_t)N, sizeof(bool));
+        disp = calloc((size_t)B, sizeof(uint32_t));
+        built = 1;
+
+        for (int oi = 0; oi < B; oi++) {
+            int b = order[oi];
+            int sz = bsize[b];
+            uint32_t d = 0;
+            int ok = 0;
+            for (; d < 1000000u; d++) {
+                int distinct = 1;
+                for (int x = 0; x < sz && distinct; x++) {
+                    int k = bkeys[boff[b] + x];
+                    uint32_t slot = hash_name_h1(uniq[k].name, d) % (uint32_t)N;
+                    if (used[slot]) { distinct = 0; break; }
+                    for (int y = 0; y < x && distinct; y++) {
+                        int k2 = bkeys[boff[b] + y];
+                        if (hash_name_h1(uniq[k2].name, d) % (uint32_t)N == slot)
+                            distinct = 0;
+                    }
+                }
+                if (distinct) { ok = 1; break; }
+            }
+            if (!ok) { built = 0; break; }   /* B too small → double and restart */
+            disp[b] = d;
+            for (int x = 0; x < sz; x++) {
+                int k = bkeys[boff[b] + x];
+                uint32_t slot = hash_name_h1(uniq[k].name, d) % (uint32_t)N;
+                defun_table[slot].name = (char *)uniq[k].name;
+                defun_table[slot].value = uniq[k].value;
+                used[slot] = true;
+            }
+        }
+
+        free(bsize); free(boff); free(bkeys); free(fill); free(order);
+        if (!built) { free(used); free(disp); B *= 2; }
+    }
+
+    /* 8. Assertion: every slot filled, no duplicate names (collision-free). */
+    for (int i = 0; i < N; i++) {
+        if (defun_table[i].name == NULL) {
+            fprintf(stderr, "defun_freeze: slot %d left empty (N=%d)\n", i, N);
+            abort();
+        }
+        for (int j = i + 1; j < N; j++) {
+            if (defun_table[j].name != NULL &&
+                strcmp(defun_table[i].name, defun_table[j].name) == 0) {
+                fprintf(stderr, "defun_freeze: duplicate name '%s' at slots %d,%d\n",
+                        defun_table[i].name, i, j);
+                abort();
+            }
+        }
+        /* The bundle closures were allocated in the nursery during bootstrap,
+         * before any collection.  Mark every perfect slot dirty so the FIRST
+         * nursery scavenge (which only rescans dirty defun slots) evacuates
+         * them to old-gen instead of reclaiming their code.  Without this,
+         * non-dirty perfect slots are skipped and the closures go stale. */
+        gc_dirty_defuns_mark(i);
+    }
+    printf("Perfect hash built: N=%d keys, B=%d buckets, "
+           "%d overflow slots — collision-free (all %d slots distinct)\n",
+           N, B, DEFUN_OVERFLOW_CAP, N);
+
+    defun_table_size = N;
+    defun_buckets = B;
+    defun_displacement = disp;
+    defun_mode = DEFUN_RUNTIME;
+    defun_table_used = N;
+    defun_table_cap = N + DEFUN_OVERFLOW_CAP;
+
+    /* 9. Free bootstrap state.  defun_table now OWNS the strdup'd names
+       (uniq[k].name); free the container arrays and the now-redundant
+       bootstrap key strings, but NOT the uniq names. */
+    for (int i = 0; i < bootstrap_count; i++) free((void *)bootstrap_keys[i].name);
+    free(bootstrap_keys);
+    bootstrap_keys = NULL; bootstrap_count = 0; bootstrap_cap = 0;
+    free(uniq);
+    free(used);
+}
+
+/* ------------------------------------------------------------------ */
 /*  vm_load_bundle: shared bundle-bootstrap for zincvm and zinctest    */
 /* ------------------------------------------------------------------ */
 
@@ -2477,6 +2722,10 @@ int vm_load_bundle(const char *buf) {
        as a separate values assoc list (namespace 2); it must start as an
        empty alist so a not-found assoc returns [] (not the bare symbol). */
     value_set("value-table", val_nil());
+
+    /* Freeze point: the full key set (primitives + bundle closures +
+       keywords) is now known.  Build the minimal perfect hash once. */
+    defun_freeze();
 
     return n;
 }

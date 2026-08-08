@@ -38,6 +38,12 @@
 #define DEFUN_TABLE_CAP  4096
 #define VALUES_TABLE_CAP 256
 
+/* Overflow tail appended to the perfect-hash defun table.  After
+ * defun_freeze() fills the N perfect slots, runtime defun_set() calls
+ * (from zinctest's GC/hygiene/eval test keys, all issued after bundle
+ * load) fall into this tail.  N + DEFUN_OVERFLOW_CAP <= DEFUN_TABLE_CAP. */
+#define DEFUN_OVERFLOW_CAP 64
+
 typedef struct { char *name; Value value; } TableEntry;
 
 /* GC scans these tables as raw uintptr_t words (conservative scan).
@@ -75,6 +81,9 @@ extern CatchFrame *vm_catch_chain;
 extern TableEntry defun_table[DEFUN_TABLE_CAP];
 extern int defun_table_used;
 extern int defun_table_cap;
+extern int defun_table_size;          /* N: perfect-hash slots (0 before freeze) */
+extern int defun_buckets;             /* B: bucket count for the perfect hash */
+extern uint32_t *defun_displacement;  /* per-bucket displacement table (B entries) */
 extern TableEntry values_table[VALUES_TABLE_CAP];
 extern int values_table_used;
 extern int values_table_cap;
