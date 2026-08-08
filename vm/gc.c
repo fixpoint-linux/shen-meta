@@ -1392,6 +1392,14 @@ static void *gcalloc_internal(size_t bytes, int type_tag) {
         freewords -= words;
         freep += words;
     } else {
+        /* Multi-page object: advance freep past it so the Cheney drain's
+         * `cp != freep` guard can still scan the object's first page.  If
+         * freep stayed at the object header and the drain dequeued this
+         * page before the next allocation moved freep, cp == freep and the
+         * whole page (and its nested closure_code children) was silently
+         * skipped.  freewords=0 still forces the next alloc through
+         * allocatepage, so allocation semantics are unchanged. */
+        freep += words;
         freewords = 0;
     }
 
