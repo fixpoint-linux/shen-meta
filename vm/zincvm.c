@@ -2456,6 +2456,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--gc-watch-alloc") == 0 && i + 1 < argc)
             gc_set_watch_alloc(strtoull(argv[++i], NULL, 0));
         if (strcmp(argv[i], "--gc-verify") == 0) gc_set_verify(1);
+        if (strcmp(argv[i], "--gc-verify-codechains") == 0) gc_set_verify_codechains(1);
     }
 
     if (argc > 1) {

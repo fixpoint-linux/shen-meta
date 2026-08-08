@@ -69,6 +69,7 @@ gcdebug: zinctest-debug
 	@echo "  --gc-page-transition-watch <page>  only log transitions of a specific page"
 	@echo "  --gc-watch-alloc <addr>     log every allocation/move of the object at <addr> (with backtrace)"
 	@echo "  --gc-verify                 run heap invariant check after each collection"
+	@echo "  --gc-verify-codechains   walk closure code chains from roots; flag ptrs into dead space"
 	@echo "  --gc-log <path>      write opt-in GC diagnostics to <path> instead of stderr"
 	@echo "  --trace <name>       (existing) trace a closure's bytecode execution"
 	@echo ""

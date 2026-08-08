@@ -110,6 +110,7 @@ static int      gc_page_transition = 0;       /* --gc-page-transition */
 static uintptr_t gc_page_transition_watch = 0; /* --gc-page-transition-watch (0 = watch all) */
 static uintptr_t gc_watch_alloc = 0;           /* --gc-watch-alloc (0 = off) */
 static int      gc_verify      = 0;           /* --gc-verify */
+static int      gc_verify_codechains = 0;  /* --gc-verify-codechains */
 
 void gc_set_verbose(int on)        { gc_verbose        = on; }
 void gc_set_check_closures(int on) { gc_check_closures = on; }
@@ -131,10 +132,12 @@ void gc_set_page_transition_watch(uintptr_t page) {
 }
 void gc_set_watch_alloc(uintptr_t addr) { gc_watch_alloc = addr; }
 void gc_set_verify(int on)              { gc_verify      = on; }
+void gc_set_verify_codechains(int on)   { gc_verify_codechains = on; }
 
 /* Forward-declared so collect() (defined earlier) can call it.  Defined
  * alongside the other opt-in helpers below gc_stale_scan_stack. */
 static void gc_verify_heap(const char *when);
+static void gc_verify_codechains_fn(const char *when);
 
 /* All opt-in diagnostic output routes through this; defaults to stderr.
  * Fatal error exits and the ROOT_PTR interior-pointer fatal stay on stderr. */
@@ -681,6 +684,7 @@ static void collect(const char *trigger) {
     /* Opt-in heap-invariant verification (--gc-verify).  Purely diagnostic;
      * never aborts, only logs. */
     gc_verify_heap("post-collect");
+    gc_verify_codechains_fn("post-collect");
 
     /* Restore the previous SIGALRM mask */
     sigprocmask(SIG_SETMASK, &old_sig_set, NULL);
@@ -873,6 +877,176 @@ static void gc_verify_heap(const char *when) {
 
     fprintf(GC_LOG, "[GC VERIFY #%ld] %s - pages=%ld objects=%ld errors=%d\n",
             gc_collect_seq, when, pages, objects, (int)errors);
+}
+
+/* ---- opt-in code-chain verifier (--gc-verify-codechains) ------------- */
+
+/* vc_code_is_live: true iff ptr is non-NULL and its page is in live space
+ * (the nursery or the active old-gen semi-space).  Mirrors the liveness
+ * test used by gc_check_closure / gc_scan_roots. */
+static int vc_code_is_live(const void *ptr) {
+    if (!ptr) return 1;
+    uintptr_t page = GCP_to_PAGE(ptr);
+    if (page < firstheappage || page > lastheappage) return 0;
+    return (space[page] == NURSERY || space[page] == current_space);
+}
+
+/* gc_verify_codechains_fn: walk every GC-reachable closure lambda.code chain
+ * from the precise roots (C global table, shadow stack, traced_code) after a
+ * collection and flag any code pointer whose page is not in live space.
+ * A bad>0 means a root points into dead space (a real root-miss — the
+ * collector failed to evacuate a reachable code chain); bad==0 with warnings
+ * only means the earlier GC-CHECK hits were benign transient closures.
+ * Pure diagnostic, default OFF, no GC allocation, never aborts. */
+static void gc_verify_codechains_fn(const char *when) {
+    if (!gc_verify_codechains) return;
+
+    #define VC_VISITED_MAX 4096
+    #define VC_MAX_DEPTH 64
+    #define VC_MAX_NODES 1000000
+
+    long roots_walked = 0, closures_found = 0, nodes_visited = 0, bad = 0;
+    int first_bad = 1;
+
+    static uintptr_t visited[VC_VISITED_MAX];
+    static int visited_len = 0;
+    visited_len = 0;
+
+    struct chain_frame { Instr *code; int code_len; const char *root_desc; };
+    struct chain_frame cstack[128];
+    int csp = 0;
+
+    #define PUSH_CHAIN(c, l, d) do { \
+        if (csp < 128 && (c)) { \
+            cstack[csp].code = (c); cstack[csp].code_len = (l); \
+            cstack[csp].root_desc = (d); csp++; \
+        } \
+    } while (0)
+
+    /* Shared drain loop: pop frames until the stack empties or the node cap
+     * is hit.  Each root walk PUSH_CHAINs then DRAINs (so the stack is empty
+     * again before the next root walk). */
+    #define DRAIN() do { \
+        while (csp > 0 && nodes_visited < VC_MAX_NODES) { \
+            struct chain_frame f = cstack[--csp]; \
+            Instr *code = f.code; \
+            if (code == NULL) continue; \
+            int already = 0; \
+            for (int vi = 0; vi < visited_len; vi++) \
+                if (visited[vi] == (uintptr_t)code) { already = 1; break; } \
+            if (already) continue; \
+            if (visited_len < VC_VISITED_MAX) \
+                visited[visited_len++] = (uintptr_t)code; \
+            if (!vc_code_is_live(code)) { \
+                if (first_bad) { \
+                    uintptr_t pg = GCP_to_PAGE(code); \
+                    fprintf(GC_LOG, "[GC VERIFY-CODE #%ld] %s: root='%s' field=lambda.code ptr=%p page=%lu space=%lu current=%lu\n", \
+                            gc_collect_seq, when, f.root_desc, (void *)code, \
+                            (unsigned long)pg, \
+                            (unsigned long)(pg >= firstheappage && pg <= lastheappage \
+                                            ? space[pg] : 0), \
+                            (unsigned long)current_space); \
+                    first_bad = 0; \
+                } \
+                bad++; \
+                continue; \
+            } \
+            for (int i = 0; i < f.code_len; i++) { \
+                nodes_visited++; \
+                if (nodes_visited > VC_MAX_NODES) break; \
+                if (code[i].op == OP_CUR && code[i].closure_code != NULL) { \
+                    if (!vc_code_is_live(code[i].closure_code)) { \
+                        if (first_bad) { \
+                            uintptr_t pg = GCP_to_PAGE(code[i].closure_code); \
+                            fprintf(GC_LOG, "[GC VERIFY-CODE #%ld] %s: root='%s' field=instr[i].closure_code ptr=%p page=%lu space=%lu current=%lu\n", \
+                                    gc_collect_seq, when, f.root_desc, \
+                                    (void *)code[i].closure_code, (unsigned long)pg, \
+                                    (unsigned long)(pg >= firstheappage && pg <= lastheappage \
+                                                    ? space[pg] : 0), \
+                                    (unsigned long)current_space); \
+                            first_bad = 0; \
+                        } \
+                        bad++; \
+                    } else { \
+                        PUSH_CHAIN(code[i].closure_code, code[i].closure_len, f.root_desc); \
+                    } \
+                } \
+            } \
+        } \
+    } while (0)
+
+    /* Root walk A — C global table (namespace 1, registered via reg_*). */
+    if (reg_global_table && reg_global_table_len) {
+        GlobalEntry *gt = (GlobalEntry *)reg_global_table;
+        int n = *reg_global_table_len;
+        char desc[128];
+        for (int i = 0; i < n; i++) {
+            roots_walked++;
+            if (gt[i].closure.tag == VAL_LAMBDA && gt[i].closure.lambda.code != NULL) {
+                closures_found++;
+                snprintf(desc, sizeof(desc), "global[%d]='%s'", i,
+                         gt[i].name ? gt[i].name : "?");
+                PUSH_CHAIN(gt[i].closure.lambda.code,
+                           gt[i].closure.lambda.code_len, desc);
+                DRAIN();
+            }
+        }
+    }
+
+    /* Root walk B — precise-root shadow stack. */
+    for (size_t i = 0; i < shadow_len; i++) {
+        GcRoot *r = &shadow_stack[i];
+        const Value *v;
+        int nvals;
+        switch (r->kind) {
+        case ROOT_VALUE:
+        case ROOT_VALUE_VOLATILE:
+            v = (const Value *)r->slot; nvals = 1; break;
+        case ROOT_VALUE_ARRAY:
+            v = (const Value *)r->slot; nvals = *(r->np); break;
+        default:
+            continue;   /* ROOT_PTR — interior pointer root, not a closure Value */
+        }
+        char desc[128];
+        for (int j = 0; j < nvals; j++) {
+            roots_walked++;
+            if (v[j].tag == VAL_LAMBDA && v[j].lambda.code != NULL) {
+                closures_found++;
+                snprintf(desc, sizeof(desc), "shadow[%zu]", i);
+                PUSH_CHAIN(v[j].lambda.code, v[j].lambda.code_len, desc);
+                DRAIN();
+            }
+        }
+    }
+
+    /* Root walk C — traced_code Instr arrays. */
+    if (reg_traced_code && reg_traced_code_len) {
+        int n = *reg_traced_code_len;
+        for (int i = 0; i < n; i++) {
+            if (reg_traced_code[i] && !vc_code_is_live(reg_traced_code[i])) {
+                if (first_bad) {
+                    uintptr_t pg = GCP_to_PAGE(reg_traced_code[i]);
+                    fprintf(GC_LOG, "[GC VERIFY-CODE #%ld] %s: root='traced_code[i]' field=lambda.code ptr=%p page=%lu space=%lu current=%lu\n",
+                            gc_collect_seq, when, (void *)reg_traced_code[i],
+                            (unsigned long)pg,
+                            (unsigned long)(pg >= firstheappage && pg <= lastheappage
+                                            ? space[pg] : 0),
+                            (unsigned long)current_space);
+                    first_bad = 0;
+                }
+                bad++;
+            }
+        }
+    }
+
+    fprintf(GC_LOG, "[GC VERIFY-CODE #%ld] %s roots=%ld closures=%ld nodes=%ld bad=%ld\n",
+            gc_collect_seq, when, roots_walked, closures_found, nodes_visited, bad);
+
+    #undef VC_VISITED_MAX
+    #undef VC_MAX_DEPTH
+    #undef VC_MAX_NODES
+    #undef PUSH_CHAIN
+    #undef DRAIN
 }
 
 /* ---- nursery collection (Phase 4b.2 — copying scavenge) ------------- */
@@ -1165,6 +1339,7 @@ static void collect_nursery(const char *trigger) {
     /* Opt-in heap-invariant verification (--gc-verify).  Purely diagnostic;
      * never aborts, only logs. */
     gc_verify_heap("post-nursery");
+    gc_verify_codechains_fn("post-nursery");
 
     in_scavenge = 0;
 
