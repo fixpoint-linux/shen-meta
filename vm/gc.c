@@ -172,46 +172,53 @@ void gc_check_closure(Value *cl, const char *where) {
                 where, (void *)code, (unsigned long)pg,
                 (unsigned long)space[pg], NURSERY, (unsigned long)current_space,
                 (void *)cl->lambda.env, cl->lambda.env_len, cl->lambda.code_len);
-        /* Decisive: does the SAME stale code pointer appear in the C global_table?
-           If yes, the global-table typed-walker scan failed to evacuate it during
-           the last full collect (a real GC bug in namespace-2 tracing). If no, the
-           stale closure is a transient local copy (C-stack / env) not the table's. */
-        if (global_table_len > 0) {
-            GlobalEntry *gt = global_table;
-            int gn = global_table_len;
+        /* Decisive: does the SAME stale code pointer appear in a registered
+           table (defun or values)?  If yes, the table typed-walker scan failed
+           to evacuate it during the last full collect (a real GC bug in
+           namespace-2 tracing). If no, the stale closure is a transient local
+           copy (C-stack / env) not the table's. */
+        if (defun_table_used > 0 || values_table_used > 0) {
             int found = 0;
             /* The interp's global-table (namespace 2) is a nested Shen cons
-               list [[name, closure] ...] stored under gt["global-table"].closure.
-               Recursively walk cons structures to find the failing .code. */
+               list [[name, closure] ...] stored in the values table under
+               "global-table".  Recursively walk cons structures to find the
+               failing .code. */
             #define WALK_SEARCH_MAX 200000
             int stack = 0;
             Value walk[256];
-            for (int gi = 0; gi < gn && !found; gi++) {
-                if (stack < 256) walk[stack++] = gt[gi].closure;
-                int visited = 0;
-                while (stack > 0 && !found && visited < WALK_SEARCH_MAX) {
-                    Value v = walk[--stack];
-                    visited++;
-                    if (v.tag == VAL_LAMBDA && v.lambda.code == code) {
-                        uintptr_t gpg = GCP_to_PAGE(v.lambda.code);
-                        fprintf(GC_LOG, "  GC-CHECK table-hit: global[%d] name='%s' code=%p "
-                                "page=%lu space=%lu (nested closure, matches stale code)\n",
-                                gi, gt[gi].name ? gt[gi].name : "?", (void *)v.lambda.code,
-                                (unsigned long)gpg,
-                                (unsigned long)(gpg >= firstheappage && gpg <= lastheappage
-                                                ? space[gpg] : 0));
-                        found = 1;
-                    } else if (v.tag == VAL_CONS) {
-                        if (stack + 2 <= 256) {
-                            walk[stack++] = *v.cons.car;
-                            walk[stack++] = *v.cons.cdr;
-                        }
-                    }
-                }
-            }
+            #define GC_CHECK_WALK_TABLE(tbl, cap) \
+                do { \
+                    for (int gi = 0; gi < (cap) && !found; gi++) { \
+                        if ((tbl)[gi].name == NULL) continue; \
+                        if (stack < 256) walk[stack++] = (tbl)[gi].value; \
+                        int visited = 0; \
+                        while (stack > 0 && !found && visited < WALK_SEARCH_MAX) { \
+                            Value v = walk[--stack]; \
+                            visited++; \
+                            if (v.tag == VAL_LAMBDA && v.lambda.code == code) { \
+                                uintptr_t gpg = GCP_to_PAGE(v.lambda.code); \
+                                fprintf(GC_LOG, "  GC-CHECK table-hit: name='%s' code=%p " \
+                                        "page=%lu space=%lu (nested closure, matches stale code)\n", \
+                                        (tbl)[gi].name ? (tbl)[gi].name : "?", (void *)v.lambda.code, \
+                                        (unsigned long)gpg, \
+                                        (unsigned long)(gpg >= firstheappage && gpg <= lastheappage \
+                                                        ? space[gpg] : 0)); \
+                                found = 1; \
+                            } else if (v.tag == VAL_CONS) { \
+                                if (stack + 2 <= 256) { \
+                                    walk[stack++] = *v.cons.car; \
+                                    walk[stack++] = *v.cons.cdr; \
+                                } \
+                            } \
+                        } \
+                    } \
+                } while (0)
+            GC_CHECK_WALK_TABLE(defun_table, defun_table_cap);
+            GC_CHECK_WALK_TABLE(values_table, values_table_cap);
+            #undef GC_CHECK_WALK_TABLE
             if (!found)
                 fprintf(GC_LOG, "  GC-CHECK table-miss: stale code=%p NOT in any "
-                        "global_table closure (transient local copy)\n", (void *)code);
+                        "registered table closure (transient local copy)\n", (void *)code);
         }
         /* Dump the raw instruction bytes so the failing closure can be
            identified even though the code page is dead space. */
@@ -298,6 +305,8 @@ static size_t  shadow_cap   = 0;
 
 static void   *reg_global_table     = NULL;
 static int    *reg_global_table_len = NULL;
+static void   *reg_values_table     = NULL;
+static int    *reg_values_table_len = NULL;
 static Instr **reg_traced_code      = NULL;
 static int    *reg_traced_code_len  = NULL;
 
@@ -361,39 +370,40 @@ void gc_dirty_vectors_clear(void) {
  * nursery-referencing value into an old-gen vector fires the barrier. */
 long gc_dirty_vectors_fired = 0;
 
-/* ---- write-barrier remembered set: dirty globals (site 2) --------- */
+/* ---- write-barrier remembered set: dirty defun-table bitset (site 2) -- */
 
-/* Dirty globals: a fixed 256-byte bitset (GLOBAL_TABLE_MAX bits = 2048).
- * Marked by global_set whenever a closure is stored into any global-table
+/* Dirty defuns: a fixed bitset (DEFUN_TABLE_CAP bits = 4096 = 512 bytes).
+ * Marked by defun_set whenever a closure/value is stored into any defun-table
  * slot; consulted by gc_scan_roots during nursery scavenges to skip
- * non-dirty globals (avoiding re-enqueuing hundreds of old-gen code/env
+ * non-dirty slots (avoiding re-enqueuing hundreds of old-gen code/env
  * pages that haven't changed).  Cleared at scavenge-end and full-collect
  * start — same lifecycle as dirty_vectors.  No overflow path (the bitset
- * is sized exactly to GLOBAL_TABLE_MAX). */
-_Static_assert(GLOBAL_TABLE_MAX % 64 == 0,
-               "DIRTY_GLOBALS bitset requires GLOBAL_TABLE_MAX be a multiple of 64");
-#define DIRTY_GLOBALS_MAX_BITS GLOBAL_TABLE_MAX
-static uint64_t dirty_globals[DIRTY_GLOBALS_MAX_BITS / 64];
-long gc_dirty_globals_fired  = 0;
-long gc_dirty_globals_scanned = 0;
+ * is sized exactly to DEFUN_TABLE_CAP).  The values table has NO dirty
+ * bitset — it is always full-scanned. */
+_Static_assert(DEFUN_TABLE_CAP % 64 == 0,
+               "DIRTY_DEFUNS bitset requires DEFUN_TABLE_CAP be a multiple of 64");
+#define DIRTY_DEFUNS_MAX_BITS DEFUN_TABLE_CAP
+static uint64_t dirty_defuns[DIRTY_DEFUNS_MAX_BITS / 64];
+long gc_dirty_defuns_fired  = 0;
+long gc_dirty_defuns_scanned = 0;
 
-void gc_dirty_globals_mark(int idx) {
-    if (idx < 0 || idx >= GLOBAL_TABLE_MAX) return;
+void gc_dirty_defuns_mark(int idx) {
+    if (idx < 0 || idx >= DEFUN_TABLE_CAP) return;
     int word = idx / 64;
     uint64_t mask = 1ULL << (idx % 64);
-    if (!(dirty_globals[word] & mask)) {
-        dirty_globals[word] |= mask;
-        gc_dirty_globals_fired++;
+    if (!(dirty_defuns[word] & mask)) {
+        dirty_defuns[word] |= mask;
+        gc_dirty_defuns_fired++;
     }
 }
 
-int gc_dirty_globals_test(int idx) {
-    if (idx < 0 || idx >= GLOBAL_TABLE_MAX) return 0;
-    return (dirty_globals[idx / 64] >> (idx % 64)) & 1;
+int gc_dirty_defuns_test(int idx) {
+    if (idx < 0 || idx >= DEFUN_TABLE_CAP) return 0;
+    return (dirty_defuns[idx / 64] >> (idx % 64)) & 1;
 }
 
-void gc_dirty_globals_clear(void) {
-    memset(dirty_globals, 0, sizeof(dirty_globals));
+void gc_dirty_defuns_clear(void) {
+    memset(dirty_defuns, 0, sizeof(dirty_defuns));
 }
 
 /* ---- forward declarations ----------------------------------------- */
@@ -500,21 +510,30 @@ static void collect(const char *trigger) {
      * gc_scan_roots() with in_scavenge=1 only scans dirty globals (as an
      * optimisation for normal nursery scavenges).  For promotion we must
      * also scan non-dirty globals — a non-dirty global may still reference
-     * a nursery object that was stored via global_set between collections. */
+     * a nursery object that was stored via defun_set between collections. */
     {
         in_scavenge = 1;
         queue_reset();
         gc_scan_roots();
 
-        /* Scan non-dirty globals explicitly: every global-table entry
-         * must be walked so nursery closures reachable only through
-         * non-dirty globals are also promoted. */
+        /* Scan non-dirty defun-table slots explicitly: every defun-table
+         * entry must be walked so nursery closures reachable only through
+         * non-dirty slots are also promoted.  The values table is always
+         * full-scanned (no dirty bitset). */
         if (reg_global_table && reg_global_table_len) {
-            GlobalEntry *gt = (GlobalEntry *)reg_global_table;
+            TableEntry *gt = (TableEntry *)reg_global_table;
             int n = *reg_global_table_len;
             for (int i = 0; i < n; i++) {
-                if (!gc_dirty_globals_test(i))
-                    gc_scan_value(&gt[i].closure);
+                if (gt[i].name != NULL && !gc_dirty_defuns_test(i))
+                    gc_scan_value(&gt[i].value);
+            }
+        }
+        if (reg_values_table && reg_values_table_len) {
+            TableEntry *vt = (TableEntry *)reg_values_table;
+            int n = *reg_values_table_len;
+            for (int i = 0; i < n; i++) {
+                if (vt[i].name != NULL)
+                    gc_scan_value(&vt[i].value);
             }
         }
 
@@ -593,7 +612,7 @@ static void collect(const char *trigger) {
     allocatedpages = 0;
     queue_reset();
     gc_dirty_vectors_clear();
-    gc_dirty_globals_clear();
+    gc_dirty_defuns_clear();
 
     /* ---- root set ---- */
 
@@ -975,23 +994,30 @@ static void gc_verify_codechains_fn(const char *when) {
         } \
     } while (0)
 
-    /* Root walk A — C global table (namespace 1, registered via reg_*). */
-    if (reg_global_table && reg_global_table_len) {
-        GlobalEntry *gt = (GlobalEntry *)reg_global_table;
-        int n = *reg_global_table_len;
-        char desc[128];
-        for (int i = 0; i < n; i++) {
-            roots_walked++;
-            if (gt[i].closure.tag == VAL_LAMBDA && gt[i].closure.lambda.code != NULL) {
-                closures_found++;
-                snprintf(desc, sizeof(desc), "global[%d]='%s'", i,
-                         gt[i].name ? gt[i].name : "?");
-                PUSH_CHAIN(gt[i].closure.lambda.code,
-                           gt[i].closure.lambda.code_len, desc);
-                DRAIN();
-            }
-        }
-    }
+    /* Root walk A — registered tables (defun + values, registered via reg_*). */
+    #define GC_VERIFY_WALK_TABLE(tbl, cap, tname) \
+        do { \
+            TableEntry *gt = (TableEntry *)(tbl); \
+            int n = (cap); \
+            char desc[128]; \
+            for (int i = 0; i < n; i++) { \
+                if (gt[i].name == NULL) continue; \
+                roots_walked++; \
+                if (gt[i].value.tag == VAL_LAMBDA && gt[i].value.lambda.code != NULL) { \
+                    closures_found++; \
+                    snprintf(desc, sizeof(desc), "%s[%d]='%s'", (tname), i, \
+                             gt[i].name ? gt[i].name : "?"); \
+                    PUSH_CHAIN(gt[i].value.lambda.code, \
+                               gt[i].value.lambda.code_len, desc); \
+                    DRAIN(); \
+                } \
+            } \
+        } while (0)
+    if (reg_global_table && reg_global_table_len)
+        GC_VERIFY_WALK_TABLE(reg_global_table, *reg_global_table_len, "defun");
+    if (reg_values_table && reg_values_table_len)
+        GC_VERIFY_WALK_TABLE(reg_values_table, *reg_values_table_len, "value");
+    #undef GC_VERIFY_WALK_TABLE
 
     /* Root walk B — precise-root shadow stack. */
     for (size_t i = 0; i < shadow_len; i++) {
@@ -1146,24 +1172,34 @@ static void gc_scan_roots(void) {
         }
     }
 
-    /* 2. Typed walker: global_table closures.
-     * During a nursery scavenge, skip non-dirty globals via the bitset
+    /* 2. Typed walker: defun_table closures.
+     * During a nursery scavenge, skip non-dirty slots via the bitset
      * to avoid re-enqueuing hundreds of stable old-gen code/env pages.
-     * Full collects always scan every global (bitset is cleared at start). */
+     * Full collects always scan every slot (bitset is cleared at start). */
     if (reg_global_table && reg_global_table_len) {
-        GlobalEntry *gt = (GlobalEntry *)reg_global_table;
+        TableEntry *gt = (TableEntry *)reg_global_table;
         int n = *reg_global_table_len;
         if (in_scavenge) {
             for (int i = 0; i < n; i++) {
-                if (gc_dirty_globals_test(i)) {
-                    gc_scan_value(&gt[i].closure);
-                    gc_dirty_globals_scanned++;
+                if (gt[i].name != NULL && gc_dirty_defuns_test(i)) {
+                    gc_scan_value(&gt[i].value);
+                    gc_dirty_defuns_scanned++;
                 }
             }
         } else {
             for (int i = 0; i < n; i++)
-                gc_scan_value(&gt[i].closure);
+                if (gt[i].name != NULL)
+                    gc_scan_value(&gt[i].value);
         }
+    }
+
+    /* 2b. Typed walker: values_table — always full-scanned (no dirty bitset). */
+    if (reg_values_table && reg_values_table_len) {
+        TableEntry *vt = (TableEntry *)reg_values_table;
+        int n = *reg_values_table_len;
+        for (int i = 0; i < n; i++)
+            if (vt[i].name != NULL)
+                gc_scan_value(&vt[i].value);
     }
 
     /* 3. Typed walker: traced_code Instr arrays */
@@ -1334,7 +1370,7 @@ static void collect_nursery(const char *trigger) {
     }
 
     gc_dirty_vectors_clear();
-    gc_dirty_globals_clear();
+    gc_dirty_defuns_clear();
 
     /* Opt-in heap-invariant verification (--gc-verify).  Purely diagnostic;
      * never aborts, only logs. */
@@ -1961,6 +1997,11 @@ size_t gc_root_watermark(void) {
 void gc_register_global_table(void *table, int *len_p) {
     reg_global_table     = table;
     reg_global_table_len = len_p;
+}
+
+void gc_register_values_table(void *table, int *len_p) {
+    reg_values_table     = table;
+    reg_values_table_len = len_p;
 }
 
 void gc_register_traced_code(Instr **arr, int *np) {

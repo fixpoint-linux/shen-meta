@@ -360,41 +360,70 @@ void trace_add(const char *name) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Global table                                                       */
+/*  Global tables (defun + values)                                     */
 /* ------------------------------------------------------------------ */
 
-/* GLOBAL_TABLE_MAX and GlobalEntry are in zincvm.h */
-
-GlobalEntry global_table[GLOBAL_TABLE_MAX];
-int global_table_len = 0;
-
-/* global_table stores name→closure bindings.  It is registered with the
-   GC via gc_register_global_table so gc_scan_roots traces every closure
-   (and their interior pointers) precisely.  There is no conservative
+/* DEFUN_TABLE_CAP/VALUES_TABLE_CAP and TableEntry are in zincvm.h.
+   The defun table is registered with the GC (via gc_register_global_table)
+   so gc_scan_roots traces every closure precisely.  The values table is
+   registered via gc_register_values_table.  There is no conservative
    C-stack scan or extra_roots mechanism; the shadow stack + registered
    tables are the sole root sources (4a.6). */
 
-void global_set(const char *name, Value v) {
-    for (int i = 0; i < global_table_len; i++) {
-        if (strcmp(global_table[i].name, name) == 0) {
-            global_table[i].closure = v;
-            gc_dirty_globals_mark(i);
+TableEntry defun_table[DEFUN_TABLE_CAP];
+int defun_table_used = 0;
+TableEntry values_table[VALUES_TABLE_CAP];
+int values_table_used = 0;
+
+/* Capacity registers for the GC: because both tables are open-addressed,
+ * live entries are scattered across the full array, so the GC must scan
+ * the whole capacity and skip empty (name==NULL) slots rather than
+ * trusting the dense `used` count. */
+int defun_table_cap = DEFUN_TABLE_CAP;
+int values_table_cap = VALUES_TABLE_CAP;
+
+/* FNV-1a hash over the name, reduced mod the table capacity. */
+static uint32_t hash_name(const char *name, int cap) {
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        h ^= (uint32_t)*p;
+        h *= 16777619u;
+    }
+    return h % (uint32_t)cap;
+}
+
+/* defun_table stores name→closure/primitiv/keyword bindings, reached by
+   [global X].  Open-address insert with linear probing; each store marks
+   the GC dirty bit so the nursery scavenge re-scans the slot. */
+void defun_set(const char *name, Value v) {
+    if (defun_table_used >= DEFUN_TABLE_CAP - 1) {
+        fprintf(stderr, "defun table full (%d entries) on '%s'\n",
+                DEFUN_TABLE_CAP, name);
+        exit(1);
+    }
+    uint32_t idx = hash_name(name, DEFUN_TABLE_CAP);
+    while (defun_table[idx].name != NULL) {
+        if (strcmp(defun_table[idx].name, name) == 0) {
+            defun_table[idx].value = v;
+            gc_dirty_defuns_mark((int)idx);
             return;
         }
+        idx = (idx + 1) % DEFUN_TABLE_CAP;
     }
-    if (global_table_len < GLOBAL_TABLE_MAX) {
-        int i = global_table_len;
-        global_table[i].name = strdup(name);
-        global_table[i].closure = v;
-        gc_dirty_globals_mark(i);
-        global_table_len++;
-    }
+    defun_table[idx].name = strdup(name);
+    defun_table[idx].value = v;
+    gc_dirty_defuns_mark((int)idx);
+    defun_table_used++;
 }
+
 static int exec_primitive_valid(const char *name);
-Value global_get(const char *name) {
-    for (int i = 0; i < global_table_len; i++)
-        if (strcmp(global_table[i].name, name) == 0)
-            return global_table[i].closure;
+Value defun_get(const char *name) {
+    uint32_t idx = hash_name(name, DEFUN_TABLE_CAP);
+    while (defun_table[idx].name != NULL) {
+        if (strcmp(defun_table[idx].name, name) == 0)
+            return defun_table[idx].value;
+        idx = (idx + 1) % DEFUN_TABLE_CAP;
+    }
     /* Only return VAL_PRIM for known C primitives. Unknown names
        (e.g., *macros*, *stinput*) must be VAL_SYMBOL so that
        cons?, element?, and other list-traversal code can match them.
@@ -405,18 +434,68 @@ Value global_get(const char *name) {
     return val_symbol(name);
 }
 
-/* global_is_defined: is `name` a known global?  True if it is in the C global
- * table (a closure, a registered keyword symbol, or a stream), OR a known C
- * primitive.  Used by the debug-build missing-global check: a [global X] whose
- * name is NOT defined here resolves (via global_get) to a bare symbol, which
- * then fails confusingly when applied — the classic "missing global" bug (e.g.
- * `not` was missing from the bundle and debruijn's [global not] became the
- * symbol 'not', silently failing the compile inside trap-error). */
-static int global_is_defined(const char *name) {
+/* values_table stores name→value bindings, reached by (value S)/(set S V):
+   streams, the Shen global-table value, and runtime (set S V) bindings.
+   Open-address insert with linear probing.  No dirty-bitset: the GC always
+   full-scans the values table. */
+void value_set(const char *name, Value v) {
+    if (values_table_used >= VALUES_TABLE_CAP - 1) {
+        fprintf(stderr, "values table full (%d entries) on '%s'\n",
+                VALUES_TABLE_CAP, name);
+        exit(1);
+    }
+    uint32_t idx = hash_name(name, VALUES_TABLE_CAP);
+    while (values_table[idx].name != NULL) {
+        if (strcmp(values_table[idx].name, name) == 0) {
+            values_table[idx].value = v;
+            return;
+        }
+        idx = (idx + 1) % VALUES_TABLE_CAP;
+    }
+    values_table[idx].name = strdup(name);
+    values_table[idx].value = v;
+    values_table_used++;
+}
+
+/* No primitive fallback: (value +) must return the bare symbol `+`. */
+Value value_get(const char *name) {
+    uint32_t idx = hash_name(name, VALUES_TABLE_CAP);
+    while (values_table[idx].name != NULL) {
+        if (strcmp(values_table[idx].name, name) == 0)
+            return values_table[idx].value;
+        idx = (idx + 1) % VALUES_TABLE_CAP;
+    }
+    return val_symbol(name);
+}
+
+/* defun_is_defined: is `name` a known defun-table global or C primitive? */
+static int defun_is_defined(const char *name) {
     if (!name) return 0;
-    for (int i = 0; i < global_table_len; i++)
-        if (strcmp(global_table[i].name, name) == 0) return 1;
+    uint32_t idx = hash_name(name, DEFUN_TABLE_CAP);
+    while (defun_table[idx].name != NULL) {
+        if (strcmp(defun_table[idx].name, name) == 0) return 1;
+        idx = (idx + 1) % DEFUN_TABLE_CAP;
+    }
     if (exec_primitive_valid(name)) return 1;
+    return 0;
+}
+
+/* global_is_defined: is `name` a known global?  True if it is in the defun
+ * table (a closure, a registered keyword symbol), the values table (a
+ * stream, the global-table value, a (set S V) binding), OR a known C
+ * primitive.  Used by the debug-build missing-global check: a [global X]
+ * whose name is NOT defined here resolves (via defun_get) to a bare symbol,
+ * which then fails confusingly when applied — the classic "missing global"
+ * bug (e.g. `not` was missing from the bundle and debruijn's [global not]
+ * became the symbol 'not', silently failing the compile inside trap-error). */
+static int global_is_defined(const char *name) {
+    if (defun_is_defined(name)) return 1;
+    if (!name) return 0;
+    uint32_t idx = hash_name(name, VALUES_TABLE_CAP);
+    while (values_table[idx].name != NULL) {
+        if (strcmp(values_table[idx].name, name) == 0) return 1;
+        idx = (idx + 1) % VALUES_TABLE_CAP;
+    }
     return 0;
 }
 
@@ -960,7 +1039,7 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             return -1;
         }
 #endif
-        *acc = global_get(a.sym.name); return 0;
+        *acc = value_get(a.sym.name); return 0;
     }
 
     /* --- Vector ops --- */
@@ -1264,7 +1343,7 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
     if (strcmp(name, "set") == 0) {
         Value sym = va_pop(stack), v = va_pop(stack);
         if (sym.tag != VAL_SYMBOL) PRIM_TYPE_ERROR("set requires symbol");
-        global_set(sym.sym.name, v); *acc = v; return 0;
+        value_set(sym.sym.name, v); *acc = v; return 0;
     }
     if (strcmp(name, "eval-kl") == 0) {
         Value a = va_pop(stack);
@@ -1299,7 +1378,7 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         gc_root_push_value(&tagged);
 
         /* Step 1: extract-kl — tagged form → raw KLambda */
-        Value extkl = global_get("extract-kl");
+        Value extkl = defun_get("extract-kl");
         gc_root_push_value(&extkl);
         if (extkl.tag != VAL_LAMBDA) {
             fprintf(stderr, "runtime: eval-kl: extract-kl not found in bundle\n");
@@ -1314,7 +1393,7 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         gc_root_push_value(&klambda);
 
         /* Step 2: kl->zinc — raw KLambda → ZINC bytecode */
-        Value klzinc = global_get("kl->zinc");
+        Value klzinc = defun_get("kl->zinc");
         gc_root_push_value(&klzinc);
         if (klzinc.tag != VAL_LAMBDA) {
             fprintf(stderr, "runtime: eval-kl: kl->zinc not found in bundle\n");
@@ -1329,7 +1408,7 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         gc_root_push_value(&zinc_code);
 
         /* Step 3: toplevel-interp — ZINC bytecode → tagged result */
-        Value tli = global_get("toplevel-interp");
+        Value tli = defun_get("toplevel-interp");
         gc_root_push_value(&tli);
         if (tli.tag != VAL_LAMBDA) {
             fprintf(stderr, "runtime: eval-kl: toplevel-interp not found in bundle\n");
@@ -1638,7 +1717,7 @@ void print_instr(Instr *code, int len, int indent) {
 /* Resolve trace names to code pointers.  Call after parse_bundle. */
 void trace_resolve(void) {
     for (int i = 0; i < num_traced; i++) {
-        Value g = global_get(traced_name[i]);
+        Value g = defun_get(traced_name[i]);
         if (g.tag == VAL_LAMBDA) {
             traced_code[i] = g.lambda.code;
             fprintf(stderr, "[trace] watching '%s' (%d instrs)\n",
@@ -1924,7 +2003,7 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
 #ifdef ZINCVM_DEBUG
             /* Missing-global guard: a [global X] whose name is not a defined
                closure, C primitive, keyword symbol, or stream resolves (via
-               global_get) to a bare symbol.  That symbol then fails confusingly
+               defun_get) to a bare symbol.  That symbol then fails confusingly
                when applied, and the error is often swallowed by trap-error
                (interp-eval-safe) producing a false `loaded`.  Surface it here.
                This catches the class of bug where a bundled closure references a
@@ -1933,7 +2012,7 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
                 fprintf(stderr, "runtime: [global %s] not defined — resolves to bare symbol\n", nm);
             }
 #endif
-            acc = global_get(nm);
+            acc = defun_get(nm);
             va_push(&stack, acc);
             pc++; break;
         }
@@ -2027,7 +2106,7 @@ Value vm_exec(Instr *code, int code_len) {
    Mirrors the convention used in eval-kl: the arg is placed after the
    closure's captured env, and the closure reads its param via `access N`. */
 static Value call_closure1(const char *name, Value arg) {
-    Value g = global_get(name);
+    Value g = defun_get(name);
     if (g.tag != VAL_LAMBDA) {
         fprintf(stderr, "meta-repl: %s not found in bundle (tag=%d)\n", name, g.tag);
         return val_nil();
@@ -2044,7 +2123,7 @@ static Value call_closure1(const char *name, Value arg) {
 /* Call a bundled lambda closure by name with three arguments
    (used for parse-exprs Str Pos Len). */
 static Value call_closure3(const char *name, Value a, Value b, Value c) {
-    Value g = global_get(name);
+    Value g = defun_get(name);
     if (g.tag != VAL_LAMBDA) {
         fprintf(stderr, "meta-repl: %s not found in bundle (tag=%d)\n", name, g.tag);
         return val_nil();
@@ -2229,7 +2308,7 @@ void init_globals(void) {
         "shen.fail!","fail",
         "stinput","stoutput", NULL
     };
-    for (int i = 0; prims[i]; i++) global_set(prims[i], val_prim(prims[i]));
+    for (int i = 0; prims[i]; i++) defun_set(prims[i], val_prim(prims[i]));
 }
 
 /* ------------------------------------------------------------------ */
@@ -2314,7 +2393,7 @@ int parse_bundle(const char *str) {
 
         /* Create a closure from the body code (empty env) and store in globals */
         Value closure = val_lambda(body_code, body_len, NULL, 0);
-        global_set(key, closure);
+        defun_set(key, closure);
         /* code is GC-allocated — no free needed */
 
         /* Consume closing ')' of entry */
@@ -2367,31 +2446,31 @@ int vm_load_bundle(const char *buf) {
         NULL
     };
     for (int i = 0; keywords[i]; i++)
-        global_set(keywords[i], val_symbol(keywords[i]));
+        defun_set(keywords[i], val_symbol(keywords[i]));
 
     /* Initialize standard I/O stream variables expected by the Shen OS.
        The bundled stinput/stoutput closures use (value *stinput*),
-       (value *stoutput*) — these resolve to global_get("*stinput*") etc.
+       (value *stoutput*) — these resolve to value_get("*stinput*") etc.
        shen.initialise-environment does NOT set them; the host port must. */
     {
         Value stin;  memset(&stin, 0, sizeof(stin));
         stin.tag = VAL_STREAM; stin.stream.file = stdin;  stin.stream.is_input = 1;
-        global_set("*stinput*", stin);
+        value_set("*stinput*", stin);
 
         Value stout; memset(&stout, 0, sizeof(stout));
         stout.tag = VAL_STREAM; stout.stream.file = stdout; stout.stream.is_input = 0;
-        global_set("*stoutput*", stout);
+        value_set("*stoutput*", stout);
 
         Value sterr; memset(&sterr, 0, sizeof(sterr));
         sterr.tag = VAL_STREAM; sterr.stream.file = stderr; sterr.stream.is_input = 0;
-        global_set("*sterror*", sterr);
+        value_set("*sterror*", sterr);
     }
 
     /* Initialize the Shen global-table variable.  The metacircular
        interp's lookup-global reads (value global-table) to resolve
        non-primitive globals; it must start as an empty alist for
        interp-eval / set-toplevel to register new defuns at runtime. */
-    global_set("global-table", val_nil());
+    value_set("global-table", val_nil());
 
     return n;
 }
@@ -2434,10 +2513,11 @@ int main(int argc, char **argv) {
     init_globals();
     gc_init(256UL * 1024 * 1024);
 
-    /* Register typed walkers so gc_scan_roots traces global_table
-     * closures and traced_code Instr arrays.  These replace the
+    /* Register typed walkers so gc_scan_roots traces defun_table closures,
+     * values_table values, and traced_code Instr arrays.  These replace the
      * former extra_roots conservative scan of the same BSS/static data. */
-    gc_register_global_table(global_table, &global_table_len);
+    gc_register_global_table(defun_table, &defun_table_cap);
+    gc_register_values_table(values_table, &values_table_cap);
     gc_register_traced_code(traced_code, &num_traced);
 
     /* Scan for --trace <name> flags (before bundle load) */
@@ -2485,7 +2565,7 @@ int main(int argc, char **argv) {
             /* -d <name>: decompile a bundled closure's bytecode */
             if (ai < argc && strcmp(argv[ai], "-d") == 0) {
                 if (ai + 1 < argc) {
-                    Value g = global_get(argv[ai + 1]);
+                    Value g = defun_get(argv[ai + 1]);
                     if (g.tag == VAL_LAMBDA) {
                         printf("=== Decompile: %s ===\n", argv[ai + 1]);
                         printf("  code_len=%d  env_len=%d\n\n", g.lambda.code_len, g.lambda.env_len);
@@ -2512,7 +2592,7 @@ int main(int argc, char **argv) {
                 printf("=== Shen REPL ===\n");
                 fflush(stdout);
 
-                Value init = global_get("shen.initialise");
+                Value init = defun_get("shen.initialise");
                 if (init.tag != VAL_LAMBDA) {
                     fprintf(stderr, "repl: shen.initialise not found (tag=%d)\n", init.tag);
                     return 1;
@@ -2538,7 +2618,7 @@ int main(int argc, char **argv) {
                 printf("Shen ready.\n\n");
                 fflush(stdout);
 
-                Value repl = global_get("shen.repl");
+                Value repl = defun_get("shen.repl");
                 if (repl.tag != VAL_LAMBDA) {
                     fprintf(stderr, "repl: shen.repl not found\n");
                     return 1;

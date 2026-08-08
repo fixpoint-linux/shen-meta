@@ -25,21 +25,29 @@
 #define verify_heap() ((void)0)
 
 /* ------------------------------------------------------------------ */
-/*  Global table                                                       */
+/*  Global tables (split into defun + values)                          */
 /* ------------------------------------------------------------------ */
 
-#define GLOBAL_TABLE_MAX 2048
+/* Two open-addressing hash tables replace the old single global_table:
+ *   - defun_table:  closures/primitives/keywords, reached by `[global X]`
+ *                   (OP_GLOBAL).  Has a GC dirty-bitset (marked on insert).
+ *   - values_table: streams (the stinput/stoutput/sterror globals), the
+ *                   Shen `global-table` value, and runtime `(set S V)`
+ *                   bindings, reached by the `value`/`set` primitives.
+ *                   Always full-scanned by the GC (no dirty bitset). */
+#define DEFUN_TABLE_CAP  4096
+#define VALUES_TABLE_CAP 256
 
-typedef struct { char *name; Value closure; } GlobalEntry;
+typedef struct { char *name; Value value; } TableEntry;
 
-/* GC scans global_table as raw uintptr_t words (conservative scan).
+/* GC scans these tables as raw uintptr_t words (conservative scan).
    These assertions ensure pointer fields are at aligned offsets and
    the struct size is a word multiple — breaking either would cause
    the GC to silently miss pointers. */
-_Static_assert(sizeof(GlobalEntry) % sizeof(uintptr_t) == 0,
-               "GlobalEntry must be word-multiple for GC scan");
-_Static_assert(_Alignof(GlobalEntry) >= sizeof(uintptr_t),
-               "GlobalEntry must be word-aligned for GC scan");
+_Static_assert(sizeof(TableEntry) % sizeof(uintptr_t) == 0,
+               "TableEntry must be word-multiple for GC scan");
+_Static_assert(_Alignof(TableEntry) >= sizeof(uintptr_t),
+               "TableEntry must be word-aligned for GC scan");
 
 /* ------------------------------------------------------------------ */
 /*  Error handling: CatchFrame                                         */
@@ -64,8 +72,12 @@ typedef struct CatchFrame {
 /* ------------------------------------------------------------------ */
 
 extern CatchFrame *vm_catch_chain;
-extern GlobalEntry global_table[GLOBAL_TABLE_MAX];
-extern int global_table_len;
+extern TableEntry defun_table[DEFUN_TABLE_CAP];
+extern int defun_table_used;
+extern int defun_table_cap;
+extern TableEntry values_table[VALUES_TABLE_CAP];
+extern int values_table_used;
+extern int values_table_cap;
 extern int trace_counter;
 extern int trace_limit;
 extern int num_traced;
@@ -108,11 +120,13 @@ Value vm_exec(Instr *code, int code_len);
 Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len);
 
 /* ------------------------------------------------------------------ */
-/*  Global table                                                       */
+/*  Global tables (defun + values)                                     */
 /* ------------------------------------------------------------------ */
 
-void  global_set(const char *name, Value v);
-Value global_get(const char *name);
+void  defun_set(const char *name, Value v);
+Value defun_get(const char *name);
+void  value_set(const char *name, Value v);
+Value value_get(const char *name);
 
 /* ------------------------------------------------------------------ */
 /*  Tracing                                                            */

@@ -101,14 +101,15 @@ void gc_set_verify_codechains(int on);
  * labels the call site (e.g. "APPLY" / "APPTERM"). */
 void gc_check_closure(Value *cl, const char *where);
 
-/* Write-barrier remembered set: dirty globals bitset (site 2).
- * Marked by global_set; consulted during nursery scavenges to skip
- * non-dirty globals.  Cleared at scavenge-end and full-collect start. */
-void gc_dirty_globals_mark(int idx);
-int  gc_dirty_globals_test(int idx);
-void gc_dirty_globals_clear(void);
-extern long gc_dirty_globals_fired;
-extern long gc_dirty_globals_scanned;
+/* Write-barrier remembered set: dirty defun-table bitset (site 2).
+ * Marked by defun_set; consulted during nursery scavenges to skip
+ * non-dirty defun-table slots.  Cleared at scavenge-end and
+ * full-collect start. */
+void gc_dirty_defuns_mark(int idx);
+int  gc_dirty_defuns_test(int idx);
+void gc_dirty_defuns_clear(void);
+extern long gc_dirty_defuns_fired;
+extern long gc_dirty_defuns_scanned;
 
 /* Instrumentation counters (GC Phase 2 Step 4 stress tests in zincvm.c).
  * gc_nursery_scavenge_count increments once per real scavenge.
@@ -157,9 +158,10 @@ void  gc_root_push_value_array(Value *base, int *np); /* N by-value Values */
 void  gc_root_pop(void);                           /* pop one entry */
 void  gc_root_pop_to(size_t watermark);            /* truncate (longjmp unwind) */
 size_t gc_root_watermark(void);                    /* snapshot depth */
-/* void* avoids GlobalEntry dependency (GlobalEntry is in zincvm.h,
+/* void* avoids TableEntry dependency (TableEntry is in zincvm.h,
  * which includes gc.h — circular include avoided). */
 void  gc_register_global_table(void *table, int *len_p);
+void  gc_register_values_table(void *table, int *len_p);
 void  gc_register_traced_code(Instr **arr, int *np);
 
 #endif /* ZINCVM_GC_H */

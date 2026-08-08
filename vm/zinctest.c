@@ -91,7 +91,7 @@ static void run_test(const char *label, const char *bytecode, int show_code) {
  * the fixed-point test to recompile a closure's KLambda through the bundled
  * compiler pipeline. */
 static Value call_bundled_1(const char *name, Value arg) {
-    Value fn = global_get(name);
+    Value fn = defun_get(name);
     if (fn.tag != VAL_LAMBDA) return val_nil();
     /* Keep fn and arg rooted across GC_VALUE_ARRAY alloc AND across vm_exec_env:
        the env array references arg, so arg must stay live during execution. */
@@ -777,19 +777,19 @@ static int gc_nursery_tests(void) {
     {
         /* Allocate a nursery cons, register as precise root, store in
          * global table, force a scavenge — the cons must be evacuated
-         * to old-gen and intact when retrieved via global_get.
+         * to old-gen and intact when retrieved via defun_get.
          * This is the load-bearing test for barrier site 2. */
         Value c = val_cons(val_number(42), val_nil());
         gc_root_push_value(&c);  /* precise root across scavenge */
 
-        long fired_before = gc_dirty_globals_fired;
-        global_set("t-dirty-1", c);
-        int fired_ok = (gc_dirty_globals_fired > fired_before);
+        long fired_before = gc_dirty_defuns_fired;
+        defun_set("t-dirty-1", c);
+        int fired_ok = (gc_dirty_defuns_fired > fired_before);
 
         long before = gc_nursery_scavenge_count;
         force_nursery_scavenge(before + 1);
 
-        Value retrieved = global_get("t-dirty-1");
+        Value retrieved = defun_get("t-dirty-1");
         int ok14 = fired_ok;
         ok14 = ok14 && (retrieved.tag == VAL_CONS);
         ok14 = ok14 && retrieved.cons.car &&
@@ -813,21 +813,21 @@ static int gc_nursery_tests(void) {
 
     /* ---- Test 15: dirty-globals re-mark after clear ---- */
     {
-        /* After a scavenge clears the bitset, a fresh global_set must
+        /* After a scavenge clears the bitset, a fresh defun_set must
          * re-mark the bit so the next scavenge still scans it. */
         Value c2 = val_cons(val_number(99), val_nil());
         gc_root_push_value(&c2);
 
-        long fired_before = gc_dirty_globals_fired;
-        global_set("t-dirty-1", c2);
-        int refired_ok = (gc_dirty_globals_fired > fired_before);
+        long fired_before = gc_dirty_defuns_fired;
+        defun_set("t-dirty-1", c2);
+        int refired_ok = (gc_dirty_defuns_fired > fired_before);
 
-        long scanned_before = gc_dirty_globals_scanned;
+        long scanned_before = gc_dirty_defuns_scanned;
         long before = gc_nursery_scavenge_count;
         force_nursery_scavenge(before + 1);
-        int rescanned_ok = (gc_dirty_globals_scanned > scanned_before);
+        int rescanned_ok = (gc_dirty_defuns_scanned > scanned_before);
 
-        Value retrieved = global_get("t-dirty-1");
+        Value retrieved = defun_get("t-dirty-1");
         int ok15 = refired_ok && rescanned_ok;
         ok15 = ok15 && (retrieved.tag == VAL_CONS);
         ok15 = ok15 && retrieved.cons.car &&
@@ -852,19 +852,19 @@ static int gc_nursery_tests(void) {
     /* ---- Test 16: dirty-globals skip (optimization proof) ---- */
     {
         /* After a scavenge clears the bitset and with no intervening
-         * global_set, the next scavenge must scan zero dirty globals. */
-        long scanned_before = gc_dirty_globals_scanned;
+         * defun_set, the next scavenge must scan zero dirty defuns. */
+        long scanned_before = gc_dirty_defuns_scanned;
         long before = gc_nursery_scavenge_count;
         force_nursery_scavenge(before + 1);
-        long scanned_delta = gc_dirty_globals_scanned - scanned_before;
+        long scanned_delta = gc_dirty_defuns_scanned - scanned_before;
 
         int ok16 = (scanned_delta == 0);
         if (!ok16) {
-            printf("  [16] dirty-globals skip FAILED "
+            printf("  [16] dirty-defuns skip FAILED "
                    "(scanned_delta=%ld, expected 0)\n", scanned_delta);
             failed = 1;
         } else {
-            printf("  [16] dirty-globals skip passed — no dirty globals "
+            printf("  [16] dirty-defuns skip passed — no dirty defuns "
                    "scanned when none marked\n");
         }
     }
@@ -878,16 +878,16 @@ static int gc_nursery_tests(void) {
         *oldval = val_number(7777);
         gc_root_push_ptr((void**)&oldval);
 
-        long fired_before = gc_dirty_globals_fired;
-        global_set("t-oldgen", *oldval);
-        int fired17 = (gc_dirty_globals_fired > fired_before);
+        long fired_before = gc_dirty_defuns_fired;
+        defun_set("t-oldgen", *oldval);
+        int fired17 = (gc_dirty_defuns_fired > fired_before);
 
-        long scanned_before = gc_dirty_globals_scanned;
+        long scanned_before = gc_dirty_defuns_scanned;
         long before = gc_nursery_scavenge_count;
         force_nursery_scavenge(before + 1);
-        int scanned17 = (gc_dirty_globals_scanned > scanned_before);
+        int scanned17 = (gc_dirty_defuns_scanned > scanned_before);
 
-        Value retrieved = global_get("t-oldgen");
+        Value retrieved = defun_get("t-oldgen");
         int ok17 = fired17 && scanned17;
         ok17 = ok17 && (retrieved.tag == VAL_NUMBER) &&
                        (retrieved.number == 7777);
@@ -913,10 +913,10 @@ static int gc_nursery_tests(void) {
         *hv = val_number(8888);
         gc_root_push_ptr((void**)&hv);
 
-        /* Mark a global dirty. */
-        long fired_before = gc_dirty_globals_fired;
-        global_set("t-hygiene", *hv);
-        int fired18 = (gc_dirty_globals_fired > fired_before);
+        /* Mark a defun dirty. */
+        long fired_before = gc_dirty_defuns_fired;
+        defun_set("t-hygiene", *hv);
+        int fired18 = (gc_dirty_defuns_fired > fired_before);
 
         /* Force a full collect via old-gen allocation pressure.
          * Use the same technique as Test 8 (200 × 4MB chunks) to
@@ -931,21 +931,21 @@ static int gc_nursery_tests(void) {
         }
         int fc_ok = (gc_full_collect_count > fc_before);
 
-        /* After full collect, force a scavenge — no dirty globals
+        /* After full collect, force a scavenge — no dirty defuns
          * should be scanned because the full collect cleared them. */
-        long scanned_before = gc_dirty_globals_scanned;
+        long scanned_before = gc_dirty_defuns_scanned;
         long before = gc_nursery_scavenge_count;
         force_nursery_scavenge(before + 1);
-        long scanned_delta = gc_dirty_globals_scanned - scanned_before;
+        long scanned_delta = gc_dirty_defuns_scanned - scanned_before;
 
         int ok18 = fired18 && fc_ok && (scanned_delta == 0);
         if (!ok18) {
-            printf("  [18] dirty-globals full-collect hygiene FAILED "
+            printf("  [18] dirty-defuns full-collect hygiene FAILED "
                    "(fired=%d fc_ok=%d scanned_delta=%ld)\n",
                    fired18, fc_ok, scanned_delta);
             failed = 1;
         } else {
-            printf("  [18] dirty-globals full-collect hygiene passed — "
+            printf("  [18] dirty-defuns full-collect hygiene passed — "
                    "bits cleared by full collect, no stale scan\n");
         }
         gc_root_pop();  /* hv */
@@ -1246,10 +1246,11 @@ int main(int argc, char **argv) {
 
     gc_init(256UL * 1024 * 1024);
 
-    /* Register typed walkers so gc_scan_roots traces global_table
-     * closures and traced_code Instr arrays.  These replace the
+    /* Register typed walkers so gc_scan_roots traces defun_table closures,
+     * values_table values, and traced_code Instr arrays.  These replace the
      * former extra_roots conservative scan of the same BSS/static data. */
-    gc_register_global_table(global_table, &global_table_len);
+    gc_register_global_table(defun_table, &defun_table_cap);
+    gc_register_values_table(values_table, &values_table_cap);
     gc_register_traced_code(traced_code, &num_traced);
 
     /* Scan for --trace <name> flags (before bundle load) */
@@ -1317,8 +1318,8 @@ int main(int argc, char **argv) {
                              val_cons(e_2,
                              val_cons(e_3, e_nil)));
 
-            /* Store in global table */
-            global_set("*test-list*", list123);
+            /* Store in defun table (reached by [global *test-list*]) */
+            defun_set("*test-list*", list123);
 
             /* Test 1: (+ 1 2) through bundled + closure */
             printf("--- Test 1: (+ 1 2) via bundled + ---\n");
@@ -1344,7 +1345,7 @@ int main(int argc, char **argv) {
             Value ev_list = val_cons(ev_two, ev_nil);          /* [2] */
             ev_list = val_cons(ev_one, ev_list);               /* [1 2] */
             ev_list = val_cons(plus_sym, ev_list);             /* [+ 1 2] */
-            global_set("*ev1*", ev_list);
+            defun_set("*ev1*", ev_list);
             run_test("eval-kl-add",
                      "(g[5:s]*ev1*P[7:s]eval-kl)", 0);
 
@@ -1356,7 +1357,7 @@ int main(int argc, char **argv) {
                 Value nil = val_nil();
                 Value lst = val_cons(n2, nil);           /* (2) */
                 lst = val_cons(n1, lst);                 /* (1 2) */
-                global_set("*ev2*", val_cons(cons_sym, lst)); /* (cons 1 2) */
+                defun_set("*ev2*", val_cons(cons_sym, lst)); /* (cons 1 2) */
             }
             printf("--- Test 11: eval-kl [cons 1 2] — expect [cons 1 . 2] ---\n");
             run_test("eval-kl-cons",
@@ -1376,7 +1377,7 @@ int main(int argc, char **argv) {
                 Value outer = val_cons(n4, nil);          /* (4) */
                 outer = val_cons(inner, outer);           /* ([* 2 3] 4) */
                 outer = val_cons(plus_sym2, outer);       /* (+ [* 2 3] 4) */
-                global_set("*ev3*", outer);
+                defun_set("*ev3*", outer);
             }
             printf("--- Test 12: eval-kl [+ [* 2 3] 4] — expect 10 ---\n");
             run_test("eval-kl-nested",
@@ -1390,7 +1391,7 @@ int main(int argc, char **argv) {
                 Value nil = val_nil();
                 Value lst = val_cons(s2, nil);           /* ("world") */
                 lst = val_cons(s1, lst);                 /* ("hello" "world") */
-                global_set("*ev4*", val_cons(cn_sym, lst)); /* (cn "hello" "world") */
+                defun_set("*ev4*", val_cons(cn_sym, lst)); /* (cn "hello" "world") */
             }
             printf("--- Test 13: eval-kl [cn \"hello\" \"world\"] — expect \"helloworld\" ---\n");
             run_test("eval-kl-cn",
@@ -1403,7 +1404,7 @@ int main(int argc, char **argv) {
                 Value nil = val_nil();
                 Value lst = val_cons(n42, nil);           /* (42) */
                 lst = val_cons(hd_sym, lst);              /* (hd 42) */
-                global_set("*ev5*", lst);
+                defun_set("*ev5*", lst);
             }
             printf("--- Test 14: eval-kl [hd 42] — expect identity (error swallowed) ---\n");
             run_test("eval-kl-error",
@@ -1416,7 +1417,7 @@ int main(int argc, char **argv) {
                 Value body = val_cons(zero, nil);          /* (0) */
                 body = val_cons(one, body);                /* (1 0) */
                 body = val_cons(val_symbol("/"), body);    /* (/ 1 0) */
-                global_set("*ev6*", body);
+                defun_set("*ev6*", body);
             }
             printf("--- Test 14b: eval-kl [/ 1 0] — expect identity, no SIGFPE (safe./ div-zero) ---\n");
             run_test("eval-kl-trap-divzero", "(g[5:s]*ev6*P[7:s]eval-kl)", 0);
@@ -1424,14 +1425,14 @@ int main(int argc, char **argv) {
             /* Diagnostic: dump bytecode of toplevel-interp and interp */
             printf("--- Bytecode Dump ---\n");
             {
-                Value tli = global_get("toplevel-interp");
+                Value tli = defun_get("toplevel-interp");
                 if (tli.tag == VAL_LAMBDA) {
                     printf("toplevel-interp bytecode (%d instrs):\n", tli.lambda.code_len);
                     print_instr(tli.lambda.code, tli.lambda.code_len < 30 ? tli.lambda.code_len : 30, 0);
                     if (tli.lambda.code_len > 30) printf("  ... (%d more)\n", tli.lambda.code_len - 30);
                     printf("env_len=%d\n", tli.lambda.env_len);
                 }
-                Value ip = global_get("interp");
+                Value ip = defun_get("interp");
                 if (ip.tag == VAL_LAMBDA) {
                     printf("\ninterp bytecode (%d instrs):\n", ip.lambda.code_len);
                     print_instr(ip.lambda.code, ip.lambda.code_len < 50 ? ip.lambda.code_len : 50, 0);
@@ -1452,7 +1453,7 @@ int main(int argc, char **argv) {
             /* Test 5b: call toplevel-interp directly */
             printf("--- Test 5b: toplevel-interp directly ---\n");
             {
-                Value tli = global_get("toplevel-interp");
+                Value tli = defun_get("toplevel-interp");
                 if (tli.tag == VAL_LAMBDA) {
                     /* Test A: empty bytecode → should return [cons] */
                     Value nil = val_nil();
@@ -1524,7 +1525,7 @@ int main(int argc, char **argv) {
 
                     /* Test C: call interp directly */
                     printf("  Test C (interp [] [cons] [] [] []):\n");
-                    Value interp_fn = global_get("interp");
+                    Value interp_fn = defun_get("interp");
                     if (interp_fn.tag == VAL_LAMBDA) {
                         Value nil_v = val_nil();
                         Value cons_tag = val_cons(val_symbol("cons"), nil_v);
@@ -1761,7 +1762,7 @@ int main(int argc, char **argv) {
 
                     /* Verify the loaded closures are usable through the
                      * metacircular interp.  The defuns land in the interp's Shen
-                     * global-table (namespace 2), NOT the C VM global_table[],
+                     * global-table (namespace 2), NOT the C VM defun_table[],
                      * so raw C bytecode [global my-add] can't reach them.
                      * Instead drive them through eval-kl: build (my-add 2 3) as
                      * a cons list, store in a C global, pass to the eval-kl
@@ -1774,7 +1775,7 @@ int main(int argc, char **argv) {
                         Value add_args = val_cons(n3, nil);            /* (3) */
                         add_args = val_cons(n2, add_args);             /* (2 3) */
                         Value add_expr = val_cons(add_sym, add_args);  /* (my-add 2 3) */
-                        global_set("*evadd*", add_expr);
+                        defun_set("*evadd*", add_expr);
                         run_test_timeout("probe-my-add-evalkl",
                             "(g[7:s]*evadd*P[7:s]eval-kl)", 0, 30);
 
@@ -1783,7 +1784,7 @@ int main(int argc, char **argv) {
                         Value n42 = val_number(42);
                         Value id_args = val_cons(n42, nil);            /* (42) */
                         Value id_expr = val_cons(id_sym, id_args);     /* (my-id 42) */
-                        global_set("*evid*", id_expr);
+                        defun_set("*evid*", id_expr);
                         run_test_timeout("probe-my-id-evalkl",
                             "(g[6:s]*evid*P[7:s]eval-kl)", 0, 30);
 
@@ -1799,7 +1800,7 @@ int main(int argc, char **argv) {
                 }
 #endif
 
-            printf("\nSelf-hosting proven: The C VM loaded %d closures compiled by\n", global_table_len);
+            printf("\nSelf-hosting proven: The C VM loaded %d closures compiled by\n", defun_table_used);
             printf("the metacircular Shen ZINC interpreter and executed them correctly.\n");
             printf("Inline OP_PRIM dispatch works (open/close/eval-kl bypass safe wrappers).\n");
             printf("eval-kl chain (marshal → extract-kl → kl->zinc → toplevel-interp → demarshal) works.\n");
@@ -1808,7 +1809,7 @@ int main(int argc, char **argv) {
             /* Verify the variable? fix: global-table variable? (now safe.variable?)
              * must return true for symbol X. */
             {
-                global_set("dv", val_symbol("X"));
+                defun_set("dv", val_symbol("X"));
                 run_test_timeout("global-var-true",
                     "(mg[2:s]dvg[9:s]variable?p)", 0, 5);
                 fflush(stdout);
@@ -1834,20 +1835,20 @@ int main(int argc, char **argv) {
                 Value lst = val_cons(val_number(3),
                             val_cons(val_number(2),
                             val_cons(val_number(1), nil)));
-                global_set("*gc-test-list*", lst);
+                value_set("*gc-test-list*", lst);
 
                 for (int i = 0; i < 5000; i++) {
                     Value cell = val_cons(val_number(i), nil);
                     (void)cell;
                 }
 
-                Value retrieved = global_get("*gc-test-list*");
+                Value retrieved = value_get("*gc-test-list*");
                 if (retrieved.tag != VAL_CONS
                     || retrieved.cons.car->tag != VAL_NUMBER
                     || retrieved.cons.car->number != 3) {
                     printf("  GC retention test FAILED\n");
                 } else {
-                    printf("  GC retention test passed — global_table entry survived GC\n");
+                    printf("  GC retention test passed — defun/values table entry survived GC\n");
                 }
             }
 
