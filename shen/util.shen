@@ -35,12 +35,20 @@
   [defun Name [Arg | Args] Body] -> [lambda Arg (defun->lambda [defun Name Args Body])]
   _                              -> (simple-error "defun->lambda: invalid arg"))
 
+\* dedupe-globals keeps the FIRST (front = newest = shen-load'd) occurrence of
+   each name, matching the comment in serialize-reduced.shen.  The old version
+   kept the LAST (back = oldest = host set-toplevel), which let curried
+   host-compiled closures shadow the flat full-arity ones from shen-load,
+   breaking the C VM (partial application). *\
 (define dedupe-globals { (list (list symbol zinc-value)) --> (list (list symbol zinc-value)) }
-  [] -> []
-  [[N V] | Rest] -> (if (empty? (assoc N Rest))
-                         [[N V] | (dedupe-globals Rest)]
-                         (dedupe-globals Rest))
-  _ -> [])
+  Table -> (dedupe-globals-h Table []))
+
+(define dedupe-globals-h
+  { (list (list symbol zinc-value)) --> (list symbol) --> (list (list symbol zinc-value)) }
+  [] _ -> []
+  [[N V] | R] Seen -> (if (element? N Seen)
+                         (dedupe-globals-h R Seen)
+                         [[N V] | (dedupe-globals-h R [N | Seen])]))
 
 (define primitive? { symbol --> boolean }
   X -> (element? X [+ / * - trap-error simple-error error-to-string intern

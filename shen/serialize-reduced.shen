@@ -35,6 +35,12 @@
 (shen-load "shen/toplevel.shen")
 (shen-load "shen/load.shen")
 (shen-load "shen/os-helpers.shen")
+\* Bundle the safe-subset shen->kl compiler so it runs ON the C VM
+   (self-contained meta-interpreter pipeline).  It compiles Shen source
+   to full-arity KLambda, fixing the curried calls that shen-scheme's
+   compiler emits in the bundled compiler closures. *\
+(shen-load "shen/shen-kl-helpers.shen")
+(shen-load "shen/shen->kl.shen")
 
 \* === Safe-wrapper aliases: point short names to our-compiled safe.N closures ===
    serialize.shen (full bundle) relies on interp.shen's set-toplevel calls for
