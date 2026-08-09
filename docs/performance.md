@@ -208,3 +208,59 @@ The hottest cost centers, in roughly decreasing impact:
 6. **B2** (appterm env reuse) — half a day.
 7. **A5, A6, A7** — cheap polish.
 8. Profile, then consider B3/B4/B5/C3.
+
+---
+
+## Category D — Shen-level perf: metacircular interp + safe-subset compiler (2026-08-10)
+
+This is the complement to the C-VM analysis above. The OS-load path (loading Shen OS
+`.kl` into the metacircular interpreter running ON the C VM) is dominated by
+Shen-level code (`shen/zinc.shen` compiler + `shen/interp.shen` metacircular VM),
+not the C VM. Advisor review confirmed the C-VM categories above are mostly
+irrelevant to the OS-load bottleneck; the hot path is interpreted Shen running on
+the C VM.
+
+### D1. COMPLETED — tail-threaded `zinc-c`/`zinc-t` (commit `0ad3d8f`)
+Eliminated the O(n²) `append` in the compiler's `[let X Y]` / `[if X Y Z]` rules,
+which was the #1 OS-load bottleneck. `stlib.initialise-sources` is a 339-deep
+`(do ...)` chain → 339-deep let-chain; each nesting level copied the whole
+accumulator via `append` → ~3-4B C VM instructions → the 5B-instruction hard-limit
+abort. Now `zinc-c`/`zinc-t` thread a `Tail` accumulator (`zinc-c-tail`,
+`zinc-t-tail`, `zinc-c-args`) with zero `append`. Verified byte-identical output on
+427 of 429 closures (only `zinc-c`/`zinc-t` differ). All tests pass. Full writeup in
+`docs/bugs.md` #8.
+
+### D2. DEFERRED — `collect-apply-args` accumulator (low impact, low risk)
+Every `apply`/`appterm` in the metacircular interp does `(append (reverse Args) E1)`
+(`shen/interp.shen:104,118,131`) to rebuild the env. The `reverse` exists because
+`collect-apply-args` builds the arg list head-first (stack order) rather than env
+order. Fix: thread an accumulator through `collect-apply-args` so args come out in
+source order, skipping the `reverse`. **Impact:** small — saves `|Args|` conses per
+call, only matters at RUNTIME of compiled OS code, not at compile. **Risk:** low.
+**Verdict:** do for cleanliness after the OS loads; negligible for the current
+blocker.
+
+### D3. DEFERRED — memoize `zinc-arity` in the closure value (trivial, medium risk)
+`zinc-arity` (`shen/interp.shen:77-79`) re-walks `C1` counting `grab`s on every
+`apply`/`appterm`. Change `[lambda C1 E1]` → `[lambda C1 E1 Arity]`, computed once
+at `cur`. **Impact:** trivial — arity ≤ 3 in all relevant calls. **Risk:** medium —
+every rule that pattern-matches `[lambda C1 E1]` (trap-error, function?, the three
+apply/appterm rules) must be updated; easy to miss one and break the bundle.
+**Verdict:** defer unless profiling after OS loads shows apply overhead significant.
+
+### D4. DEFERRED — vector env for `lookup` (large refactor, bad trade-off)
+`lookup` (`shen/interp.shen:38-41`) is O(env-depth). A vector env (absvector) would
+make it O(1) but every env construction becomes a vector copy O(|env|) — *worse*
+than the current O(|Args|) append for small calls. Would need persistent-vector
+technique to win. **Verdict:** skip unless `lookup` is measured hot post-OS-load.
+
+### D5. Confirmed NOT needed — `normalize`/`debruijn`/`kmacros`
+These are already linear (build via direct conses, not `append`). Once `zinc-c` is
+tail-threaded the whole compile pipeline is O(n). No changes needed.
+
+### D6. Alternative strategy if D1 alone isn't enough — pre-bundle the OS offline
+Skip runtime compilation of the OS `.kl` files entirely by pre-bundling them via
+`make bundle-full`. AGENTS.md notes the full bundle is type-unsafe and segfaults the
+release VM, but works under `./zincvm-debug`. If the goal is just "load stlib.kl",
+pre-bundling sidesteps the metacircular compile cost. Not needed — D1 already
+cleared the hard limit.
