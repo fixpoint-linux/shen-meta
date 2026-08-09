@@ -1221,6 +1221,7 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         cf.parent = vm_catch_chain;
         cf.in_trap_error = 0;   /* set to 1 inside body branch */
         vm_catch_chain = &cf;
+        volatile size_t body_call_wm = gc_root_watermark();
         if (setjmp(cf.buf) == 0) {
             /* Body path: in_trap_error=1 so primitive type errors throw */
             cf.in_trap_error = 1;
@@ -1244,6 +1245,10 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             /* Error path: unlink FIRST so handler's simple-error propagates
                to the enclosing catch frame, not back to this one. */
             vm_catch_chain = cf.parent;
+            /* Drop the body's vm_exec_env prologue roots leaked when
+               vm_throw longjmp'd out of it (bypassing its `done:` epilogue).
+               Mirrors eval-kl. */
+            gc_root_pop_to(body_call_wm);
             Value err = cf.error_val;
             int env_len = handler.lambda.env_len;
             int new_env_len = env_len + 1;
@@ -2836,11 +2841,13 @@ int main(int argc, char **argv) {
                     cf.parent = vm_catch_chain;
                     cf.in_trap_error = 0;
                     vm_catch_chain = &cf;
+                    volatile size_t init_wm = gc_root_watermark();
                     if (setjmp(cf.buf) == 0) {
                         vm_exec_env(init.lambda.code, init.lambda.code_len,
                                     env_init, init.lambda.env_len + 1);
                     }
                     vm_catch_chain = cf.parent;
+                    gc_root_pop_to(init_wm);
                     /* S3: cf.error_val never read at this site (error swallowed). No root needed. */
                 }
                 printf("Shen ready.\n\n");
@@ -2866,11 +2873,13 @@ int main(int argc, char **argv) {
                     cf.parent = vm_catch_chain;
                     cf.in_trap_error = 0;
                     vm_catch_chain = &cf;
+                    volatile size_t repl_wm = gc_root_watermark();
                     if (setjmp(cf.buf) == 0) {
                         vm_exec_env(repl.lambda.code, repl.lambda.code_len,
                                     env_repl, repl.lambda.env_len + 1);
                     }
                     vm_catch_chain = cf.parent;
+                    gc_root_pop_to(repl_wm);
                     /* S3: cf.error_val never read at this site (error swallowed). No root needed. */
                 }
                 repl_mode = 0;
