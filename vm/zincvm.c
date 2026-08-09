@@ -1948,6 +1948,7 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
                  * CALLFRAME_ARRAY scan (gc.c) does not keep dead frame envs /
                  * stacks reachable until the slot is reused. */
                 cf->env = NULL; cf->stack.data = NULL; cf->stack.len = 0;
+                cf->code = NULL; cf->code_len = 0; cf->pc = 0;
                 continue;
             }
             break;
@@ -1992,6 +1993,7 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
                     stack = cf->stack;
                     /* Release stale GC pointers in the popped slot (see above). */
                     cf->env = NULL; cf->stack.data = NULL; cf->stack.len = 0;
+                    cf->code = NULL; cf->code_len = 0; cf->pc = 0;
                     va_push(&stack, acc);  /* push return value to caller stack */
                 } else goto done;
             } else if (stack.len > 0) { env_push(&env, &env_len, &env_cap, va_pop(&stack)); pc++; }
@@ -2072,6 +2074,7 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
                 stack = cf->stack;
                 /* Release stale GC pointers in the popped slot (see above). */
                 cf->env = NULL; cf->stack.data = NULL; cf->stack.len = 0;
+                cf->code = NULL; cf->code_len = 0; cf->pc = 0;
                 va_push(&stack, acc);  /* push return value to caller stack */
             } else goto done;
             break;
