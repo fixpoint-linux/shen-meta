@@ -690,6 +690,19 @@ static void collect(const char *trigger) {
 
     /* ---- finish ---- */
 
+    /* After Phase 1, every live object has been evacuated to next_space.
+     * Any page still tagged current_space is dead from-space and must be
+     * released to space=0 so the next collect's allocatepage can find it.
+     * Without this, dead pages keep their tag forever; allocatepage's
+     * free-page test (gc.c:1542) refuses them during the next Phase 1
+     * (space==next_space of that collect), forcing grow_heap to mint new
+     * space=0 pages — geometric heap growth and eventual OOM. */
+    for (uintptr_t pg = firstheappage; pg <= lastheappage; pg++) {
+        if (space[pg] == current_space) {
+            space[pg] = 0;
+            type_page[pg] = 0;
+        }
+    }
     current_space = next_space;
 
     /* Opt-in stale-reference scan: after the semi-space flip, the previous
