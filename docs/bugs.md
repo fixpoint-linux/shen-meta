@@ -168,6 +168,17 @@ compiles in O(n). Registered `zinc-c-args`/`zinc-c-tail`/`zinc-t-tail` via `set-
 34/34, `make test-debug` 39/39, `make run-bundle` (self-hosting + GC stress) pass. The OS-load
 probe now gets past the hard limit quickly.
 
+**Bonus correctness fix (same session):** `kmacros`' `[open X out]` rule
+(`normalize.shen:44`) was a copy-paste typo — it compiled `(open X out)` into
+`[%% open X in]`. Fixed to `[%% open X out]`. Verified: `(kmacros [open "f" out])`
+now yields `[%% open f out]`, `(kmacros [open "f" in])` stays `[%% open f in]`.
+The metacircular interp's `[prim open]` rule already handled `out` correctly
+(`interp.shen:199`), so only the compile-side rule was wrong. The advisor also
+flagged a `debruijn [let X Y Z]` value-drop bug — **investigated and NOT a bug**:
+`[let X Y Z]` = var X / value Y / body Z, and the rule correctly debruijns the
+value Y into the value slot and the body Z under `[X | Scope]`, dropping only the
+var name (represented as `[lookup N]` in the body).
+
 **Current blocker (OPEN):** The OS-load probe now FAILS fast on `stlib.kl` with
 `tag=9 msg=[error "No condition was true"]` (not a hard-limit hang). "No condition was true" is
 `kmacros`' empty-cond fallback (`normalize.shen:19` `[cond] -> [simple-error ...]`), so a `cond`

@@ -41,7 +41,7 @@
   [intern [type X string]]                     -> [%% intern X]
   [error-to-string [type X exception]]         -> [%% error-to-string X]
   [open [type X string] [type in symbol]]      -> [%% open X in]
-  [open [type X string] [type out symbol]]     -> [%% open X in]
+  [open [type X string] [type out symbol]]     -> [%% open X out]
   [write-byte [type N number] [type S stream]] -> [%% write-byte N S]
   [cn [type S string] [type S1 string]]        -> [%% cn S S1]
   [pos [type S string] [type N number]]        -> [%% pos S N]
