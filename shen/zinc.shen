@@ -11,8 +11,8 @@
   [lambda X]   -> [grab | (zinc-t X)]
   [let X Y]    -> (append (zinc-c X) (append [let] (zinc-t Y)))
   [if X Y Z]   -> (let F (gensym l) (let E (gensym l)
-                    (append (append (zinc-c X) (append [jmpf F] (zinc-c Y)))
-                            (append [jmp E] (append [label F] (append (zinc-c Z) [label E]))))))
+                    (append (append (zinc-c X) (append [jmpf F] (zinc-t Y)))
+                            (append [jmp E] (append [label F] (append (zinc-t Z) [label E]))))))
   [symbol X]   -> [symbol X] where (symbol? X)
   \* %% escapes: (%% F A1..An) compiles directly to a primitive dispatch. *\
   [%% F A]     -> (append (zinc-c A) [prim F]) where (and (symbol? F) (primitive? F))
