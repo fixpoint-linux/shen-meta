@@ -666,9 +666,16 @@ static Value marshal_to_tagged(Value v) {
            Recursive marshalling creates deeply nested structures that the
            compiled interp patterns can't match. */
         gc_root_push_value(&v);  /* root v across nested val_cons allocs */
-        Value result = val_cons(val_symbol("cons"),
-                        val_cons(*v.cons.car, val_cons(*v.cons.cdr, val_nil())));
-        gc_root_pop();
+        Value car_val = *v.cons.car;
+        Value cdr_val = *v.cons.cdr;
+        gc_root_push_value(&car_val);
+        gc_root_push_value(&cdr_val);
+        Value inner  = val_cons(cdr_val, val_nil());
+        gc_root_push_value(&inner);
+        Value middle = val_cons(car_val, inner);
+        gc_root_push_value(&middle);
+        Value result = val_cons(val_symbol("cons"), middle);
+        gc_root_pop(); gc_root_pop(); gc_root_pop(); gc_root_pop(); gc_root_pop();
         return result;
     }
     case VAL_NIL:
@@ -704,11 +711,15 @@ static Value demarshal_from_tagged(Value tagged) {
     if (strcmp(tag, "cons") == 0) {
         gc_root_push_value(&tagged);  /* root tagged across recursive call allocs */
         Value cdr = *tagged.cons.cdr;
-        if (cdr.tag == VAL_NIL) { gc_root_pop(); return val_nil(); }  /* [cons] — empty list */
+        gc_root_push_value(&cdr);
+        if (cdr.tag == VAL_NIL) { gc_root_pop(); gc_root_pop(); return val_nil(); }  /* [cons] — empty list */
         /* [cons X Y] — recursively demarshal car and cdr */
         Value tagged_car = *cdr.cons.car;
         Value tagged_cdr = *cdr.cons.cdr;
         Value actual_cdr = *tagged_cdr.cons.car;
+        gc_root_push_value(&tagged_car);
+        gc_root_push_value(&tagged_cdr);
+        gc_root_push_value(&actual_cdr);
         Value r1 = demarshal_from_tagged(tagged_car);
         gc_root_push_value(&r1);     /* root r1 across demarshal of actual_cdr */
         Value r2 = demarshal_from_tagged(actual_cdr);
@@ -716,6 +727,10 @@ static Value demarshal_from_tagged(Value tagged) {
         Value out = val_cons(r1, r2);
         gc_root_pop();  /* r2 */
         gc_root_pop();  /* r1 */
+        gc_root_pop();  /* actual_cdr */
+        gc_root_pop();  /* tagged_cdr */
+        gc_root_pop();  /* tagged_car */
+        gc_root_pop();  /* cdr */
         gc_root_pop();  /* tagged */
         return out;
     }

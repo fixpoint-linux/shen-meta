@@ -37,6 +37,27 @@ static void alarm_handler(int sig) {
     longjmp(alarm_jmp, 1);
 }
 
+static void crash_handler(int sig) {
+    fprintf(stderr, "\n*** CRASH: signal %d ***\n", sig);
+    fprintf(stderr, "*** Resolve with: addr2line -e ./BINARY <addr> ***\n");
+    /* Manual frame-pointer walk for x86_64.
+     * Requires -fno-omit-frame-pointer at compile time.
+     * x86_64 ABI: %rbp points to [saved_rbp, return_addr]. */
+    void **rbp = __builtin_frame_address(0);
+    int depth = 0;
+    fprintf(stderr, "Backtrace (frame-pointer walk, depth limit 32):\n");
+    while (rbp && depth < 32) {
+        void *ret_addr = rbp[1];
+        if (!ret_addr) break;
+        fprintf(stderr, "  [%2d] %p\n", depth, ret_addr);
+        void **next_rbp = (void **)rbp[0];
+        if (next_rbp <= rbp) break;  /* guard against stack corruption loops */
+        rbp = next_rbp;
+        depth++;
+    }
+    _exit(sig);
+}
+
 static void run_test_timeout(const char *label, const char *bytecode, int show_code, int timeout_sec) {
     test_timed_out = 0;
     fprintf(stderr, "[run_test] %s: parsing...\n", label);
@@ -1318,6 +1339,11 @@ int main(int argc, char **argv) {
     init_globals();
 
     gc_init(256UL * 1024 * 1024);
+
+    /* Install SIGSEGV backtrace handler for crash diagnostics */
+    struct sigaction sa = {0};
+    sa.sa_handler = crash_handler;
+    sigaction(SIGSEGV, &sa, NULL);
 
     /* Register typed walkers so gc_scan_roots traces defun_table closures,
      * values_table values, and traced_code Instr arrays.  These replace the
