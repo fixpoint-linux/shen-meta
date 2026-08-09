@@ -124,6 +124,79 @@ static Value call_bundled_1(const char *name, Value arg) {
     return result;
 }
 
+/* call_bundled_2: call a two-argument bundled closure by name. */
+static Value call_bundled_2(const char *name, Value a1, Value a2) {
+    Value fn = defun_get(name);
+    if (fn.tag != VAL_LAMBDA) return val_nil();
+    gc_root_push_value(&fn);
+    gc_root_push_value(&a1);
+    gc_root_push_value(&a2);
+    Value *env = GC_VALUE_ARRAY(fn.lambda.env_len + 2);
+    if (fn.lambda.env_len > 0)
+        memcpy(env, fn.lambda.env, fn.lambda.env_len * sizeof(Value));
+    env[fn.lambda.env_len] = a1;
+    env[fn.lambda.env_len + 1] = a2;
+    CatchFrame cf;
+    cf.parent = vm_catch_chain;
+    cf.in_trap_error = 0;
+    vm_catch_chain = &cf;
+    Value result;
+    if (setjmp(cf.buf)) {
+        vm_catch_chain = cf.parent;
+        gc_root_push_value(&cf.error_val);
+        result = cf.error_val;
+        gc_root_pop();
+        gc_root_pop();  /* a2 */
+        gc_root_pop();  /* a1 */
+        gc_root_pop();  /* fn */
+        return result;
+    }
+    result = vm_exec_env(fn.lambda.code, fn.lambda.code_len, env, fn.lambda.env_len + 2);
+    vm_catch_chain = cf.parent;
+    gc_root_push_value(&result);
+    gc_root_pop();                 /* result */
+    gc_root_pop();                 /* a2 */
+    gc_root_pop();                 /* a1 */
+    gc_root_pop();                 /* fn */
+    return result;
+}
+
+/* apply_closure_2: apply a closure VALUE (not by name) to 2 args. */
+static Value apply_closure_2(Value fn, Value a1, Value a2) {
+    if (fn.tag != VAL_LAMBDA) return val_nil();
+    gc_root_push_value(&fn);
+    gc_root_push_value(&a1);
+    gc_root_push_value(&a2);
+    Value *env = GC_VALUE_ARRAY(fn.lambda.env_len + 2);
+    if (fn.lambda.env_len > 0)
+        memcpy(env, fn.lambda.env, fn.lambda.env_len * sizeof(Value));
+    env[fn.lambda.env_len] = a1;
+    env[fn.lambda.env_len + 1] = a2;
+    CatchFrame cf;
+    cf.parent = vm_catch_chain;
+    cf.in_trap_error = 0;
+    vm_catch_chain = &cf;
+    Value result;
+    if (setjmp(cf.buf)) {
+        vm_catch_chain = cf.parent;
+        gc_root_push_value(&cf.error_val);
+        result = cf.error_val;
+        gc_root_pop();
+        gc_root_pop();
+        gc_root_pop();
+        gc_root_pop();
+        return result;
+    }
+    result = vm_exec_env(fn.lambda.code, fn.lambda.code_len, env, fn.lambda.env_len + 2);
+    vm_catch_chain = cf.parent;
+    gc_root_push_value(&result);
+    gc_root_pop();
+    gc_root_pop();
+    gc_root_pop();
+    gc_root_pop();
+    return result;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Nursery scavenge helpers (moved from zincvm.c)                     */
 /* ------------------------------------------------------------------ */
@@ -1741,6 +1814,84 @@ int main(int argc, char **argv) {
                             printf("  Probe 4 FAIL: expected symbol `loaded`, got tag=%d\n", c4.tag);
                         fflush(stdout);
                     }
+                }
+
+                /* Probe 4b: does OUR zinc-c compile a FLAT debruijn'd
+                 * application [[function debruijn] [] [lookup 1]] into FLAT
+                 * or CURRIED ZINC?  This isolates where the currying is
+                 * introduced (zinc-c vs upstream KLambda). */
+                printf("\n--- OS-load Probe 4b: zinc-c on flat KLambda app ---\n"); fflush(stdout);
+                {
+                    /* [function debruijn] */
+                    Value fn_h = val_cons(val_symbol("function"), val_cons(val_symbol("debruijn"), val_nil()));
+                    /* [lookup 1] */
+                    Value lk = val_cons(val_symbol("lookup"), val_cons(val_number(1), val_nil()));
+                    /* [[function debruijn] [] [lookup 1]] */
+                    Value kl = val_cons(fn_h, val_cons(val_nil(), val_cons(lk, val_nil())));
+                    Value z = call_bundled_1("zinc-c", kl);
+                    printf("  zinc-c([function debruijn] [] [lookup 1]) -> ");
+                    print_value(z); printf(" (tag=%d)\n", z.tag); fflush(stdout);
+                }
+
+                /* Probe 4c: bundled shen->kl on a .shen define — does it
+                 * produce FLAT or CURRIED KLambda for (debruijn [] X)? */
+                printf("\n--- OS-load Probe 4c: shen->kl on test-define.shen ---\n"); fflush(stdout);
+                {
+                    Value p = val_string("shen/probe-kl/test-define.shen", (long)strlen("shen/probe-kl/test-define.shen"));
+                    Value forms = call_bundled_1("read-file-raw", p);
+                    Value kls = call_bundled_1("shen->kl-forms", forms);
+                    printf("  forms: "); print_value(forms); printf("\n  kls: "); print_value(kls); printf("\n"); fflush(stdout);
+                }
+
+                /* Probe 4d: compile (defun my-add [X Y] [+ X Y]) through the
+                 * flat pipeline pieces (defun->lambda -> kmacros ->
+                 * normalize-term -> debruijn -> zinc-c) to find where zinc-c
+                 * says "unknown expression". */
+                printf("\n--- OS-load Probe 4d: pipeline on my-add defun ---\n"); fflush(stdout);
+                {
+                    /* Test the CPS continuation `id` first: does (id 42) -> 42? */
+                    Value idr = call_bundled_1("id", val_number(42));
+                    printf("  id(42): "); print_value(idr); printf(" (tag=%d)\n", idr.tag); fflush(stdout);
+                    /* normalize-term on [+ X Y] directly (bypass lambda) */
+                    Value xsym2 = val_symbol("X"), ysym2 = val_symbol("Y"), addsym2 = val_symbol("+");
+                    Value plus = val_cons(addsym2, val_cons(xsym2, val_cons(ysym2, val_nil())));
+                    Value N2 = call_bundled_1("normalize-term", plus);
+                    printf("  normalize-term([+ X Y]): "); print_value(N2); printf("\n"); fflush(stdout);
+                    /* idx: X and Y positions in scope [X Y] should differ. */
+                    Value sc = val_cons(xsym2, val_cons(ysym2, val_nil()));
+                    Value iX = call_bundled_2("idx", xsym2, sc);
+                    Value iY = call_bundled_2("idx", ysym2, sc);
+                    printf("  idx X [X Y]: "); print_value(iX); printf("   idx Y [X Y]: "); print_value(iY); printf("\n"); fflush(stdout);
+                    Value xsym = val_symbol("X"), ysym = val_symbol("Y"), addsym = val_symbol("+");
+                    Value args = val_cons(xsym, val_cons(ysym, val_nil()));
+                    Value body = val_cons(addsym, val_cons(xsym, val_cons(ysym, val_nil())));
+                    Value defun = val_cons(val_symbol("defun"),
+                               val_cons(val_symbol("my-add"),
+                                 val_cons(args, val_cons(body, val_nil()))));
+                    Value lam = call_bundled_1("defun->lambda", defun);
+                    printf("  defun->lambda: "); print_value(lam); printf("\n"); fflush(stdout);
+                    Value K = call_bundled_1("kmacros", lam);
+                    printf("  kmacros: "); print_value(K); printf("\n"); fflush(stdout);
+                    Value N = call_bundled_1("normalize-term", K);
+                    printf("  normalize: "); print_value(N); printf("\n"); fflush(stdout);
+                    Value nil = val_nil();
+                    Value D = call_bundled_2("debruijn", nil, N);
+                    printf("  debruijn: "); print_value(D); printf("\n"); fflush(stdout);
+                    Value Z = call_bundled_1("zinc-c", D);
+                    printf("  zinc-c: "); print_value(Z); printf("\n"); fflush(stdout);
+                    /* toplevel-interp the compiled code -> closure (does this OOM?) */
+                    Value clos = call_bundled_1("toplevel-interp", Z);
+                    printf("  toplevel-interp(zinc-c): "); print_value(clos); printf(" (tag=%d)\n", clos.tag); fflush(stdout);
+                }
+
+                /* Probe 4e: shen->kl output for a 3-arg fn (index_h) — check
+                 * KLambda before debruijn. */
+                printf("\n--- OS-load Probe 4e: shen->kl on index_h ---\n"); fflush(stdout);
+                {
+                    Value p = val_string("shen/probe-kl/test-indexh.shen", (long)strlen("shen/probe-kl/test-indexh.shen"));
+                    Value forms = call_bundled_1("read-file-raw", p);
+                    Value kls = call_bundled_1("shen->kl-forms", forms);
+                    printf("  shen->kl(index_h): "); print_value(kls); printf("\n"); fflush(stdout);
                 }
 
                 printf("\n--- Test OS-load probe: interp-load-raw of shen/probe-kl/test-add.kl ---\n"); fflush(stdout);

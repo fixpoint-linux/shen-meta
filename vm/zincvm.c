@@ -2051,9 +2051,8 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
                 fprintf(stderr, "runtime: apply non-callable tag=%d", acc.tag);
                 if (acc.tag == VAL_SYMBOL) {
                     fprintf(stderr, " sym='%s'", acc.sym.name);
-                    /* Show recent globals that resolved to this symbol */
-                    fprintf(stderr, " at pc=%d depth=%d", pc, frames_sp);
                 }
+                fprintf(stderr, " at pc=%d depth=%d", pc, frames_sp);
                 fprintf(stderr, "\n");
                 goto done;
             }
