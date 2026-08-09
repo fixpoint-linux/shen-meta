@@ -138,3 +138,40 @@ and clear `type_page`. After the fix `live_pages` stays stable at ~135K across a
 no `grow_heap` fires, `interp-load-raw` of the probe `.kl` completes and `(my-add 2 3)` evaluates.
 `make test` 34/34, `make test-debug` 39/39. Diagnostic probes live in `vm/zinctest.c` under
 `#ifdef ZINC_TEST_OS_LOAD` (build with `-DZINCTEST -DZINCVM_DEBUG -DZINC_TEST_OS_LOAD`).
+
+## 8. OS-load: `stlib.kl` compiler O(n²) `append` — FIXED (tail-threaded zinc-c/zinc-t); now a kmacros `cond` blocker
+
+**Status: perf blocker FIXED (tail-threaded `zinc-c`/`zinc-t`). Remaining: `stlib.kl` FAILS fast with `No condition was true`.**
+
+**Symptom (pre-fix):** Ordered OS load reached `stlib.kl` (file 20) and aborted at the instruction
+hard limit: `[HARD LIMIT] 5000000000 instructions, aborting at pc=16 frames=37`, after ~50 min of
+burning instructions compiling the 231 KB `initialise-sources` defun. Files 0-19 loaded cleanly.
+
+**Root cause (advisor-confirmed):** `stlib.initialise-sources` is a 339-deep left-nested
+`(do X (do Y ...))` chain. `kmacros` rewrites each `(do X Y)` into `(let (newvar) X Y)`, so
+post-normalization it is a 339-deep left-nested let-chain. `zinc-c`'s `[let X Y]` rule used nested
+`append` — each nesting level copies the entire accumulator, so compiling the chain was O(n²):
+~39M cons allocations ≈ ~400M metacircular instructions ≈ 3-4B C VM instructions. NOTE: Tier-3
+`fold-append` in `util.shen` was NOT the primary culprit (only used for multi-arg calls); the
+quadratic lived in the `[let X Y]` / `[if X Y Z]` append chains.
+
+**Fix (uncommitted at this writing):** Rewrote `shen/zinc.shen` to tail-thread `zinc-c`/`zinc-t`
+with a `Tail` accumulator (`zinc-c-tail`, `zinc-t-tail`) plus a `zinc-c-args` helper that compiles
+arg lists left-to-right into Tail. Zero `append` calls remain in the compiler; the let-chain now
+compiles in O(n). Registered `zinc-c-args`/`zinc-c-tail`/`zinc-t-tail` via `set-toplevel` in
+`shen/interp.shen`. Implementation gotcha: `zinc-c-tail` `[lambda X]` must be
+`[cur | [(zinc-t-tail X [return]) | Tail]]` — NOT `[[cur (...)] | Tail]` (double-wrap breaks the
+`c(...)` closure-body unwrap in `parse_bundle`).
+
+**Verification:** Only `zinc-c` and `zinc-t` closures differ from the baseline bundle; all other
+427 bundled closures are byte-identical (semantics preserved on the reduced bundle). `make test`
+34/34, `make test-debug` 39/39, `make run-bundle` (self-hosting + GC stress) pass. The OS-load
+probe now gets past the hard limit quickly.
+
+**Current blocker (OPEN):** The OS-load probe now FAILS fast on `stlib.kl` with
+`tag=9 msg=[error "No condition was true"]` (not a hard-limit hang). "No condition was true" is
+`kmacros`' empty-cond fallback (`normalize.shen:19` `[cond] -> [simple-error ...]`), so a `cond`
+form in `stlib.kl` exhausted all `[cond [X Y] | Rest]` branches during kmacro expansion — i.e. the
+safe-subset kmacros can't expand some `cond` shape that `stlib.kl` uses, or a `cond` branch's
+pattern does not match the rule and falls through to the empty case. Next step: identify the exact
+`cond`/source construct in `stlib.kl` that reaches the empty-cond fallback and extend kmacros.

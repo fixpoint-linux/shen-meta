@@ -3,63 +3,65 @@
   []      -> []
   [H | T] -> [(zinc-c H) | (map-zinc-c T)])
 
-(define zinc-t { klambda --> zinc-code }
-  [lookup X]   -> [access X] where (number? X)
-  [function X] -> [global X] where (symbol? X)
-  \* Single-element symbol list [K] is a literal value, not a call *\
-  [K]          -> [symbol K] where (symbol? K)
-  [lambda X]   -> [grab | (zinc-t X)]
-  [let X Y]    -> (append (zinc-c X) (append [let] (zinc-t Y)))
-  [if X Y Z]   -> (let F (gensym l) (let E (gensym l)
-                    (append (append (zinc-c X) (append [jmpf F] (zinc-t Y)))
-                            (append [jmp E] (append [label F] (append (zinc-t Z) [label E]))))))
-  [symbol X]   -> [symbol X] where (symbol? X)
-  \* %% escapes: (%% F A1..An) compiles directly to a primitive dispatch. *\
-  [%% F A]     -> (append (zinc-c A) [prim F]) where (and (symbol? F) (primitive? F))
-  [%% F | Args] -> (append (fold-append [] (map-zinc-c (reverse (tl Args))))
-                           (append (zinc-c (hd Args)) [prim F]))
-                   where (and (symbol? F) (primitive? F))
-  [F A]        <- (if (primitive? F) (append (zinc-c A) [prim F]) (fail)) where (symbol? F)
-  [F | Args]   <- (if (primitive? F)
-                    (append (fold-append [] (map-zinc-c (reverse (tl Args))))
-                            (append (zinc-c (hd Args)) [prim F]))
-                    (fail)) where (symbol? F)
-  [F | Args]   -> (append [pushmark]
-                          (append (fold-append [] (map-zinc-c (reverse Args)))
-                                  (append (zinc-c F) [appterm])))
-  X            -> [boolean X] where (boolean? X)
-  X            -> [number X] where (number? X)
-  X            -> [string X] where (string? X)
-  []           -> []
-  _            -> (simple-error "zinc-t: unknown expression"))
+\* Compile a list of klambda args left-to-right (caller passes them pre-reversed)
+   threading a Tail accumulator.  Produces code_A1 ++ code_A2 ++ ... ++ Tail. *\
+(define zinc-c-args { (list klambda) --> zinc-code --> zinc-code }
+  []       Tail -> Tail
+  [A | R]  Tail -> (zinc-c-tail A (zinc-c-args R Tail)))
 
-(define zinc-c { klambda --> zinc-code }
-  [lookup X]   -> [access X] where (number? X)
-  [function X] -> [global X] where (symbol? X)
+(define zinc-t-tail { klambda --> zinc-code --> zinc-code }
+  [lookup X]   Tail -> [access X | Tail] where (number? X)
+  [function X] Tail -> [global X | Tail] where (symbol? X)
   \* Single-element symbol list [K] is a literal value, not a call *\
-  [K]          -> [symbol K] where (symbol? K)
-  [lambda X]   -> [cur (append (zinc-t X) [return])]
-  [let X Y]    -> (append (zinc-c X) (append [let] (append (zinc-c Y) [endlet])))
-  [if X Y Z]   -> (let F (gensym l) (let E (gensym l)
-                    (append (append (zinc-c X) (append [jmpf F] (zinc-c Y)))
-                            (append [jmp E] (append [label F] (append (zinc-c Z) [label E]))))))
-  [symbol X]   -> [symbol X] where (symbol? X)
+  [K]          Tail -> [symbol K | Tail] where (symbol? K)
+  [lambda X]   Tail -> [grab | (zinc-t-tail X Tail)]
+  [let X Y]    Tail -> (zinc-c-tail X [let | (zinc-t-tail Y Tail)])
+  [if X Y Z]   Tail -> (let F (gensym l) (let E (gensym l)
+                        (zinc-c-tail X [jmpf F | (zinc-t-tail Y [jmp E | [label F | (zinc-t-tail Z [label E | Tail])]])])))
+  [symbol X]   Tail -> [symbol X | Tail] where (symbol? X)
+  \* %% escapes: (%% F A1..An) compiles directly to a primitive dispatch. *\
+  [%% F A]     Tail -> (zinc-c-tail A [prim F | Tail]) where (and (symbol? F) (primitive? F))
+  [%% F | Args] Tail -> (zinc-c-args (reverse (tl Args)) (zinc-c-tail (hd Args) [prim F | Tail]))
+                   where (and (symbol? F) (primitive? F))
+  [F A]        Tail <- (if (primitive? F) (zinc-c-tail A [prim F | Tail]) (fail)) where (symbol? F)
+  [F | Args]   Tail <- (if (primitive? F)
+                        (zinc-c-args (reverse (tl Args)) (zinc-c-tail (hd Args) [prim F | Tail]))
+                        (fail)) where (symbol? F)
+  [F | Args]   Tail -> [pushmark | (zinc-c-args (reverse Args) (zinc-c-tail F [appterm | Tail]))]
+  X            Tail -> [boolean X | Tail] where (boolean? X)
+  X            Tail -> [number X | Tail] where (number? X)
+  X            Tail -> [string X | Tail] where (string? X)
+  []           Tail -> Tail
+  _            Tail -> (simple-error "zinc-t: unknown expression"))
+
+(define zinc-c-tail { klambda --> zinc-code --> zinc-code }
+  [lookup X]   Tail -> [access X | Tail] where (number? X)
+  [function X] Tail -> [global X | Tail] where (symbol? X)
+  \* Single-element symbol list [K] is a literal value, not a call *\
+  [K]          Tail -> [symbol K | Tail] where (symbol? K)
+  [lambda X]   Tail -> [cur | [(zinc-t-tail X [return]) | Tail]]
+  [let X Y]    Tail -> (zinc-c-tail X [let | (zinc-c-tail Y [endlet | Tail])])
+  [if X Y Z]   Tail -> (let F (gensym l) (let E (gensym l)
+                        (zinc-c-tail X [jmpf F | (zinc-c-tail Y [jmp E | [label F | (zinc-c-tail Z [label E | Tail])]])])))
+  [symbol X]   Tail -> [symbol X | Tail] where (symbol? X)
   \* %% escapes: (%% F A1..An) compiles directly to a primitive dispatch,
      bypassing the global table / safe wrappers (matches C VM's [prim F]). *\
-  [%% F A]     -> (append (zinc-c A) [prim F]) where (and (symbol? F) (primitive? F))
-  [%% F | Args] -> (append (fold-append [] (map-zinc-c (reverse (tl Args))))
-                           (append (zinc-c (hd Args)) [prim F]))
+  [%% F A]     Tail -> (zinc-c-tail A [prim F | Tail]) where (and (symbol? F) (primitive? F))
+  [%% F | Args] Tail -> (zinc-c-args (reverse (tl Args)) (zinc-c-tail (hd Args) [prim F | Tail]))
                    where (and (symbol? F) (primitive? F))
-  [F A]        <- (if (primitive? F) (append (zinc-c A) [prim F]) (fail)) where (symbol? F)
-  [F | Args]   <- (if (primitive? F)
-                    (append (fold-append [] (map-zinc-c (reverse (tl Args))))
-                            (append (zinc-c (hd Args)) [prim F]))
-                    (fail)) where (symbol? F)
-  [F | Args]   -> (append [pushmark]
-                          (append (fold-append [] (map-zinc-c (reverse Args)))
-                                  (append (zinc-c F) [apply])))
-  X            -> [boolean X] where (boolean? X)
-  X            -> [number X] where (number? X)
-  X            -> [string X] where (string? X)
-  []           -> []
-  _            -> (simple-error "zinc-c: unknown expression"))
+  [F A]        Tail <- (if (primitive? F) (zinc-c-tail A [prim F | Tail]) (fail)) where (symbol? F)
+  [F | Args]   Tail <- (if (primitive? F)
+                        (zinc-c-args (reverse (tl Args)) (zinc-c-tail (hd Args) [prim F | Tail]))
+                        (fail)) where (symbol? F)
+  [F | Args]   Tail -> [pushmark | (zinc-c-args (reverse Args) (zinc-c-tail F [apply | Tail]))]
+  X            Tail -> [boolean X | Tail] where (boolean? X)
+  X            Tail -> [number X | Tail] where (number? X)
+  X            Tail -> [string X | Tail] where (string? X)
+  []           Tail -> Tail
+  _            Tail -> (simple-error "zinc-c: unknown expression"))
+
+(define zinc-c { klambda --> zinc-code }
+  E -> (zinc-c-tail E []))
+
+(define zinc-t { klambda --> zinc-code }
+  E -> (zinc-t-tail E []))
