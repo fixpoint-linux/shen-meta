@@ -75,3 +75,53 @@ These are deliberate, preserved behaviors that the CatchFrame refactor (`3ed45b1
 - **Routing the eval-kl path through the safe wrappers (via the metacircular interp rules) was attempted and REVERTED.** Two mechanisms were tried: `((function X) ...)` compiled back to `[prim X]` (not `[global X]`) and introduced a nil-arg regression; `(apply X [args])` failed because `apply` is not a callable global in this context (`apply non-callable sym='apply'`). Both broke self-hosting. The interp rules are back to the original `(X ...)` form, so eval-kl'd dynamic code does NOT yet route through the safe wrappers — the design intent is documented in AGENTS.md but not implemented.
 - **Safe wrappers now cover:** all the arithmetic (`+ - * /`, incl. division-by-zero), list (`hd`/`tl`/`fst`/`snd`/`cons`/`emptylist`), string (`n->string`/`string->n`/`tlstr`/`hdstr`/`str`), symbol (`intern`/`value`/`set`), vector (`absvector` incl. negative, `<-address`/`address->`), I/O (`open` incl. genuine open-failure, `close`, `read-byte`, `write-byte`), `get-time`, `pos`, `cn`, comparisons, `trap-error`, `simple-error`, `error-to-string`, and the type predicates. (`hdstr` and `read-file-as-string` required adding metacircular-interp `[prim ...]` rules so the eval-kl path can wrap them.)
 - `val_error` messages are GC-allocated (no `strdup` leak). All error state is file-scope C statics (not thread-safe); the VM is single-threaded by design.
+
+## 7. Self-hosting bootstrap: `.kl` defun registration now compiles correctly (4 fixes)
+
+**Status: 4 root causes FIXED and committed. One blocker remains (OOM in `interp-load-raw`).**
+
+`(interp-load-raw "file.kl")` now successfully parses a `.kl` defun, compiles it via the
+self-hosted pipeline, and registers it in the meta-interpreter's global-table. Four
+sequential compiler/closure-selection bugs were root-caused and fixed:
+
+1. **`dedupe-globals` inverted (bcb3e80).** Kept the LAST (back = oldest = host `set-toplevel`)
+   duplicate of a global name instead of the FIRST (front = newest = `shen-load`'d). The
+   `shen-load` pipeline compiles every defun to flat/full-arity ZINC, but the curried
+   host-compiled `set-toplevel` closures shadowed them, so the bundled `kl->zinc` crashed on
+   any non-primitive body (`apply non-callable`). Rewrote `dedupe-globals` to keep the first
+   occurrence via a `Bound`-style seen-set.
+2. **`shen-kl-expr` miscompiled higher-order calls (d8125bb).** The data-fallback branch
+   fired on `(UppercaseVar x)` heads, miscompiling `(K Aexp)` into the literal data `[K Aexp]`
+   (a cons chain with no `apply`), silently breaking every CPS continuation in `normalize.shen`.
+   Collapsed `shen-kl-expr` to always emit an application (bracket lists are already consified
+   at read time).
+3. **`compile-pattern` didn't linearize non-linear patterns (4c8e94b).** Repeat variable
+   occurrences (e.g. `X` in `index_h`'s `X [X | Rest] C`) were compiled as fresh bindings
+   instead of equality tests, so `idx` returned 0 for every variable and `debruijn` assigned
+   `[lookup 0]` to all of them. Threaded a `Bound` assoc-list through the pattern compiler so
+   repeat vars emit `[= Slot <prior>]`.
+4. **`zinc-t` compiled `if`-branches non-tail (be5c882).** The metacircular `interp`'s body is a
+   giant `cond`→`if` tree; `zinc-t`'s `[if X Y Z]` compiled branches with `zinc-c` (`apply`,
+   non-tail) instead of `zinc-t` (`appterm`), killing TCO. Every interpreter step pinned its
+   `E`/`S`/`R` cons-list snapshots, growing the heap. Fixed the branches to use `zinc-t`.
+   Bundled `interp` now has 94 `appterm` / 37 `apply` (was 1 / 130).
+
+**Verified correct (C-VM probe `ZINC_TEST_OS_LOAD`):** `idx X [X Y] → 0`, `idx Y [X Y] → 1`;
+`normalize-term([+ X Y]) → [%% + X Y]`; `debruijn` → `[lookup 1] [lookup 0]`;
+`zinc-c` → 2 grabs with distinct access; `toplevel-interp` → `[lambda [grab access 0 access 1
+prim + return] []]`. `interp-eval-all` on the parsed `.kl` forms returns `loaded` and registers
+the closure (`lookup-global my-add` finds it). `make test` 34/34, `make test-debug` 39/39.
+
+**REMAINING BLOCKER (bug 5): `interp-load-raw` OOMs.** `interp-load-raw` (= `interp-eval-all
+(read-file-raw File)`) exhausts the 4 GB GC heap reservation: `[gc] grow_heap: need 8192 MB but
+reservation is 4096 MB`. `allocatedpages` (logged as `live_pages`) doubles every FULL collect
+(~137K → 268K → 530K → 1054K → 2098K), i.e. `grow_heap` keeps doubling because each collection
+needs ~2x the pages. The growth starts during the earlier self-hosting/OS-load probes (heap is
+already ~2M pages by Probe 4c, before `interp-load-raw`), so it is a general runtime
+allocation/retention issue, not specific to `interp-load-raw`. The TCO fix (bug 4) did NOT
+eliminate it. Probe 4 (`interp-eval-all` on pre-parsed forms) passes; `interp-load-raw` (which
+additionally calls `read-file-raw` inside) OOMs. Suspects: a GC retention/root issue in the
+meta-interpreter's `interp` execution or the compiler closures, or high allocation that the GC
+cannot reclaim (heap grows geometrically instead of collecting). Diagnostic probes live in
+`vm/zinctest.c` under `#ifdef ZINC_TEST_OS_LOAD` (build with `-DZINCTEST -DZINCVM_DEBUG
+-DZINC_TEST_OS_LOAD`).
