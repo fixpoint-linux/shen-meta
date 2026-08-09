@@ -158,10 +158,14 @@
 
 (define shen-kl-expr
   [] -> []
-  [H | R] -> (if (shen-kl-app-head? H)
-                 [(shen->kl-body H) | (shen-kl-app-args R)]
-                 (let Split (shen-kl-split-tail R)
-                   [cons (shen->kl-body H) (shen-kl-build-tail Split)]))
+  \* After the reader (commit 49c2ece) consifies bracket list literals at
+     read time, every cons-cell form reaching here is either a genuine
+     application (F x) or a (cons ...) literal produced by the reader —
+     there is no remaining case where data-construction is correct.  The
+     old uppercase-head data branch miscompiled higher-order calls like
+     (K Aexp) into the literal data [K Aexp] (a cons chain with no apply),
+     silently breaking every CPS continuation in normalize.shen. *\
+  [H | R] -> [(shen->kl-body H) | (shen-kl-app-args R)]
   X -> X)
 
 (define shen-kl-app-head?
