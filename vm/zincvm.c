@@ -171,7 +171,41 @@ Value val_string_from(Value *src_slot, int off, int len) {
     v.tag = VAL_STRING; v.str.data = dst; v.str.len = len;
     return v;
 }
+/* Symbol intern table: open-addressed with linear probing, 2048 buckets.
+   Symbols are immortal (no GC pointers inside VAL_SYMBOL), so the table
+   lives forever.  Reduces memory growth and GC pressure from strdup. */
+#define SYMBOL_INTERN_SIZE 2048
+static char *symbol_intern[SYMBOL_INTERN_SIZE];
+
+static unsigned int sym_intern_hash(const char *s) {
+    unsigned int h = 5381;
+    while (*s) h = ((h << 5) + h) + (unsigned char)*s++;
+    return h;
+}
+
 Value val_symbol(const char *name) {
+    unsigned int h = sym_intern_hash(name) & (SYMBOL_INTERN_SIZE - 1);
+    for (int i = 0; i < SYMBOL_INTERN_SIZE; i++) {
+        unsigned int idx = (h + i) & (SYMBOL_INTERN_SIZE - 1);
+        char *existing = symbol_intern[idx];
+        if (!existing) break;  /* empty slot → not in table yet */
+        if (strcmp(existing, name) == 0) {
+            Value v; memset(&v, 0, sizeof(v));
+            v.tag = VAL_SYMBOL; v.sym.name = existing; return v;
+        }
+    }
+    /* Not found — insert.  If the table is full (extremely unlikely),
+       fall back to plain strdup (still correct, just not interred). */
+    for (int i = 0; i < SYMBOL_INTERN_SIZE; i++) {
+        unsigned int idx = (h + i) & (SYMBOL_INTERN_SIZE - 1);
+        if (!symbol_intern[idx]) {
+            char *dup = strdup(name);
+            symbol_intern[idx] = dup;
+            Value v; memset(&v, 0, sizeof(v));
+            v.tag = VAL_SYMBOL; v.sym.name = dup; return v;
+        }
+    }
+    /* Table full — fallback (should never happen with 2048 buckets) */
     Value v; memset(&v, 0, sizeof(v));
     v.tag = VAL_SYMBOL; v.sym.name = strdup(name); return v;
 }
@@ -874,702 +908,711 @@ static int exec_primitive_valid(const char *name) {
  * scan to accidentally keep it alive).  Search for gc_root_push_value in
  * this function to confirm coverage of all such popped-Value→alloc pairs. */
 static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
-    /* --- Type predicates --- */
-    if (strcmp(name, "symbol?") == 0) {
-        Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_SYMBOL); return 0;
-    }
-    if (strcmp(name, "boolean?") == 0) {
-        Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_BOOLEAN); return 0;
-    }
-    if (strcmp(name, "string?") == 0) {
-        Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_STRING); return 0;
-    }
-    if (strcmp(name, "number?") == 0) {
-        Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_NUMBER); return 0;
-    }
-    if (strcmp(name, "cons?") == 0) {
-        Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_CONS); return 0;
-    }
-    if (strcmp(name, "error?") == 0) {
-        Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_ERROR); return 0;
-    }
-    if (strcmp(name, "absvector?") == 0) {
-        Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_VECTOR); return 0;
-    }
-    if (strcmp(name, "function?") == 0) {
-        Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_LAMBDA || a.tag == VAL_PRIM); return 0;
-    }
-    if (strcmp(name, "stream?") == 0) {
-        Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_STREAM); return 0;
-    }
-    if (strcmp(name, "variable?") == 0) {
-        /* Shen variable: first char uppercase A-Z, rest alphanumeric + misc chars.
-           Misc: ` = * / + _ ? $ ! @ ~ . > < & % ' #  (matching shen.misc?) */
-        Value a = va_pop(stack);
-        if (a.tag != VAL_SYMBOL) { *acc = val_boolean(0); return 0; }
-        const char *s = a.sym.name;
-        if (!s[0] || s[0] < 'A' || s[0] > 'Z') { *acc = val_boolean(0); return 0; }
-        for (int i = 1; s[i]; i++) {
-            int c = (unsigned char)s[i];
-            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                (c >= '0' && c <= '9')) continue;
-            /* shen.misc? chars: ` = * / + _ ? $ ! @ ~ . > < & % ' # */
-            if (c == '`' || c == '=' || c == '*' || c == '/' || c == '+' ||
-                c == '_' || c == '?' || c == '$' || c == '!' || c == '@' ||
-                c == '~' || c == '.' || c == '>' || c == '<' || c == '&' ||
-                c == '%' || c == '\'' || c == '#') continue;
-            *acc = val_boolean(0); return 0;
-        }
-        *acc = val_boolean(1); return 0;
-    }
+    if (!name[0]) goto unknown;
+    switch (name[0]) {
 
-    /* --- KLambda tuple ops --- */
-    if (strcmp(name, "@p") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        *acc = val_cons(a1, a2); return 0;
-    }
-    if (strcmp(name, "fst") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("fst on non-cons");
-        *acc = *a.cons.car; return 0;
-    }
-    if (strcmp(name, "snd") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("snd on non-cons");
-        *acc = *a.cons.cdr; return 0;
-    }
-
-    /* --- Arithmetic --- */
-    if (strcmp(name, "+") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("+ on non-numbers");
-        *acc = val_number(a1.number + a2.number); return 0;
-    }
-    if (strcmp(name, "-") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("- on non-numbers");
-        *acc = val_number(a1.number - a2.number); return 0;
-    }
-    if (strcmp(name, "*") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("* on non-numbers");
-        *acc = val_number(a1.number * a2.number); return 0;
-    }
-    if (strcmp(name, "/") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("/ on non-numbers");
-        if (a2.number == 0) PRIM_TYPE_ERROR("division by zero");
-        *acc = val_number(a1.number / a2.number); return 0;
-    }
-
-    /* --- Comparison --- */
-    if (strcmp(name, "=") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        if (a1.tag == VAL_NUMBER && a2.tag == VAL_NUMBER)
-            *acc = val_boolean(a1.number == a2.number);
-        else if (a1.tag == VAL_STRING && a2.tag == VAL_STRING)
-            *acc = val_boolean(a1.str.len == a2.str.len && memcmp(a1.str.data, a2.str.data, a1.str.len) == 0);
-        else if (a1.tag == VAL_SYMBOL && a2.tag == VAL_SYMBOL)
-            *acc = val_boolean(strcmp(a1.sym.name, a2.sym.name) == 0);
-        else if (a1.tag == VAL_BOOLEAN && a2.tag == VAL_BOOLEAN)
-            *acc = val_boolean(a1.boolean == a2.boolean);
-        /* cons-vs-symbol and symbol-vs-cons: always false.
-           zinc-c currently generates correct hd-wrapped comparisons, so
-           flat comparisons like = [number 42] "number" no longer occur. */
-        else if ((a1.tag == VAL_CONS && a2.tag == VAL_SYMBOL) ||
-                 (a1.tag == VAL_SYMBOL && a2.tag == VAL_CONS))
-            *acc = val_boolean(false);
-        /* fail is registered as VAL_PRIM so it can be both applied (error)
-           and compared in where clauses.  Compare symbol name with prim name. */
-        else if (a1.tag == VAL_SYMBOL && a2.tag == VAL_PRIM)
-            *acc = val_boolean(strcmp(a1.sym.name, a2.prim.name) == 0);
-        else if (a1.tag == VAL_PRIM && a2.tag == VAL_SYMBOL)
-            *acc = val_boolean(strcmp(a1.prim.name, a2.sym.name) == 0);
-        /* Deep structural equality for cons cells.  Critical for
-           macroexpand-h's fixed-point check: (= original walked).
-           Without this, cons==cons always returns false (falls through
-           to the NIL==NIL catch-all), causing infinite recursion. */
-        else if (a1.tag == VAL_CONS && a2.tag == VAL_CONS)
-            *acc = val_boolean(deep_equal(a1, a2));
-        else if (a1.tag == VAL_VECTOR && a2.tag == VAL_VECTOR)
-            *acc = val_boolean(deep_equal(a1, a2));
-        else *acc = val_boolean(a1.tag == VAL_NIL && a2.tag == VAL_NIL);
-        return 0;
-    }
-    if (strcmp(name, "<") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        *acc = val_boolean(a1.tag == VAL_NUMBER && a2.tag == VAL_NUMBER && a1.number < a2.number); return 0;
-    }
-    if (strcmp(name, ">") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        *acc = val_boolean(a1.tag == VAL_NUMBER && a2.tag == VAL_NUMBER && a1.number > a2.number); return 0;
-    }
-    if (strcmp(name, "<=") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        *acc = val_boolean(a1.tag == VAL_NUMBER && a2.tag == VAL_NUMBER && a1.number <= a2.number); return 0;
-    }
-    if (strcmp(name, ">=") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        *acc = val_boolean(a1.tag == VAL_NUMBER && a2.tag == VAL_NUMBER && a1.number >= a2.number); return 0;
-    }
-
-    /* --- List ops --- */
-    if (strcmp(name, "cons") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        *acc = val_cons(a1, a2); return 0;
-    }
-    if (strcmp(name, "hd") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag == VAL_NIL) { *acc = val_nil(); return 0; }
-        if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("hd on non-cons");
-        *acc = *a.cons.car; return 0;
-    }
-    if (strcmp(name, "tl") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag == VAL_NIL) { *acc = val_nil(); return 0; }
-        if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("tl on non-cons");
-        *acc = *a.cons.cdr; return 0;
-    }
-    if (strcmp(name, "emptylist") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag == VAL_NUMBER && a.number == 0) { *acc = val_nil(); return 0; }
-        if (a.tag != VAL_NUMBER || a.number != 0) PRIM_TYPE_ERROR("emptylist on non-zero");
-    }
-
-    /* --- String ops --- */
-    if (strcmp(name, "cn") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-        char b1[256], b2[256];
-        if (a1.tag == VAL_STRING) snprintf(b1, sizeof(b1), "%.*s", a1.str.len, a1.str.data);
-        else if (a1.tag == VAL_NUMBER) snprintf(b1, sizeof(b1), "%ld", a1.number);
-        else if (a1.tag == VAL_SYMBOL) snprintf(b1, sizeof(b1), "%s", a1.sym.name);
-        else if (a1.tag == VAL_BOOLEAN) snprintf(b1, sizeof(b1), "%s", a1.boolean ? "true" : "false");
-        else if (a1.tag == VAL_NIL) snprintf(b1, sizeof(b1), "[]");
-        else snprintf(b1, sizeof(b1), "[?]");
-        if (a2.tag == VAL_STRING) snprintf(b2, sizeof(b2), "%.*s", a2.str.len, a2.str.data);
-        else if (a2.tag == VAL_NUMBER) snprintf(b2, sizeof(b2), "%ld", a2.number);
-        else if (a2.tag == VAL_SYMBOL) snprintf(b2, sizeof(b2), "%s", a2.sym.name);
-        else if (a2.tag == VAL_BOOLEAN) snprintf(b2, sizeof(b2), "%s", a2.boolean ? "true" : "false");
-        else if (a2.tag == VAL_NIL) snprintf(b2, sizeof(b2), "[]");
-        else snprintf(b2, sizeof(b2), "[?]");
-        int len = strlen(b2) + strlen(b1);
-        char *r = malloc(len + 1);
-        strcpy(r, b1); strcat(r, b2);
-        *acc = val_string(r, len); free(r); return 0;
-    }
-    if (strcmp(name, "n->string") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag != VAL_NUMBER) PRIM_TYPE_ERROR("n->string on non-number");
-        /* Shen: number→character code (ASCII). (n->string 40) → "(" */
-        char buf[2] = { (char)a.number, '\0' };
-        *acc = val_string(buf, 1); return 0;
-    }
-    if (strcmp(name, "string->n") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag != VAL_STRING) PRIM_TYPE_ERROR("string->n on non-string");
-        /* Shen: character code of first character. (string->n "(") → 40 */
-        *acc = val_number(a.str.len > 0 ? (unsigned char)a.str.data[0] : 0); return 0;
-    }
-    if (strcmp(name, "str") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag == VAL_SYMBOL) *acc = val_string(a.sym.name, strlen(a.sym.name));
-        else if (a.tag == VAL_STRING) *acc = a;
-        else if (a.tag == VAL_NUMBER) { char buf[64]; int len = snprintf(buf, sizeof(buf), "%ld", a.number); *acc = val_string(buf, len); }
-        else if (a.tag == VAL_BOOLEAN) *acc = val_string(a.boolean ? "true" : "false",
-                                                         a.boolean ? 4 : 5);
-        else { static char buf[4096]; int pos = 0; str_value(a, buf, &pos, sizeof(buf), 0); *acc = val_string(buf, pos); }
-        return 0;
-    }
-    if (strcmp(name, "tlstr") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag != VAL_STRING || a.str.len < 1) PRIM_TYPE_ERROR("tlstr on empty/non-string");
-        *acc = val_string_from(&a, 1, a.str.len - 1); return 0;
-    }
-    if (strcmp(name, "hdstr") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag != VAL_STRING || a.str.len < 1) PRIM_TYPE_ERROR("hdstr on empty/non-string");
-        *acc = val_string_from(&a, 0, 1); return 0;
-    }
-    if (strcmp(name, "pos") == 0) {
-        Value a1 = va_pop(stack), a2 = va_pop(stack);
-#ifdef ZINCVM_DEBUG
-        if (a1.tag != VAL_STRING || a2.tag != VAL_NUMBER) {
-            if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                vm_throw("pos on bad types");
-            fprintf(stderr, "runtime: pos on bad types\n"); return -1;
+    /* ---- 'a': absvector, absvector?, address-> ---- */
+    case 'a':
+        if (strcmp(name, "absvector") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_NUMBER || a.number < 0) PRIM_TYPE_ERROR("absvector bad size");
+            *acc = val_vector((int)a.number); return 0;
         }
-#endif
-        /* Shen: (pos Str N) returns the single character at index N.
-           Out of bounds → empty string. But when inside trap-error,
-           OOB must trigger an error so that callers (e.g. shen.string->byte)
-           can catch it and return shen.eos. Without this, shen.write-chars
-           loops forever writing NUL bytes. */
-        int pl = (int)a2.number;
-        if (pl < 0 || pl >= a1.str.len) {
-            /* OOB is a semantic error (not a type error). Shen code relies on
-               trap-error catching this to detect end-of-string (e.g. strlen-acc).
-               Must throw unconditionally when inside trap-error, not just in debug. */
-            if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                vm_throw("pos out of bounds");
-            *acc = val_string("", 0);
-        } else *acc = val_string_from(&a1, pl, 1);
-        return 0;
-    }
-
-    /* --- Symbol ops --- */
-    if (strcmp(name, "intern") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag != VAL_STRING) PRIM_TYPE_ERROR("intern on non-string");
-        char buf[256]; int n = a.str.len < 255 ? a.str.len : 255;
-        memcpy(buf, a.str.data, n); buf[n] = '\0';
-        *acc = val_symbol(buf); return 0;
-    }
-    if (strcmp(name, "value") == 0) {
-        Value a = va_pop(stack);
-#ifdef ZINCVM_DEBUG
-        if (a.tag != VAL_SYMBOL) {
-            if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                vm_throw("value on non-symbol");
-            fprintf(stderr, "runtime: value on non-symbol\n");
-            return -1;
+        if (strcmp(name, "absvector?") == 0) {
+            Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_VECTOR); return 0;
         }
-#endif
-        *acc = value_get(a.sym.name); return 0;
-    }
-
-    /* --- Vector ops --- */
-    if (strcmp(name, "absvector") == 0) {
-        Value a = va_pop(stack);
-        if (a.tag != VAL_NUMBER || a.number < 0) PRIM_TYPE_ERROR("absvector bad size");
-        *acc = val_vector((int)a.number); return 0;
-    }
-    if (strcmp(name, "<-address") == 0) {
-        Value vec = va_pop(stack), idx = va_pop(stack);
-#ifdef ZINCVM_DEBUG
-        if (vec.tag != VAL_VECTOR || idx.tag != VAL_NUMBER) {
-            if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                vm_throw("<-address bad types");
-            fprintf(stderr, "runtime: <-address bad types\n"); return -1;
-        }
-#endif
-        int i = (int)idx.number;
-#ifdef ZINCVM_DEBUG
-        if (i < 0 || i >= vec.vector.len) {
-            if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                vm_throw("<-address OOB");
-            fprintf(stderr, "runtime: <-address OOB\n"); return -1;
-        }
-#endif
-        *acc = vec.vector.data[i]; return 0;
-    }
-    if (strcmp(name, "address->") == 0) {
-        Value vec = va_pop(stack), idx = va_pop(stack), val = va_pop(stack);
-        if (vec.tag != VAL_VECTOR || idx.tag != VAL_NUMBER) PRIM_TYPE_ERROR("address-> bad types");
-        int i = (int)idx.number;
-        if (i < 0 || i >= vec.vector.len) PRIM_TYPE_ERROR("address-> OOB");
-        vec.vector.data[i] = val;
-        /* Phase 2 Step 5 — write barrier: if the vector's element array
-         * is in old-gen and the stored value references a nursery object,
-         * record the element array so the next nursery scavenge scans it
-         * (old-gen is not otherwise scanned).  vec is a by-value pop,
-         * but vec.vector.data is the real heap array pointer. */
-        if (vec.vector.data &&
-            gc_in_oldgen(vec.vector.data) &&
-            value_references_nursery(&val)) {
-            gc_dirty_vectors_add(vec.vector.data);
-        }
-        *acc = vec; return 0;
-    }
-
-    /* --- Error handling --- */
-    if (strcmp(name, "simple-error") == 0) {
-        Value a = va_pop(stack);
-        /* REPL EOF exit: when stdin hits EOF, the reader raises
-           "error: empty stream" and shen.loop would normally catch it
-           and re-loop infinitely.  In repl_mode, longjmp to repl_exit_jmp
-           for a clean exit instead. */
-        if (repl_mode && a.tag == VAL_STRING
-            && a.str.len == 19 && strncmp(a.str.data, "error: empty stream", 19) == 0) {
-            longjmp(repl_exit_jmp, 1);
-        }
-        char msg[256];
-        if (a.tag == VAL_STRING) snprintf(msg, sizeof(msg), "%.*s", a.str.len, a.str.data);
-        else snprintf(msg, sizeof(msg), "simple-error called");
-        vm_throw(msg);
-    }
-    if (strcmp(name, "shen.fail!") == 0 || strcmp(name, "fail") == 0) {
-        /* (defun fail () shen.fail!) — called as (fail) triggers error.
-           When called WITH arguments (e.g., YACC's (fail 0)), return a
-           sentinel cons [fail arg] instead.  This matches standard Shen
-           behavior where (fail N) creates a parse-failure sentinel for
-           parse-failure? to match via =. */
-        if (stack->len > 0) {
-            Value arg = va_pop(stack);
-            *acc = val_cons(val_symbol("fail"), val_cons(arg, val_nil()));
-            return 0;
-        }
-        vm_throw("fail");
-    }
-    if (strcmp(name, "error-to-string") == 0) {
-        Value a = va_pop(stack);
-        /* Pin a so a.error.message survives the GC_STR alloc inside
-           val_string (4a precise-root site). */
-        gc_root_push_value(&a);
-        if (a.tag == VAL_ERROR) *acc = val_string(a.error.message, strlen(a.error.message));
-        else if (a.tag == VAL_STRING) *acc = a;
-        else *acc = val_string("unknown error", 13);
-        gc_root_pop();
-        return 0;
-    }
-    if (strcmp(name, "trap-error") == 0) {
-        /* RTL: (trap-error Body Handler) — Handler pushed first, then Body.
-           Stack: [mark, Handler, Body] → pop Body first, then Handler.
-           handler is volatile: after longjmp from vm_throw, the compiler
-           must re-read handler from the stack, not from a cached register. */
-        volatile Value body = va_pop(stack);
-        volatile Value handler = va_pop(stack);
-        /* Pin body and handler so their interior pointers (lambda.env,
-           lambda.code) survive the GC_VALUE_ARRAY calls below (4a precise-root).
-           Use volatile-safe API — body/handler are volatile (longjmp re-read). */
-        gc_root_push_value_volatile(&body);
-        gc_root_push_value_volatile(&handler);
-        if (handler.tag != VAL_LAMBDA) PRIM_TYPE_ERROR("trap-error handler not fn");
-        CatchFrame cf;
-        cf.parent = vm_catch_chain;
-        cf.in_trap_error = 0;   /* set to 1 inside body branch */
-        vm_catch_chain = &cf;
-        volatile size_t body_call_wm = gc_root_watermark();
-        if (setjmp(cf.buf) == 0) {
-            /* Body path: in_trap_error=1 so primitive type errors throw */
-            cf.in_trap_error = 1;
-            if (body.tag == VAL_LAMBDA) {
-                /* kmacros wraps the body in (lambda (newvar) B), so the
-                   bytecode expects a dummy parameter at env index 0.
-                   Append a nil to the captured env to match. */
-                int new_len = body.lambda.env_len + 1;
-                Value *new_env = GC_VALUE_ARRAY(new_len);
-                if (body.lambda.env_len > 0)
-                    memcpy(new_env, body.lambda.env, body.lambda.env_len * sizeof(Value));
-                new_env[body.lambda.env_len] = val_nil();
-                if (gc_in_oldgen(new_env) && body.lambda.env_len > 0) {
-                    for (int j = 0; j < body.lambda.env_len; j++) {
-                        if (value_references_nursery(&body.lambda.env[j])) {
-                            gc_dirty_vectors_add(new_env);
-                            break;
-                        }
-                    }
-                }
-                *acc = vm_exec_env(body.lambda.code, body.lambda.code_len, new_env, new_len);
+        if (strcmp(name, "address->") == 0) {
+            Value vec = va_pop(stack), idx = va_pop(stack), val = va_pop(stack);
+            if (vec.tag != VAL_VECTOR || idx.tag != VAL_NUMBER) PRIM_TYPE_ERROR("address-> bad types");
+            int i = (int)idx.number;
+            if (i < 0 || i >= vec.vector.len) PRIM_TYPE_ERROR("address-> OOB");
+            vec.vector.data[i] = val;
+            if (vec.vector.data &&
+                gc_in_oldgen(vec.vector.data) &&
+                value_references_nursery(&val)) {
+                gc_dirty_vectors_add(vec.vector.data);
             }
-            else *acc = body;
-            vm_catch_chain = cf.parent;
-            gc_root_pop();  /* handler */
-            gc_root_pop();  /* body */
-            return 0;
-        } else {
-            /* Error path: unlink FIRST so handler's simple-error propagates
-               to the enclosing catch frame, not back to this one. */
-            vm_catch_chain = cf.parent;
-            /* Drop the body's vm_exec_env prologue roots leaked when
-               vm_throw longjmp'd out of it (bypassing its `done:` epilogue).
-               Mirrors eval-kl. */
-            gc_root_pop_to(body_call_wm);
-            Value err = cf.error_val;
-            int env_len = handler.lambda.env_len;
-            int new_env_len = env_len + 1;
-            gc_root_push_value(&err);        /* S3: root err (copy of cf.error_val) across GC_VALUE_ARRAY */
-            Value *henv = GC_VALUE_ARRAY(new_env_len);
-            if (env_len > 0)
-                memcpy(henv, handler.lambda.env, env_len * sizeof(Value));
-            henv[env_len] = err;
-            if (gc_in_oldgen(henv) && value_references_nursery(&err))
-                gc_dirty_vectors_add(henv);
-            /* Capture lambda.code AFTER allocating (GC may evacuate it) —
-               handler is a volatile root so handler.lambda.code is updated
-               in-place by GC, but a separately-captured local is not. */
-            Instr *hc = handler.lambda.code; int hl = handler.lambda.code_len;
-            gc_root_pop();  /* err */
-            /* Pop roots BEFORE calling handler — if handler's vm_exec_env
-               raises a simple-error (longjmps to cf.parent), the pops
-               would be skipped.  All handler interior-pointers have been
-               captured into locals (hc, hl, henv, new_env_len). */
-            gc_root_pop();  /* handler */
-            gc_root_pop();  /* body */
-            *acc = vm_exec_env(hc, hl, henv, new_env_len);
-            return 0;
+            *acc = vec; return 0;
         }
-    }
+        break;
 
-    /* --- I/O --- */
-    if (strcmp(name, "open") == 0) {
-        /* ZINC evaluates args right-to-left, so the stack has:
-           [rightmost, leftmost] with leftmost on top.
-           For (open path dir): stack=[dir, path], path on top. */
-        Value path = va_pop(stack), dir = va_pop(stack);
-#ifdef ZINCVM_DEBUG
-        if (path.tag != VAL_STRING || dir.tag != VAL_SYMBOL) {
-            if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                vm_throw("open bad types");
-            fprintf(stderr, "runtime: open bad types — path.tag=%d dir.tag=%d", path.tag, dir.tag);
-            if (path.tag == VAL_SYMBOL) fprintf(stderr, " path='%s'", path.sym.name);
-            if (path.tag == VAL_MARK) fprintf(stderr, " path=MARK");
-            if (dir.tag == VAL_STRING) fprintf(stderr, " dir='%.*s'", dir.str.len, dir.str.data);
-            fprintf(stderr, " stack_remaining=%d\n", stack->len);
-            for (int si = stack->len - 1; si >= 0 && si >= stack->len - 5; si--) {
-                fprintf(stderr, "  stack[%d]: tag=%d", si, stack->data[si].tag);
-                if (stack->data[si].tag == VAL_SYMBOL) fprintf(stderr, " '%s'", stack->data[si].sym.name);
-                if (stack->data[si].tag == VAL_MARK) fprintf(stderr, " MARK");
-                fprintf(stderr, "\n");
-            }
-            return -1;
+    /* ---- 'b': boolean? ---- */
+    case 'b':
+        if (strcmp(name, "boolean?") == 0) {
+            Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_BOOLEAN); return 0;
         }
-#endif
-        char pb[256]; int n = path.str.len < 255 ? path.str.len : 255;
-        memcpy(pb, path.str.data, n); pb[n] = '\0';
-        if (strcmp(dir.sym.name, "in") == 0) {
-            FILE *f = fopen(pb, "r");
-            if (f) { *acc = val_stream_in(f); return 0; }
-            /* File not found — treat as string stream */
-            if (errno == ENOENT) {
-                *acc = val_string_stream_in(path.str.data, path.str.len);
-                return 0;
-            }
-            /* Genuine open failure (EACCES/ENOTDIR/...).  Return false so the
-               Shen safe wrapper (safe.open) can detect it and raise a catchable
-               simple-error — reference Shen's kl:open raises "File does not
-               exist".  The wrapper owns this error, not the C primitive. */
-            *acc = val_boolean(false); return 0;
-        } else if (strcmp(dir.sym.name, "out") == 0) {
-            FILE *f = fopen(pb, "w");
-            if (!f) { *acc = val_boolean(false); return 0; }
-            *acc = val_stream_out(f); return 0;
+        break;
+
+    /* ---- 'c': cons, cons?, cn, close ---- */
+    case 'c':
+        if (strcmp(name, "cons") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            *acc = val_cons(a1, a2); return 0;
         }
-#ifdef ZINCVM_DEBUG
-        if (vm_catch_chain && vm_catch_chain->in_trap_error)
-            vm_throw("open invalid direction");
-        fprintf(stderr, "runtime: open direction must be in or out\n"); return -1;
-#endif
-    }
-    if (strcmp(name, "close") == 0) {
-        Value s = va_pop(stack);
-        if (s.tag != VAL_STREAM) PRIM_TYPE_ERROR("close on non-stream");
-        if (s.stream.is_string) {
-            int idx = (int)(intptr_t)s.stream.file - 1;
-            if (idx < 0 || idx >= n_string_streams) { fprintf(stderr, "runtime: bad string stream idx\n"); return -1; }
-            free(string_streams[idx].data);
-            string_streams[idx].data = NULL;
+        if (strcmp(name, "cons?") == 0) {
+            Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_CONS); return 0;
+        }
+        if (strcmp(name, "cn") == 0) {
+            /* cn: concatenate two values as strings.  Two-pass approach:
+               first compute total length, then write into a single GC_STR
+               allocation.  No truncation, no malloc/free per call. */
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            int l1, l2;
+            switch (a1.tag) {
+            case VAL_STRING:  l1 = a1.str.len; break;
+            case VAL_NUMBER:  { char t[32]; l1 = snprintf(t, sizeof(t), "%ld", a1.number); } break;
+            case VAL_SYMBOL:  l1 = (int)strlen(a1.sym.name); break;
+            case VAL_BOOLEAN: l1 = a1.boolean ? 4 : 5; break;
+            case VAL_NIL:     l1 = 2; break;
+            default:          l1 = 3; break;
+            }
+            switch (a2.tag) {
+            case VAL_STRING:  l2 = a2.str.len; break;
+            case VAL_NUMBER:  { char t[32]; l2 = snprintf(t, sizeof(t), "%ld", a2.number); } break;
+            case VAL_SYMBOL:  l2 = (int)strlen(a2.sym.name); break;
+            case VAL_BOOLEAN: l2 = a2.boolean ? 4 : 5; break;
+            case VAL_NIL:     l2 = 2; break;
+            default:          l2 = 3; break;
+            }
+            int total = l1 + l2;
+            gc_root_push_value(&a1);
+            gc_root_push_value(&a2);
+            char *buf = GC_STR(total);
+            int pos = 0;
+            switch (a1.tag) {
+            case VAL_STRING:  memcpy(buf + pos, a1.str.data, l1); break;
+            case VAL_NUMBER:  snprintf(buf + pos, (size_t)l1 + 1, "%ld", a1.number); break;
+            case VAL_SYMBOL:  memcpy(buf + pos, a1.sym.name, l1); break;
+            case VAL_BOOLEAN: memcpy(buf + pos, a1.boolean ? "true" : "false", l1); break;
+            case VAL_NIL:     memcpy(buf + pos, "[]", 2); break;
+            default:          memcpy(buf + pos, "[?]", 3); break;
+            }
+            pos = l1;
+            switch (a2.tag) {
+            case VAL_STRING:  memcpy(buf + pos, a2.str.data, l2); break;
+            case VAL_NUMBER:  snprintf(buf + pos, (size_t)l2 + 1, "%ld", a2.number); break;
+            case VAL_SYMBOL:  memcpy(buf + pos, a2.sym.name, l2); break;
+            case VAL_BOOLEAN: memcpy(buf + pos, a2.boolean ? "true" : "false", l2); break;
+            case VAL_NIL:     memcpy(buf + pos, "[]", 2); break;
+            default:          memcpy(buf + pos, "[?]", 3); break;
+            }
+            gc_root_pop(); gc_root_pop();
+            Value result; memset(&result, 0, sizeof(result));
+            result.tag = VAL_STRING; result.str.data = buf; result.str.len = total;
+            *acc = result; return 0;
+        }
+        if (strcmp(name, "close") == 0) {
+            Value s = va_pop(stack);
+            if (s.tag != VAL_STREAM) PRIM_TYPE_ERROR("close on non-stream");
+            if (s.stream.is_string) {
+                int idx = (int)(intptr_t)s.stream.file - 1;
+                if (idx < 0 || idx >= n_string_streams) { fprintf(stderr, "runtime: bad string stream idx\n"); return -1; }
+                free(string_streams[idx].data);
+                string_streams[idx].data = NULL;
+                *acc = val_nil(); return 0;
+            }
+            if (s.stream.file) fclose(s.stream.file);
             *acc = val_nil(); return 0;
         }
-        if (s.stream.file) fclose(s.stream.file);
-        *acc = val_nil(); return 0;
-    }
-    if (strcmp(name, "read-byte") == 0) {
-        Value s = va_pop(stack);
-#ifdef ZINCVM_DEBUG
-        if (s.tag != VAL_STREAM || !s.stream.is_input) {
-            if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                vm_throw("read-byte on non-input");
-            fprintf(stderr, "runtime: read-byte on non-input\n"); return -1;
+        break;
+
+    /* ---- 'e': error?, error-to-string, eval-kl, emptylist ---- */
+    case 'e':
+        if (strcmp(name, "error?") == 0) {
+            Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_ERROR); return 0;
         }
-#endif
-        if (s.stream.is_string) {
-            int idx = (int)(intptr_t)s.stream.file - 1;
-            if (idx < 0 || idx >= n_string_streams) { return -1; }
-            if (string_streams[idx].pos >= string_streams[idx].len) {
-                *acc = val_number(-1);  /* EOF */
-            } else {
-                *acc = val_number((unsigned char)string_streams[idx].data[string_streams[idx].pos++]);
-            }
+        if (strcmp(name, "error-to-string") == 0) {
+            Value a = va_pop(stack);
+            gc_root_push_value(&a);
+            if (a.tag == VAL_ERROR) *acc = val_string(a.error.message, strlen(a.error.message));
+            else if (a.tag == VAL_STRING) *acc = a;
+            else *acc = val_string("unknown error", 13);
+            gc_root_pop();
             return 0;
         }
-        int c = fgetc(s.stream.file); *acc = val_number(c == EOF ? -1 : c); return 0;
-    }
-    if (strcmp(name, "read-file-as-string") == 0) {
-        Value path = va_pop(stack);
-        if (path.tag != VAL_STRING) PRIM_TYPE_ERROR("read-file-as-string on non-string");
-        char *p = strndup(path.str.data, path.str.len);
-        FILE *f = fopen(p, "r");
-        free(p);
-        if (!f) { fprintf(stderr, "runtime: cannot open file for read-file-as-string\n"); *acc = val_string("", 0); return 0; }
-        fseek(f, 0, SEEK_END);
-        long sz = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        char *buf = malloc(sz + 1);
-        size_t n = fread(buf, 1, sz, f);
-        fclose(f);
-        buf[n] = '\0';
-        *acc = val_string(buf, n);
-        free(buf);
-        return 0;
-    }
-    if (strcmp(name, "write-byte") == 0) {
-        /* RTL: (write-byte Byte Stream) — Stream pushed first (bottom), Byte last (top). */
-        Value byte = va_pop(stack);
-        Value s    = va_pop(stack);
+        if (strcmp(name, "eval-kl") == 0) {
+            Value a = va_pop(stack);
+            CatchFrame cf;
+            cf.parent = vm_catch_chain;
+            cf.in_trap_error = 0;
+            vm_catch_chain = &cf;
+            volatile Value result = a;
+            volatile size_t eval_kl_wm = gc_root_watermark();
+            if (setjmp(cf.buf) == 0) {
+
+            Value tagged = marshal_to_tagged(a);
+            gc_root_push_value(&tagged);
+
+            Value extkl = defun_get("extract-kl");
+            gc_root_push_value(&extkl);
+            if (extkl.tag != VAL_LAMBDA) {
+                fprintf(stderr, "runtime: eval-kl: extract-kl not found in bundle\n");
+                goto eval_kl_done;
+            }
+            Value *env1 = GC_VALUE_ARRAY(extkl.lambda.env_len + 1);
+            if (extkl.lambda.env_len > 0)
+                memcpy(env1, extkl.lambda.env, extkl.lambda.env_len * sizeof(Value));
+            env1[extkl.lambda.env_len] = tagged;
+            if (gc_in_oldgen(env1) && value_references_nursery(&tagged))
+                gc_dirty_vectors_add(env1);
+            Value klambda = vm_exec_env(extkl.lambda.code, extkl.lambda.code_len,
+                                         env1, extkl.lambda.env_len + 1);
+            gc_root_push_value(&klambda);
+
+            Value klzinc = defun_get("kl->zinc");
+            gc_root_push_value(&klzinc);
+            if (klzinc.tag != VAL_LAMBDA) {
+                fprintf(stderr, "runtime: eval-kl: kl->zinc not found in bundle\n");
+                goto eval_kl_done;
+            }
+            Value *env2 = GC_VALUE_ARRAY(klzinc.lambda.env_len + 1);
+            if (klzinc.lambda.env_len > 0)
+                memcpy(env2, klzinc.lambda.env, klzinc.lambda.env_len * sizeof(Value));
+            env2[klzinc.lambda.env_len] = klambda;
+            if (gc_in_oldgen(env2) && value_references_nursery(&klambda))
+                gc_dirty_vectors_add(env2);
+            Value zinc_code = vm_exec_env(klzinc.lambda.code, klzinc.lambda.code_len,
+                                           env2, klzinc.lambda.env_len + 1);
+            gc_root_push_value(&zinc_code);
+
+            Value tli = defun_get("toplevel-interp");
+            gc_root_push_value(&tli);
+            if (tli.tag != VAL_LAMBDA) {
+                fprintf(stderr, "runtime: eval-kl: toplevel-interp not found in bundle\n");
+                goto eval_kl_done;
+            }
+            Value *env3 = GC_VALUE_ARRAY(tli.lambda.env_len + 1);
+            if (tli.lambda.env_len > 0)
+                memcpy(env3, tli.lambda.env, tli.lambda.env_len * sizeof(Value));
+            env3[tli.lambda.env_len] = zinc_code;
+            if (gc_in_oldgen(env3) && value_references_nursery(&zinc_code))
+                gc_dirty_vectors_add(env3);
+            Value tagged_result = vm_exec_env(tli.lambda.code, tli.lambda.code_len,
+                                               env3, tli.lambda.env_len + 1);
+            gc_root_push_value(&tagged_result);
+
+            result = demarshal_from_tagged(tagged_result);
+
+            eval_kl_done:
+            gc_root_pop_to(eval_kl_wm);
+            vm_catch_chain = cf.parent;
+            *acc = result;
+            return 0;
+            }
+            gc_root_pop_to(eval_kl_wm);
+            vm_catch_chain = cf.parent;
+            *acc = result;
+            return 0;
+        }
+        if (strcmp(name, "emptylist") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag == VAL_NUMBER && a.number == 0) { *acc = val_nil(); return 0; }
+            if (a.tag != VAL_NUMBER || a.number != 0) PRIM_TYPE_ERROR("emptylist on non-zero");
+        }
+        break;
+
+    /* ---- 'f': fst, function?, fail ---- */
+    case 'f':
+        if (strcmp(name, "fst") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("fst on non-cons");
+            *acc = *a.cons.car; return 0;
+        }
+        if (strcmp(name, "function?") == 0) {
+            Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_LAMBDA || a.tag == VAL_PRIM); return 0;
+        }
+        if (strcmp(name, "fail") == 0) {
+            if (stack->len > 0) {
+                Value arg = va_pop(stack);
+                *acc = val_cons(val_symbol("fail"), val_cons(arg, val_nil()));
+                return 0;
+            }
+            vm_throw("fail");
+        }
+        break;
+
+    /* ---- 'g': gensym, get-time ---- */
+    case 'g':
+        if (strcmp(name, "gensym") == 0) {
+            static long gensym_counter = 0;
+            char buf[64];
+            if (stack->len > 0) va_pop(stack);
+            snprintf(buf, sizeof(buf), "shen.gensym_%ld", gensym_counter++);
+            *acc = val_symbol(buf); return 0;
+        }
+        if (strcmp(name, "get-time") == 0) {
+            Value mode = va_pop(stack);
+            if (mode.tag != VAL_SYMBOL) PRIM_TYPE_ERROR("get-time requires symbol");
+            if (strcmp(mode.sym.name, "unix") == 0 || strcmp(mode.sym.name, "real") == 0)
+                { *acc = val_number((long)time(NULL)); return 0; }
+            if (strcmp(mode.sym.name, "run") == 0) { *acc = val_number((long)clock()); return 0; }
 #ifdef ZINCVM_DEBUG
-        if (s.tag != VAL_STREAM || s.stream.is_input) {
             if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                vm_throw("write-byte on non-output");
-            fprintf(stderr, "runtime: write-byte on non-output\n"); return -1;
-        }
-        if (byte.tag != VAL_NUMBER) {
-            if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                vm_throw("write-byte requires number");
-            fprintf(stderr, "runtime: write-byte requires number\n"); return -1;
-        }
+                vm_throw("get-time unknown mode");
+            fprintf(stderr, "runtime: unknown get-time mode '%s'\n", mode.sym.name); return -1;
 #endif
-        fputc((int)byte.number, s.stream.file);
-        if (s.stream.file == stdout) fflush(stdout);
-        *acc = val_number(byte.number); return 0;
-    }
-    if (strcmp(name, "get-time") == 0) {
-        Value mode = va_pop(stack);
-        if (mode.tag != VAL_SYMBOL) PRIM_TYPE_ERROR("get-time requires symbol");
-        if (strcmp(mode.sym.name, "unix") == 0 || strcmp(mode.sym.name, "real") == 0)
-            { *acc = val_number((long)time(NULL)); return 0; }
-        if (strcmp(mode.sym.name, "run") == 0) { *acc = val_number((long)clock()); return 0; }
+        }
+        break;
+
+    /* ---- 'h': hd, hdstr ---- */
+    case 'h':
+        if (strcmp(name, "hd") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag == VAL_NIL) { *acc = val_nil(); return 0; }
+            if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("hd on non-cons");
+            *acc = *a.cons.car; return 0;
+        }
+        if (strcmp(name, "hdstr") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_STRING || a.str.len < 1) PRIM_TYPE_ERROR("hdstr on empty/non-string");
+            *acc = val_string_from(&a, 0, 1); return 0;
+        }
+        break;
+
+    /* ---- 'i': intern ---- */
+    case 'i':
+        if (strcmp(name, "intern") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_STRING) PRIM_TYPE_ERROR("intern on non-string");
+            char buf[256]; int n = a.str.len < 255 ? a.str.len : 255;
+            memcpy(buf, a.str.data, n); buf[n] = '\0';
+            *acc = val_symbol(buf); return 0;
+        }
+        break;
+
+    /* ---- 'n': n->string, number?, newvar ---- */
+    case 'n':
+        if (strcmp(name, "n->string") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_NUMBER) PRIM_TYPE_ERROR("n->string on non-number");
+            char buf[2] = { (char)a.number, '\0' };
+            *acc = val_string(buf, 1); return 0;
+        }
+        if (strcmp(name, "number?") == 0) {
+            Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_NUMBER); return 0;
+        }
+        if (strcmp(name, "newvar") == 0) {
+            static int newvar_counter = 0;
+            char buf[64];
+            if (stack->len > 0) va_pop(stack);
+            snprintf(buf, sizeof(buf), "V_%d", newvar_counter++);
+            *acc = val_symbol(buf); return 0;
+        }
+        break;
+
+    /* ---- 'o': open ---- */
+    case 'o':
+        if (strcmp(name, "open") == 0) {
+            Value path = va_pop(stack), dir = va_pop(stack);
 #ifdef ZINCVM_DEBUG
-        if (vm_catch_chain && vm_catch_chain->in_trap_error)
-            vm_throw("get-time unknown mode");
-        fprintf(stderr, "runtime: unknown get-time mode '%s'\n", mode.sym.name); return -1;
+            if (path.tag != VAL_STRING || dir.tag != VAL_SYMBOL) {
+                if (vm_catch_chain && vm_catch_chain->in_trap_error)
+                    vm_throw("open bad types");
+                fprintf(stderr, "runtime: open bad types — path.tag=%d dir.tag=%d", path.tag, dir.tag);
+                if (path.tag == VAL_SYMBOL) fprintf(stderr, " path='%s'", path.sym.name);
+                if (path.tag == VAL_MARK) fprintf(stderr, " path=MARK");
+                if (dir.tag == VAL_STRING) fprintf(stderr, " dir='%.*s'", dir.str.len, dir.str.data);
+                fprintf(stderr, " stack_remaining=%d\n", stack->len);
+                for (int si = stack->len - 1; si >= 0 && si >= stack->len - 5; si--) {
+                    fprintf(stderr, "  stack[%d]: tag=%d", si, stack->data[si].tag);
+                    if (stack->data[si].tag == VAL_SYMBOL) fprintf(stderr, " '%s'", stack->data[si].sym.name);
+                    if (stack->data[si].tag == VAL_MARK) fprintf(stderr, " MARK");
+                    fprintf(stderr, "\n");
+                }
+                return -1;
+            }
 #endif
-    }
-
-    /* --- Meta --- */
-    if (strcmp(name, "gensym") == 0) {
-        static long gensym_counter = 0;
-        char buf[64];
-        if (stack->len > 0) va_pop(stack);  /* consume prefix arg (Shen compiler passes it) */
-        snprintf(buf, sizeof(buf), "shen.gensym_%ld", gensym_counter++);
-        *acc = val_symbol(buf); return 0;
-    }
-    if (strcmp(name, "newvar") == 0) {
-        static int newvar_counter = 0;
-        char buf[64];
-        if (stack->len > 0) va_pop(stack);  /* consume prefix arg */
-        snprintf(buf, sizeof(buf), "V_%d", newvar_counter++);
-        *acc = val_symbol(buf); return 0;
-    }
-    if (strcmp(name, "set") == 0) {
-        Value sym = va_pop(stack), v = va_pop(stack);
-        if (sym.tag != VAL_SYMBOL) PRIM_TYPE_ERROR("set requires symbol");
-        value_set(sym.sym.name, v); *acc = v; return 0;
-    }
-    if (strcmp(name, "eval-kl") == 0) {
-        Value a = va_pop(stack);
-        /* eval-kl chain (interp.shen:80):
-           marshal native → tagged form
-           → extract-kl    (tagged → raw KLambda)
-           → kl->zinc      (KLambda → ZINC bytecode)
-           → toplevel-interp (ZINC bytecode → tagged result)
-           → demarshal tagged result → native Value
-
-           The three closures are in the bundle via set-toplevel
-           in interp.shen:193-195.  The recursion guard prevents
-           infinite re-entry when %% eval-kl is called from within
-           Shen code executed by the chain. */
-        /* Recursion guard removed — was breaking defun compilation
-           by returning identity instead of evaluating nested eval-kl.
-           With Boehm GC, deep recursion through eval-kl→kl→zinc→eval-kl
-           is safe (no GC corruption).  A CatchFrame swallows pipeline
-           errors (simple-error → longjmp) and returns identity. */
-        CatchFrame cf;
-        cf.parent = vm_catch_chain;
-        cf.in_trap_error = 0;
-        vm_catch_chain = &cf;
-        volatile Value result = a;  /* default: identity; volatile so the longjmp path re-reads from the stack */
-        /* Watermark for longjmp unwind: any roots pushed inside the setjmp==0
-           block must be truncated on the error path (4a precise-root). */
-        volatile size_t eval_kl_wm = gc_root_watermark();
-        if (setjmp(cf.buf) == 0) {
-
-        /* Marshal native Value → Shen tagged form */
-        Value tagged = marshal_to_tagged(a);
-        gc_root_push_value(&tagged);
-
-        /* Step 1: extract-kl — tagged form → raw KLambda */
-        Value extkl = defun_get("extract-kl");
-        gc_root_push_value(&extkl);
-        if (extkl.tag != VAL_LAMBDA) {
-            fprintf(stderr, "runtime: eval-kl: extract-kl not found in bundle\n");
-            goto done;
+            char pb[256]; int n = path.str.len < 255 ? path.str.len : 255;
+            memcpy(pb, path.str.data, n); pb[n] = '\0';
+            if (strcmp(dir.sym.name, "in") == 0) {
+                FILE *f = fopen(pb, "r");
+                if (f) { *acc = val_stream_in(f); return 0; }
+                if (errno == ENOENT) {
+                    *acc = val_string_stream_in(path.str.data, path.str.len);
+                    return 0;
+                }
+                *acc = val_boolean(false); return 0;
+            } else if (strcmp(dir.sym.name, "out") == 0) {
+                FILE *f = fopen(pb, "w");
+                if (!f) { *acc = val_boolean(false); return 0; }
+                *acc = val_stream_out(f); return 0;
+            }
+#ifdef ZINCVM_DEBUG
+            if (vm_catch_chain && vm_catch_chain->in_trap_error)
+                vm_throw("open invalid direction");
+            fprintf(stderr, "runtime: open direction must be in or out\n"); return -1;
+#endif
         }
-        Value *env1 = GC_VALUE_ARRAY(extkl.lambda.env_len + 1);
-        if (extkl.lambda.env_len > 0)
-            memcpy(env1, extkl.lambda.env, extkl.lambda.env_len * sizeof(Value));
-        env1[extkl.lambda.env_len] = tagged;
-        if (gc_in_oldgen(env1) && value_references_nursery(&tagged))
-            gc_dirty_vectors_add(env1);
-        Value klambda = vm_exec_env(extkl.lambda.code, extkl.lambda.code_len,
-                                     env1, extkl.lambda.env_len + 1);
-        gc_root_push_value(&klambda);
+        break;
 
-        /* Step 2: kl->zinc — raw KLambda → ZINC bytecode */
-        Value klzinc = defun_get("kl->zinc");
-        gc_root_push_value(&klzinc);
-        if (klzinc.tag != VAL_LAMBDA) {
-            fprintf(stderr, "runtime: eval-kl: kl->zinc not found in bundle\n");
-            goto done;
+    /* ---- 'p': pos ---- */
+    case 'p':
+        if (strcmp(name, "pos") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+#ifdef ZINCVM_DEBUG
+            if (a1.tag != VAL_STRING || a2.tag != VAL_NUMBER) {
+                if (vm_catch_chain && vm_catch_chain->in_trap_error)
+                    vm_throw("pos on bad types");
+                fprintf(stderr, "runtime: pos on bad types\n"); return -1;
+            }
+#endif
+            int pl = (int)a2.number;
+            if (pl < 0 || pl >= a1.str.len) {
+                if (vm_catch_chain && vm_catch_chain->in_trap_error)
+                    vm_throw("pos out of bounds");
+                *acc = val_string("", 0);
+            } else *acc = val_string_from(&a1, pl, 1);
+            return 0;
         }
-        Value *env2 = GC_VALUE_ARRAY(klzinc.lambda.env_len + 1);
-        if (klzinc.lambda.env_len > 0)
-            memcpy(env2, klzinc.lambda.env, klzinc.lambda.env_len * sizeof(Value));
-        env2[klzinc.lambda.env_len] = klambda;
-        if (gc_in_oldgen(env2) && value_references_nursery(&klambda))
-            gc_dirty_vectors_add(env2);
-        Value zinc_code = vm_exec_env(klzinc.lambda.code, klzinc.lambda.code_len,
-                                       env2, klzinc.lambda.env_len + 1);
-        gc_root_push_value(&zinc_code);
+        break;
 
-        /* Step 3: toplevel-interp — ZINC bytecode → tagged result */
-        Value tli = defun_get("toplevel-interp");
-        gc_root_push_value(&tli);
-        if (tli.tag != VAL_LAMBDA) {
-            fprintf(stderr, "runtime: eval-kl: toplevel-interp not found in bundle\n");
-            goto done;
+    /* ---- 'r': read-byte, read-file-as-string ---- */
+    case 'r':
+        if (strcmp(name, "read-byte") == 0) {
+            Value s = va_pop(stack);
+#ifdef ZINCVM_DEBUG
+            if (s.tag != VAL_STREAM || !s.stream.is_input) {
+                if (vm_catch_chain && vm_catch_chain->in_trap_error)
+                    vm_throw("read-byte on non-input");
+                fprintf(stderr, "runtime: read-byte on non-input\n"); return -1;
+            }
+#endif
+            if (s.stream.is_string) {
+                int idx = (int)(intptr_t)s.stream.file - 1;
+                if (idx < 0 || idx >= n_string_streams) { return -1; }
+                if (string_streams[idx].pos >= string_streams[idx].len) {
+                    *acc = val_number(-1);
+                } else {
+                    *acc = val_number((unsigned char)string_streams[idx].data[string_streams[idx].pos++]);
+                }
+                return 0;
+            }
+            int c = fgetc(s.stream.file); *acc = val_number(c == EOF ? -1 : c); return 0;
         }
-        Value *env3 = GC_VALUE_ARRAY(tli.lambda.env_len + 1);
-        if (tli.lambda.env_len > 0)
-            memcpy(env3, tli.lambda.env, tli.lambda.env_len * sizeof(Value));
-        env3[tli.lambda.env_len] = zinc_code;
-        if (gc_in_oldgen(env3) && value_references_nursery(&zinc_code))
-            gc_dirty_vectors_add(env3);
-        Value tagged_result = vm_exec_env(tli.lambda.code, tli.lambda.code_len,
-                                           env3, tli.lambda.env_len + 1);
-        gc_root_push_value(&tagged_result);
+        if (strcmp(name, "read-file-as-string") == 0) {
+            Value path = va_pop(stack);
+            if (path.tag != VAL_STRING) PRIM_TYPE_ERROR("read-file-as-string on non-string");
+            char *p = strndup(path.str.data, path.str.len);
+            FILE *f = fopen(p, "r");
+            free(p);
+            if (!f) { fprintf(stderr, "runtime: cannot open file for read-file-as-string\n"); *acc = val_string("", 0); return 0; }
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            char *buf = malloc(sz + 1);
+            size_t n = fread(buf, 1, sz, f);
+            fclose(f);
+            buf[n] = '\0';
+            *acc = val_string(buf, n);
+            free(buf);
+            return 0;
+        }
+        break;
 
-        /* Step 4: demarshal tagged result → native Value */
-        result = demarshal_from_tagged(tagged_result);
+    /* ---- 's': symbol?, string?, simple-error, str, stream?, stinput,
+                 stoutput, set, string->n, shen.fail! ---- */
+    case 's':
+        if (strcmp(name, "symbol?") == 0) {
+            Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_SYMBOL); return 0;
+        }
+        if (strcmp(name, "string?") == 0) {
+            Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_STRING); return 0;
+        }
+        if (strcmp(name, "simple-error") == 0) {
+            Value a = va_pop(stack);
+            if (repl_mode && a.tag == VAL_STRING
+                && a.str.len == 19 && strncmp(a.str.data, "error: empty stream", 19) == 0) {
+                longjmp(repl_exit_jmp, 1);
+            }
+            char msg[256];
+            if (a.tag == VAL_STRING) snprintf(msg, sizeof(msg), "%.*s", a.str.len, a.str.data);
+            else snprintf(msg, sizeof(msg), "simple-error called");
+            vm_throw(msg);
+        }
+        if (strcmp(name, "str") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag == VAL_SYMBOL) *acc = val_string(a.sym.name, strlen(a.sym.name));
+            else if (a.tag == VAL_STRING) *acc = a;
+            else if (a.tag == VAL_NUMBER) { char buf[64]; int len = snprintf(buf, sizeof(buf), "%ld", a.number); *acc = val_string(buf, len); }
+            else if (a.tag == VAL_BOOLEAN) *acc = val_string(a.boolean ? "true" : "false",
+                                                             a.boolean ? 4 : 5);
+            else { static char buf[4096]; int pos = 0; str_value(a, buf, &pos, sizeof(buf), 0); *acc = val_string(buf, pos); }
+            return 0;
+        }
+        if (strcmp(name, "stream?") == 0) {
+            Value a = va_pop(stack); *acc = val_boolean(a.tag == VAL_STREAM); return 0;
+        }
+        if (strcmp(name, "stinput") == 0) {
+            Value v; memset(&v, 0, sizeof(v));
+            v.tag = VAL_STREAM;
+            v.stream.file = stdin;
+            v.stream.is_input = 1;
+            *acc = v; return 0;
+        }
+        if (strcmp(name, "stoutput") == 0) {
+            Value v; memset(&v, 0, sizeof(v));
+            v.tag = VAL_STREAM;
+            v.stream.file = stdout;
+            v.stream.is_input = 0;
+            *acc = v; return 0;
+        }
+        if (strcmp(name, "set") == 0) {
+            Value sym = va_pop(stack), v = va_pop(stack);
+            if (sym.tag != VAL_SYMBOL) PRIM_TYPE_ERROR("set requires symbol");
+            value_set(sym.sym.name, v); *acc = v; return 0;
+        }
+        if (strcmp(name, "string->n") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_STRING) PRIM_TYPE_ERROR("string->n on non-string");
+            *acc = val_number(a.str.len > 0 ? (unsigned char)a.str.data[0] : 0); return 0;
+        }
+        if (strcmp(name, "shen.fail!") == 0) {
+            if (stack->len > 0) {
+                Value arg = va_pop(stack);
+                *acc = val_cons(val_symbol("fail"), val_cons(arg, val_nil()));
+                return 0;
+            }
+            vm_throw("fail");
+        }
+        if (strcmp(name, "snd") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("snd on non-cons");
+            *acc = *a.cons.cdr; return 0;
+        }
+        break;
 
-        done:
-        gc_root_pop_to(eval_kl_wm);
-        vm_catch_chain = cf.parent;
-        *acc = result;
-        return 0;
-        } /* end setjmp == 0 block */
-        /* Error path: unlink, truncate any roots pushed before longjmp. */
-        gc_root_pop_to(eval_kl_wm);
-        vm_catch_chain = cf.parent;
-        *acc = result;
-        return 0;
+    /* ---- 't': tl, trap-error, tlstr ---- */
+    case 't':
+        if (strcmp(name, "tl") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag == VAL_NIL) { *acc = val_nil(); return 0; }
+            if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("tl on non-cons");
+            *acc = *a.cons.cdr; return 0;
+        }
+        if (strcmp(name, "trap-error") == 0) {
+            volatile Value body = va_pop(stack);
+            volatile Value handler = va_pop(stack);
+            gc_root_push_value_volatile(&body);
+            gc_root_push_value_volatile(&handler);
+            if (handler.tag != VAL_LAMBDA) PRIM_TYPE_ERROR("trap-error handler not fn");
+            CatchFrame cf;
+            cf.parent = vm_catch_chain;
+            cf.in_trap_error = 0;
+            vm_catch_chain = &cf;
+            volatile size_t body_call_wm = gc_root_watermark();
+            if (setjmp(cf.buf) == 0) {
+                cf.in_trap_error = 1;
+                if (body.tag == VAL_LAMBDA) {
+                    int new_len = body.lambda.env_len + 1;
+                    Value *new_env = GC_VALUE_ARRAY(new_len);
+                    if (body.lambda.env_len > 0)
+                        memcpy(new_env, body.lambda.env, body.lambda.env_len * sizeof(Value));
+                    new_env[body.lambda.env_len] = val_nil();
+                    if (gc_in_oldgen(new_env) && body.lambda.env_len > 0) {
+                        for (int j = 0; j < body.lambda.env_len; j++) {
+                            if (value_references_nursery(&body.lambda.env[j])) {
+                                gc_dirty_vectors_add(new_env);
+                                break;
+                            }
+                        }
+                    }
+                    *acc = vm_exec_env(body.lambda.code, body.lambda.code_len, new_env, new_len);
+                }
+                else *acc = body;
+                vm_catch_chain = cf.parent;
+                gc_root_pop(); gc_root_pop();
+                return 0;
+            } else {
+                vm_catch_chain = cf.parent;
+                gc_root_pop_to(body_call_wm);
+                Value err = cf.error_val;
+                int env_len = handler.lambda.env_len;
+                int new_env_len = env_len + 1;
+                gc_root_push_value(&err);
+                Value *henv = GC_VALUE_ARRAY(new_env_len);
+                if (env_len > 0)
+                    memcpy(henv, handler.lambda.env, env_len * sizeof(Value));
+                henv[env_len] = err;
+                if (gc_in_oldgen(henv) && value_references_nursery(&err))
+                    gc_dirty_vectors_add(henv);
+                Instr *hc = handler.lambda.code; int hl = handler.lambda.code_len;
+                gc_root_pop();
+                gc_root_pop(); gc_root_pop();
+                *acc = vm_exec_env(hc, hl, henv, new_env_len);
+                return 0;
+            }
+        }
+        if (strcmp(name, "tlstr") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_STRING || a.str.len < 1) PRIM_TYPE_ERROR("tlstr on empty/non-string");
+            *acc = val_string_from(&a, 1, a.str.len - 1); return 0;
+        }
+        break;
+
+    /* ---- 'v': value, variable? ---- */
+    case 'v':
+        if (strcmp(name, "value") == 0) {
+            Value a = va_pop(stack);
+#ifdef ZINCVM_DEBUG
+            if (a.tag != VAL_SYMBOL) {
+                if (vm_catch_chain && vm_catch_chain->in_trap_error)
+                    vm_throw("value on non-symbol");
+                fprintf(stderr, "runtime: value on non-symbol\n");
+                return -1;
+            }
+#endif
+            *acc = value_get(a.sym.name); return 0;
+        }
+        if (strcmp(name, "variable?") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_SYMBOL) { *acc = val_boolean(0); return 0; }
+            const char *s = a.sym.name;
+            if (!s[0] || s[0] < 'A' || s[0] > 'Z') { *acc = val_boolean(0); return 0; }
+            for (int i = 1; s[i]; i++) {
+                int c = (unsigned char)s[i];
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9')) continue;
+                if (c == '`' || c == '=' || c == '*' || c == '/' || c == '+' ||
+                    c == '_' || c == '?' || c == '$' || c == '!' || c == '@' ||
+                    c == '~' || c == '.' || c == '>' || c == '<' || c == '&' ||
+                    c == '%' || c == '\'' || c == '#') continue;
+                *acc = val_boolean(0); return 0;
+            }
+            *acc = val_boolean(1); return 0;
+        }
+        break;
+
+    /* ---- 'w': write-byte ---- */
+    case 'w':
+        if (strcmp(name, "write-byte") == 0) {
+            Value byte = va_pop(stack);
+            Value s    = va_pop(stack);
+#ifdef ZINCVM_DEBUG
+            if (s.tag != VAL_STREAM || s.stream.is_input) {
+                if (vm_catch_chain && vm_catch_chain->in_trap_error)
+                    vm_throw("write-byte on non-output");
+                fprintf(stderr, "runtime: write-byte on non-output\n"); return -1;
+            }
+            if (byte.tag != VAL_NUMBER) {
+                if (vm_catch_chain && vm_catch_chain->in_trap_error)
+                    vm_throw("write-byte requires number");
+                fprintf(stderr, "runtime: write-byte requires number\n"); return -1;
+            }
+#endif
+            fputc((int)byte.number, s.stream.file);
+            if (s.stream.file == stdout) fflush(stdout);
+            *acc = val_number(byte.number); return 0;
+        }
+        break;
+
+    /* ---- Arithmetic: +, -, *, / ---- */
+    case '+':
+        if (strcmp(name, "+") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("+ on non-numbers");
+            *acc = val_number(a1.number + a2.number); return 0;
+        }
+        break;
+    case '-':
+        if (strcmp(name, "-") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("- on non-numbers");
+            *acc = val_number(a1.number - a2.number); return 0;
+        }
+        break;
+    case '*':
+        if (strcmp(name, "*") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("* on non-numbers");
+            *acc = val_number(a1.number * a2.number); return 0;
+        }
+        break;
+    case '/':
+        if (strcmp(name, "/") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("/ on non-numbers");
+            if (a2.number == 0) PRIM_TYPE_ERROR("division by zero");
+            *acc = val_number(a1.number / a2.number); return 0;
+        }
+        break;
+
+    /* ---- Comparison: =, <, > ---- */
+    case '=':
+        if (strcmp(name, "=") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            if (a1.tag == VAL_NUMBER && a2.tag == VAL_NUMBER)
+                *acc = val_boolean(a1.number == a2.number);
+            else if (a1.tag == VAL_STRING && a2.tag == VAL_STRING)
+                *acc = val_boolean(a1.str.len == a2.str.len && memcmp(a1.str.data, a2.str.data, a1.str.len) == 0);
+            else if (a1.tag == VAL_SYMBOL && a2.tag == VAL_SYMBOL)
+                *acc = val_boolean(strcmp(a1.sym.name, a2.sym.name) == 0);
+            else if (a1.tag == VAL_BOOLEAN && a2.tag == VAL_BOOLEAN)
+                *acc = val_boolean(a1.boolean == a2.boolean);
+            else if ((a1.tag == VAL_CONS && a2.tag == VAL_SYMBOL) ||
+                     (a1.tag == VAL_SYMBOL && a2.tag == VAL_CONS))
+                *acc = val_boolean(false);
+            else if (a1.tag == VAL_SYMBOL && a2.tag == VAL_PRIM)
+                *acc = val_boolean(strcmp(a1.sym.name, a2.prim.name) == 0);
+            else if (a1.tag == VAL_PRIM && a2.tag == VAL_SYMBOL)
+                *acc = val_boolean(strcmp(a1.prim.name, a2.sym.name) == 0);
+            else if (a1.tag == VAL_CONS && a2.tag == VAL_CONS)
+                *acc = val_boolean(deep_equal(a1, a2));
+            else if (a1.tag == VAL_VECTOR && a2.tag == VAL_VECTOR)
+                *acc = val_boolean(deep_equal(a1, a2));
+            else *acc = val_boolean(a1.tag == VAL_NIL && a2.tag == VAL_NIL);
+            return 0;
+        }
+        break;
+    case '<':
+        if (strcmp(name, "<") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            *acc = val_boolean(a1.tag == VAL_NUMBER && a2.tag == VAL_NUMBER && a1.number < a2.number); return 0;
+        }
+        if (strcmp(name, "<=") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            *acc = val_boolean(a1.tag == VAL_NUMBER && a2.tag == VAL_NUMBER && a1.number <= a2.number); return 0;
+        }
+        if (strcmp(name, "<-address") == 0) {
+            Value vec = va_pop(stack), idx = va_pop(stack);
+#ifdef ZINCVM_DEBUG
+            if (vec.tag != VAL_VECTOR || idx.tag != VAL_NUMBER) {
+                if (vm_catch_chain && vm_catch_chain->in_trap_error)
+                    vm_throw("<-address bad types");
+                fprintf(stderr, "runtime: <-address bad types\n"); return -1;
+            }
+#endif
+            int i = (int)idx.number;
+#ifdef ZINCVM_DEBUG
+            if (i < 0 || i >= vec.vector.len) {
+                if (vm_catch_chain && vm_catch_chain->in_trap_error)
+                    vm_throw("<-address OOB");
+                fprintf(stderr, "runtime: <-address OOB\n"); return -1;
+            }
+#endif
+            *acc = vec.vector.data[i]; return 0;
+        }
+        break;
+    case '>':
+        if (strcmp(name, ">") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            *acc = val_boolean(a1.tag == VAL_NUMBER && a2.tag == VAL_NUMBER && a1.number > a2.number); return 0;
+        }
+        if (strcmp(name, ">=") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            *acc = val_boolean(a1.tag == VAL_NUMBER && a2.tag == VAL_NUMBER && a1.number >= a2.number); return 0;
+        }
+        break;
+
+    /* ---- '@': @p ---- */
+    case '@':
+        if (strcmp(name, "@p") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            *acc = val_cons(a1, a2); return 0;
+        }
+        break;
     }
 
-    /* --- Stream accessors for REPL --- */
-    if (strcmp(name, "stinput") == 0) {
-        Value v; memset(&v, 0, sizeof(v));
-        v.tag = VAL_STREAM;
-        v.stream.file = stdin;
-        v.stream.is_input = 1;
-        *acc = v; return 0;
-    }
-    if (strcmp(name, "stoutput") == 0) {
-        Value v; memset(&v, 0, sizeof(v));
-        v.tag = VAL_STREAM;
-        v.stream.file = stdout;
-        v.stream.is_input = 0;
-        *acc = v; return 0;
-    }
-
+unknown:
     fprintf(stderr, "runtime: unknown primitive '%s'\n", name);
     return -1;
 }
@@ -1649,25 +1692,15 @@ static int parse_body(ParseState *ps, Instr **out) {
         if (c == ')' || c == '\0') break;
         if (c == '(') PARSE_ERROR("unexpected nested list in body");
         Instr instr; memset(&instr, 0, sizeof(instr));
+        instr.op = char_to_opcode(c); ps->p++;
         switch (c) {
-        case 'm': instr.op = OP_PUSHMARK; ps->p++; break;
-        case 'p': instr.op = OP_APPLY;    ps->p++; break;
-        case 'r': instr.op = OP_GRAB;     ps->p++; break;
-        case 'v': instr.op = OP_RETURN;   ps->p++; break;
-        case 'e': instr.op = OP_LET;      ps->p++; break;
-        case 'd': instr.op = OP_ENDLET;   ps->p++; break;
-        case 't': instr.op = OP_APPTERM;  ps->p++; break;
-        case 'a': instr.op = OP_ACCESS;   ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'f': instr.op = OP_JMPF;     ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'j': instr.op = OP_JMP;      ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'n': instr.op = OP_NUMBER;   ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'g': instr.op = OP_GLOBAL;   ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 's': instr.op = OP_SYMBOL;   ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'P': instr.op = OP_PRIM;     ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'S': instr.op = OP_STRING;   ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'b': instr.op = OP_BOOLEAN;  ps->p++; instr.operand = parse_csexp_atom(ps); break;
+        case 'm': case 'p': case 'r': case 'v': case 'e': case 'd': case 't':
+            break;  /* no operand */
+        case 'a': case 'f': case 'j': case 'n': case 'g':
+        case 's': case 'P': case 'S': case 'b':
+            instr.operand = parse_csexp_atom(ps); break;
         case 'c': {
-            instr.op = OP_CUR; ps->p++; skip_ws(ps);
+            skip_ws(ps);
             if (*ps->p != '(') PARSE_ERROR("expected '(' after 'c'");
             ps->p++;
             /* Allocate a stable side-slot for the closure_code so the GC
@@ -1825,7 +1858,7 @@ void print_instr(Instr *code, int len, int indent) {
             for (int j = 0; j < indent; j++) printf("  ");
             printf("endcur\n");
             break;
-        default: printf("??? (op=%c)\n", in->op);
+        default: printf("??? (op=%d)\n", (int)in->op);
         }
     }
 }
@@ -1869,7 +1902,7 @@ static void print_instr_one(Instr *in, int pc) {
     case OP_BOOLEAN:  printf("boolean "); print_value(in->operand); printf("\n"); break;
     case OP_PRIM:     printf("prim "); print_value(in->operand); printf("\n"); break;
     case OP_CUR:      printf("cur (code=%d)\n", in->closure_len); break;
-    default:          printf("??? (%c)\n", in->op);
+    default:          printf("??? (%d)\n", (int)in->op);
     }
 }
 
@@ -1930,6 +1963,18 @@ static Value env_pop(Value **env, int *env_len) {
 int trace_counter = -1;
 int trace_limit = 0;
 
+/* Instruction limit with env-var override for huge compilations (e.g. stlib.kl).
+   Cached once at vm_exec_env entry so getenv/strtoull is not called per iteration. */
+static unsigned long long get_instr_limit(void) {
+    const char *e = getenv("ZINCVM_INSTR_LIMIT");
+    if (e && *e) {
+        char *end = NULL;
+        unsigned long long v = strtoull(e, &end, 10);
+        if (end != e) return v;
+    }
+    return 5000000000ULL;
+}
+
 Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) {
     /* Push all root slots BEFORE any allocation.  &env, &stack.data, and &acc
        are pushed early (while still NULL/nil) so gc_scan_roots reads the
@@ -1972,14 +2017,14 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
     gc_root_push_callframe_array(frame_stack, frames_sp_slot);
     int pc = 0; Instr *cur_code = code; int cur_len = code_len;
     int instr_count = 0;
+    unsigned long long instr_limit = get_instr_limit();
     gc_root_push_ptr((void**)&cur_code);   /* ROOT_PTR — Instr** */
     gc_root_push_ptr((void**)&frame_stack); /* ROOT_PTR — CallFrame** */
-    #define INSTR_HARD_LIMIT 500000000
 
     while (1) {
-        if (++instr_count >= INSTR_HARD_LIMIT) {
-            fprintf(stderr, "[HARD LIMIT] %d instructions, aborting at pc=%d frames=%d\n",
-                    instr_count, pc, frames_sp);
+        if ((unsigned long long)++instr_count >= instr_limit) {
+            fprintf(stderr, "[HARD LIMIT] %llu instructions, aborting at pc=%d frames=%d\n",
+                    instr_limit, pc, frames_sp);
             goto done;
         }
         if (trace_counter >= 0) {
@@ -2236,7 +2281,7 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
                 fprintf(stderr, "runtime: appterm non-lambda\n"); goto done;
             }
         }
-        default: fprintf(stderr, "runtime: unknown op '%c' at pc=%d\n", in->op, pc); goto done;
+        default: fprintf(stderr, "runtime: unknown op %d at pc=%d\n", (int)in->op, pc); goto done;
         }
     }
 done:

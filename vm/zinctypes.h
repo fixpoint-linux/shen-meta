@@ -63,13 +63,75 @@ typedef struct Value {
 /* ------------------------------------------------------------------ */
 
 typedef enum {
-    OP_ACCESS   = 'a', OP_GLOBAL   = 'g', OP_JMPF     = 'f',
-    OP_JMP      = 'j', OP_APPTERM  = 't', OP_APPLY    = 'p',
-    OP_PUSHMARK = 'm', OP_CUR      = 'c',
-    OP_GRAB     = 'r', OP_RETURN   = 'v', OP_LET      = 'e',
-    OP_ENDLET   = 'd', OP_NUMBER   = 'n', OP_STRING   = 'S',
-    OP_SYMBOL   = 's', OP_BOOLEAN  = 'b', OP_PRIM     = 'P'
+    OP_ACCESS   = 0,  /* 'a' */
+    OP_GLOBAL   = 1,  /* 'g' */
+    OP_JMPF     = 2,  /* 'f' */
+    OP_JMP      = 3,  /* 'j' */
+    OP_APPTERM  = 4,  /* 't' */
+    OP_APPLY    = 5,  /* 'p' */
+    OP_PUSHMARK = 6,  /* 'm' */
+    OP_CUR      = 7,  /* 'c' */
+    OP_GRAB     = 8,  /* 'r' */
+    OP_RETURN   = 9,  /* 'v' */
+    OP_LET      = 10, /* 'e' */
+    OP_ENDLET   = 11, /* 'd' */
+    OP_NUMBER   = 12, /* 'n' */
+    OP_STRING   = 13, /* 'S' */
+    OP_SYMBOL   = 14, /* 's' */
+    OP_BOOLEAN  = 15, /* 'b' */
+    OP_PRIM     = 16, /* 'P' */
+    OP_COUNT    = 17
 } Opcode;
+
+/* Translate a csexp opcode character to the dense enum.  Called once
+   during parse (parse_body) so the VM's main dispatch switch gets a
+   compact jump table instead of a branch chain. */
+static inline Opcode char_to_opcode(char c) {
+    switch (c) {
+    case 'a': return OP_ACCESS;
+    case 'g': return OP_GLOBAL;
+    case 'f': return OP_JMPF;
+    case 'j': return OP_JMP;
+    case 't': return OP_APPTERM;
+    case 'p': return OP_APPLY;
+    case 'm': return OP_PUSHMARK;
+    case 'c': return OP_CUR;
+    case 'r': return OP_GRAB;
+    case 'v': return OP_RETURN;
+    case 'e': return OP_LET;
+    case 'd': return OP_ENDLET;
+    case 'n': return OP_NUMBER;
+    case 'S': return OP_STRING;
+    case 's': return OP_SYMBOL;
+    case 'b': return OP_BOOLEAN;
+    case 'P': return OP_PRIM;
+    default: return OP_COUNT;
+    }
+}
+
+/* Reverse mapping for decompilers. */
+static inline char opcode_to_char(Opcode op) {
+    static const char map[17] = {
+        [OP_ACCESS]   = 'a',
+        [OP_GLOBAL]   = 'g',
+        [OP_JMPF]     = 'f',
+        [OP_JMP]      = 'j',
+        [OP_APPTERM]  = 't',
+        [OP_APPLY]    = 'p',
+        [OP_PUSHMARK] = 'm',
+        [OP_CUR]      = 'c',
+        [OP_GRAB]     = 'r',
+        [OP_RETURN]   = 'v',
+        [OP_LET]      = 'e',
+        [OP_ENDLET]   = 'd',
+        [OP_NUMBER]   = 'n',
+        [OP_STRING]   = 'S',
+        [OP_SYMBOL]   = 's',
+        [OP_BOOLEAN]  = 'b',
+        [OP_PRIM]     = 'P',
+    };
+    return (op < OP_COUNT) ? map[op] : '?';
+}
 
 typedef struct Instr {
     Opcode op;

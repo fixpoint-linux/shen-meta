@@ -80,13 +80,71 @@ typedef struct Value {
 /* ------------------------------------------------------------------ */
 
 typedef enum {
-    OP_ACCESS   = 'a', OP_GLOBAL   = 'g', OP_JMPF     = 'f',
-    OP_JMP      = 'j', OP_APPTERM  = 't', OP_APPLY    = 'p',
-    OP_PUSHMARK = 'm', OP_CUR      = 'c',
-    OP_GRAB     = 'r', OP_RETURN   = 'v', OP_LET      = 'e',
-    OP_ENDLET   = 'd', OP_NUMBER   = 'n', OP_STRING   = 'S',
-    OP_SYMBOL   = 's', OP_BOOLEAN  = 'b', OP_PRIM     = 'P'
+    OP_ACCESS   = 0,  /* 'a' */
+    OP_GLOBAL   = 1,  /* 'g' */
+    OP_JMPF     = 2,  /* 'f' */
+    OP_JMP      = 3,  /* 'j' */
+    OP_APPTERM  = 4,  /* 't' */
+    OP_APPLY    = 5,  /* 'p' */
+    OP_PUSHMARK = 6,  /* 'm' */
+    OP_CUR      = 7,  /* 'c' */
+    OP_GRAB     = 8,  /* 'r' */
+    OP_RETURN   = 9,  /* 'v' */
+    OP_LET      = 10, /* 'e' */
+    OP_ENDLET   = 11, /* 'd' */
+    OP_NUMBER   = 12, /* 'n' */
+    OP_STRING   = 13, /* 'S' */
+    OP_SYMBOL   = 14, /* 's' */
+    OP_BOOLEAN  = 15, /* 'b' */
+    OP_PRIM     = 16, /* 'P' */
+    OP_COUNT    = 17
 } Opcode;
+
+static inline Opcode char_to_opcode(char c) {
+    switch (c) {
+    case 'a': return OP_ACCESS;
+    case 'g': return OP_GLOBAL;
+    case 'f': return OP_JMPF;
+    case 'j': return OP_JMP;
+    case 't': return OP_APPTERM;
+    case 'p': return OP_APPLY;
+    case 'm': return OP_PUSHMARK;
+    case 'c': return OP_CUR;
+    case 'r': return OP_GRAB;
+    case 'v': return OP_RETURN;
+    case 'e': return OP_LET;
+    case 'd': return OP_ENDLET;
+    case 'n': return OP_NUMBER;
+    case 'S': return OP_STRING;
+    case 's': return OP_SYMBOL;
+    case 'b': return OP_BOOLEAN;
+    case 'P': return OP_PRIM;
+    default: return OP_COUNT;
+    }
+}
+
+static inline char opcode_to_char(Opcode op) {
+    static const char map[17] = {
+        [OP_ACCESS]   = 'a',
+        [OP_GLOBAL]   = 'g',
+        [OP_JMPF]     = 'f',
+        [OP_JMP]      = 'j',
+        [OP_APPTERM]  = 't',
+        [OP_APPLY]    = 'p',
+        [OP_PUSHMARK] = 'm',
+        [OP_CUR]      = 'c',
+        [OP_GRAB]     = 'r',
+        [OP_RETURN]   = 'v',
+        [OP_LET]      = 'e',
+        [OP_ENDLET]   = 'd',
+        [OP_NUMBER]   = 'n',
+        [OP_STRING]   = 'S',
+        [OP_SYMBOL]   = 's',
+        [OP_BOOLEAN]  = 'b',
+        [OP_PRIM]     = 'P',
+    };
+    return (op < OP_COUNT) ? map[op] : '?';
+}
 
 struct Instr {
     Opcode op;
@@ -260,25 +318,15 @@ static int parse_body(ParseState *ps, Instr **out) {
         if (c == ')' || c == '\0') break;
         if (c == '(') PARSE_ERROR("unexpected nested list in body");
         Instr instr; memset(&instr, 0, sizeof(instr));
+        instr.op = char_to_opcode(c); ps->p++;
         switch (c) {
-        case 'm': instr.op = OP_PUSHMARK; ps->p++; break;
-        case 'p': instr.op = OP_APPLY;    ps->p++; break;
-        case 'r': instr.op = OP_GRAB;     ps->p++; break;
-        case 'v': instr.op = OP_RETURN;   ps->p++; break;
-        case 'e': instr.op = OP_LET;      ps->p++; break;
-        case 'd': instr.op = OP_ENDLET;   ps->p++; break;
-        case 't': instr.op = OP_APPTERM;  ps->p++; break;
-        case 'a': instr.op = OP_ACCESS;   ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'f': instr.op = OP_JMPF;     ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'j': instr.op = OP_JMP;      ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'n': instr.op = OP_NUMBER;   ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'g': instr.op = OP_GLOBAL;   ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 's': instr.op = OP_SYMBOL;   ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'P': instr.op = OP_PRIM;     ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'S': instr.op = OP_STRING;   ps->p++; instr.operand = parse_csexp_atom(ps); break;
-        case 'b': instr.op = OP_BOOLEAN;  ps->p++; instr.operand = parse_csexp_atom(ps); break;
+        case 'm': case 'p': case 'r': case 'v': case 'e': case 'd': case 't':
+            break;
+        case 'a': case 'f': case 'j': case 'n': case 'g':
+        case 's': case 'P': case 'S': case 'b':
+            instr.operand = parse_csexp_atom(ps); break;
         case 'c':
-            instr.op = OP_CUR; ps->p++; skip_ws(ps);
+            skip_ws(ps);
             if (*ps->p != '(') PARSE_ERROR("expected '(' after 'c'");
             ps->p++; instr.closure_len = parse_body(ps, &instr.closure_code);
             if (*ps->p != ')') PARSE_ERROR("expected ')' after cur body");
@@ -477,7 +525,7 @@ static void decompile_raw(Instr *code, int len, int indent) {
             for (int j = 0; j < indent; j++) printf("  ");
             printf("endcur\n");
             break;
-        default: printf("??? (op=%c)\n", in->op);
+        default: printf("??? (op=%d)\n", (int)in->op);
         }
     }
 }
@@ -524,7 +572,7 @@ static void decompile_asm(Instr *code, int len, int base_addr, int indent) {
             for (int j = 0; j < indent; j++) printf("  ");
             printf("      endcur\n");
             break;
-        default: printf("??? (op=%c)\n", in->op);
+        default: printf("??? (op=%d)\n", (int)in->op);
         }
         addr++;
     }
@@ -560,7 +608,7 @@ static void decompile_shen_instr(Instr *in, int indent) {
         for (int j = 0; j < indent; j++) printf("  ");
         printf("]\n");
         break;
-    default: printf("[??? %c]\n", in->op);
+    default: printf("[??? %d]\n", (int)in->op);
     }
 }
 
@@ -596,22 +644,13 @@ static void emit_csexp_operand(Value v) {
 
 static void decompile_csexp_instr(Instr *in) {
     switch (in->op) {
-    case OP_PUSHMARK: printf("m"); break;
-    case OP_APPLY:    printf("p"); break;
-    case OP_GRAB:     printf("r"); break;
-    case OP_RETURN:   printf("v"); break;
-    case OP_LET:      printf("e"); break;
-    case OP_ENDLET:   printf("d"); break;
-    case OP_APPTERM:  printf("t"); break;
-    case OP_ACCESS:   printf("a"); emit_csexp_operand(in->operand); break;
-    case OP_GLOBAL:   printf("g"); emit_csexp_operand(in->operand); break;
-    case OP_JMPF:     printf("f"); emit_csexp_operand(in->operand); break;
-    case OP_JMP:      printf("j"); emit_csexp_operand(in->operand); break;
-    case OP_NUMBER:   printf("n"); emit_csexp_operand(in->operand); break;
-    case OP_STRING:   printf("S"); emit_csexp_operand(in->operand); break;
-    case OP_SYMBOL:   printf("s"); emit_csexp_operand(in->operand); break;
-    case OP_BOOLEAN:  printf("b"); emit_csexp_operand(in->operand); break;
-    case OP_PRIM:     printf("P"); emit_csexp_operand(in->operand); break;
+    case OP_PUSHMARK: case OP_APPLY: case OP_GRAB: case OP_RETURN:
+    case OP_LET: case OP_ENDLET: case OP_APPTERM:
+        printf("%c", opcode_to_char(in->op)); break;
+    case OP_ACCESS: case OP_GLOBAL: case OP_JMPF: case OP_JMP:
+    case OP_NUMBER: case OP_STRING: case OP_SYMBOL: case OP_BOOLEAN:
+    case OP_PRIM:
+        printf("%c", opcode_to_char(in->op)); emit_csexp_operand(in->operand); break;
     case OP_CUR:
         printf("c(");
         for (int k = 0; k < in->closure_len; k++)
