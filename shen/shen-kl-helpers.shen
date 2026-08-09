@@ -86,45 +86,55 @@
    Returns [Tests Subs] — both lists (may be empty). *\
 
 (define compile-pattern
-  Pat Slot -> [[] [[Pat Slot]]] where (variable? Pat)
-  Pat Slot -> [[] []] where (= Pat (intern "_"))
-  [] Slot -> [[[= Slot []]] []]
-  Pat Slot -> (compile-constructor-pattern Pat Slot)
-              where (cons-constructor-pattern? Pat)
-  Pat Slot -> (compile-list-pattern Pat Slot) where (cons? Pat)
-  Pat Slot -> [[[= Slot Pat]] []])
+  Pat Slot Bound -> (if (variable? Pat)
+                        (let Existing (assoc Pat Bound)
+                          (if (cons? Existing)
+                              [[[= Slot (hd (tl Existing))]] []]
+                              [[] [[Pat Slot]]]))
+                        (if (= Pat (intern "_"))
+                            [[] []]
+                            (if (= Pat [])
+                                [[[= Slot []]] []]
+                                (if (cons-constructor-pattern? Pat)
+                                    (compile-constructor-pattern Pat Slot Bound)
+                                    (if (cons? Pat)
+                                        (compile-list-pattern Pat Slot Bound)
+                                        [[[= Slot Pat]] []]))))))
 
 \* compile-constructor-pattern: handle [cons P1 P2]. *\
 
 (define compile-constructor-pattern
-  [cons P1 P2] Slot -> (let Result1 (compile-pattern P1 [hd Slot])
-                          (let Result2 (compile-pattern P2 [tl Slot])
-                            [(append [[cons? Slot]]
-                                     (append (hd Result1) (hd Result2)))
-                             (append (hd (tl Result1)) (hd (tl Result2)))]))
-  _ _ -> (simple-error "compile-constructor-pattern: not a constructor pattern"))
+  [cons P1 P2] Slot Bound -> (let Result1 (compile-pattern P1 [hd Slot] Bound)
+                               (let Bound1 (append Bound (hd (tl Result1)))
+                                 (let Result2 (compile-pattern P2 [tl Slot] Bound1)
+                                   [(append [[cons? Slot]]
+                                            (append (hd Result1) (hd Result2)))
+                                    (append (hd (tl Result1)) (hd (tl Result2)))])))
+  _ _ _ -> (simple-error "compile-constructor-pattern: not a constructor pattern"))
 
 \* compile-list-pattern: handle proper and improper list patterns. *\
 
 (define compile-list-pattern
-  Pat Slot -> (let H (hd Pat)
-                (let T (tl Pat)
-                  (let ResultH (compile-pattern H [hd Slot])
-                    (let ResultT (compile-pattern T [tl Slot])
-                      [(append [[cons? Slot]]
-                               (append (hd ResultH) (hd ResultT)))
-                       (append (hd (tl ResultH)) (hd (tl ResultT)))])))))
+  Pat Slot Bound -> (let H (hd Pat)
+                      (let T (tl Pat)
+                        (let ResultH (compile-pattern H [hd Slot] Bound)
+                          (let Bound1 (append Bound (hd (tl ResultH)))
+                            (let ResultT (compile-pattern T [tl Slot] Bound1)
+                              [(append [[cons? Slot]]
+                                       (append (hd ResultH) (hd ResultT)))
+                               (append (hd (tl ResultH)) (hd (tl ResultT)))]))))))
 
 \* compile-patterns: walk patterns and params, accumulating tests and subs. *\
 
 (define compile-patterns
-  [] [] Tests Subs -> [Tests Subs]
-  [Pat | PRest] [Param | ParamRest] Tests Subs ->
-    (let Result (compile-pattern Pat Param)
+  [] [] Tests Subs Bound -> [Tests Subs]
+  [Pat | PRest] [Param | ParamRest] Tests Subs Bound ->
+    (let Result (compile-pattern Pat Param Bound)
       (compile-patterns PRest ParamRest
                         (append Tests (hd Result))
-                        (append Subs (hd (tl Result)))))
-  _ _ _ _ -> (simple-error "compile-patterns: pattern/param count mismatch"))
+                        (append Subs (hd (tl Result)))
+                        (append Bound (hd (tl Result)))))
+  _ _ _ _ _ -> (simple-error "compile-patterns: pattern/param count mismatch"))
 
 \* rectify-test: convert a list of tests into a single boolean expression. *\
 
@@ -272,7 +282,7 @@
                       (let Guard (fst GuardGuarded)
                         (let Guarded (snd GuardGuarded)
                           (let AlphaBody (alpha-convert Body)
-                            (let Compiled (compile-patterns Pats Params [] [])
+                            (let Compiled (compile-patterns Pats Params [] [] [])
                               (let Tests (hd Compiled)
                                 (let Subs (hd (tl Compiled))
                                   (let SubBody (apply-subs Subs AlphaBody)
