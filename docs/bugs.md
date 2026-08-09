@@ -112,16 +112,29 @@ sequential compiler/closure-selection bugs were root-caused and fixed:
 prim + return] []]`. `interp-eval-all` on the parsed `.kl` forms returns `loaded` and registers
 the closure (`lookup-global my-add` finds it). `make test` 34/34, `make test-debug` 39/39.
 
-**REMAINING BLOCKER (bug 5): `interp-load-raw` OOMs.** `interp-load-raw` (= `interp-eval-all
-(read-file-raw File)`) exhausts the 4 GB GC heap reservation: `[gc] grow_heap: need 8192 MB but
-reservation is 4096 MB`. `allocatedpages` (logged as `live_pages`) doubles every FULL collect
-(~137K → 268K → 530K → 1054K → 2098K), i.e. `grow_heap` keeps doubling because each collection
-needs ~2x the pages. The growth starts during the earlier self-hosting/OS-load probes (heap is
-already ~2M pages by Probe 4c, before `interp-load-raw`), so it is a general runtime
-allocation/retention issue, not specific to `interp-load-raw`. The TCO fix (bug 4) did NOT
-eliminate it. Probe 4 (`interp-eval-all` on pre-parsed forms) passes; `interp-load-raw` (which
-additionally calls `read-file-raw` inside) OOMs. Suspects: a GC retention/root issue in the
-meta-interpreter's `interp` execution or the compiler closures, or high allocation that the GC
-cannot reclaim (heap grows geometrically instead of collecting). Diagnostic probes live in
-`vm/zinctest.c` under `#ifdef ZINC_TEST_OS_LOAD` (build with `-DZINCTEST -DZINCVM_DEBUG
--DZINC_TEST_OS_LOAD`).
+**Bug 5 (RESOLVED e632649): `interp-load-raw` OOM — dead from-space pages never freed.** The
+symptom: `interp-load-raw` exhausted the 4 GB GC heap reservation (`grow_heap: need 8192 MB but
+reservation is 4096 MB`); `allocatedpages` (logged as `live_pages`) doubled at every FULL collect
+(~137K → 268K → 530K → 1054K → 2098K). Reproduced even in the normal self-hosting run
+(`./zinctest globals.csexp --gc-verbose`), so it was a general runtime issue, not OS-load-specific.
+
+**Root cause:** `collect()` swapped semi-spaces and reset `allocatedpages=0` (gc.c:612) but NEVER
+reset the dead from-space pages' `space[]` tags back to 0. Dead pages kept their tag forever.
+During the next Phase 1 scavenge, `allocatepage`'s free-page test (gc.c:1542-1544) refuses any page
+tagged `current_space` or `next_space`, so only never-allocated `space=0` pages are usable. When
+`space=0` ran low, the scan-exhausted path (gc.c:1586) called `grow_heap`, which DOUBLES
+`heappages` (gc.c:1457). Doubling `heappages` doubled `oldgen_collect_threshold() = heappages/4`
+(gc.c:1498), so more garbage fit between collects → `live_pages` doubled at the next collect →
+another `grow_heap` → geometric growth to OOM.
+
+Diagnostics confirmed it was bookkeeping, NOT a stale pointer: `--gc-stale-scan` and
+`--gc-dump-roots` both showed ZERO hits. Page-space distribution at the end of a FULL collect
+showed only ~2000 `space=0` pages while half a million were dead-tagged `space=1` and half a
+million dead-tagged `space=2`; the real reachable set was only ~6138 pages (~3 MB).
+
+**Fix (e632649, 5 lines in `collect()`):** immediately before `current_space = next_space;`, loop
+all pages and reset any page tagged `current_space` (the now-dead from-space) back to `space=0`
+and clear `type_page`. After the fix `live_pages` stays stable at ~135K across all FULL collects,
+no `grow_heap` fires, `interp-load-raw` of the probe `.kl` completes and `(my-add 2 3)` evaluates.
+`make test` 34/34, `make test-debug` 39/39. Diagnostic probes live in `vm/zinctest.c` under
+`#ifdef ZINC_TEST_OS_LOAD` (build with `-DZINCTEST -DZINCVM_DEBUG -DZINC_TEST_OS_LOAD`).
