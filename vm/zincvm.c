@@ -577,25 +577,6 @@ static int defun_is_defined(const char *name) {
     return 0;
 }
 
-/* global_is_defined: is `name` a known global?  True if it is in the defun
- * table (a closure, a registered keyword symbol), the values table (a
- * stream, the global-table value, a (set S V) binding), OR a known C
- * primitive.  Used by the debug-build missing-global check: a [global X]
- * whose name is NOT defined here resolves (via defun_get) to a bare symbol,
- * which then fails confusingly when applied — the classic "missing global"
- * bug (e.g. `not` was missing from the bundle and debruijn's [global not]
- * became the symbol 'not', silently failing the compile inside trap-error). */
-static int global_is_defined(const char *name) {
-    if (defun_is_defined(name)) return 1;
-    if (!name) return 0;
-    uint32_t idx = hash_name(name, VALUES_TABLE_CAP);
-    while (values_table[idx].name != NULL) {
-        if (strcmp(values_table[idx].name, name) == 0) return 1;
-        idx = (idx + 1) % VALUES_TABLE_CAP;
-    }
-    return 0;
-}
-
 /* ------------------------------------------------------------------ */
 /*  Error handling for trap-error / simple-error                       */
 /* ------------------------------------------------------------------ */
@@ -2097,18 +2078,11 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
             pc++; break;
         case OP_GLOBAL: {
             const char *nm = (in->operand.tag == VAL_SYMBOL) ? in->operand.sym.name : "";
-#ifdef ZINCVM_DEBUG
-            /* Missing-global guard: a [global X] whose name is not a defined
-               closure, C primitive, keyword symbol, or stream resolves (via
-               defun_get) to a bare symbol.  That symbol then fails confusingly
-               when applied, and the error is often swallowed by trap-error
-               (interp-eval-safe) producing a false `loaded`.  Surface it here.
-               This catches the class of bug where a bundled closure references a
-               global that isn't in the bundle (e.g. `not` before it was added). */
-            if (nm[0] != '\0' && !global_is_defined(nm)) {
-                fprintf(stderr, "runtime: [global %s] not defined — resolves to bare symbol\n", nm);
+            if (nm[0] != '\0' && !defun_is_defined(nm)) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "global not found: %s", nm);
+                vm_throw(msg);
             }
-#endif
             acc = defun_get(nm);
             va_push(&stack, acc);
             pc++; break;
