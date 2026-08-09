@@ -101,7 +101,7 @@ void gc_scan_value(Value *v) {
 
 /* True iff v references any GC object in the nursery.  Must mirror
  * exactly the pointer fields gc_scan_value evacuates. */
-static int value_references_nursery(Value *v) {
+int value_references_nursery(Value *v) {
     switch (v->tag) {
     case VAL_CONS:    return gc_in_nursery(v->cons.car) || gc_in_nursery(v->cons.cdr);
     case VAL_LAMBDA:  return gc_in_nursery(v->lambda.code) || gc_in_nursery(v->lambda.env);
@@ -334,6 +334,8 @@ static void va_push(ValueArray *a, Value v) {
         gc_root_pop();
     }
     a->data[a->len++] = v;
+    if (gc_in_oldgen(a->data) && value_references_nursery(&v))
+        gc_dirty_vectors_add(a->data);
 }
 static Value va_pop(ValueArray *a) {
     if (a->len <= 0) { fprintf(stderr, "fatal: pop from empty stack\n"); exit(1); }
@@ -1249,6 +1251,14 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
                 if (body.lambda.env_len > 0)
                     memcpy(new_env, body.lambda.env, body.lambda.env_len * sizeof(Value));
                 new_env[body.lambda.env_len] = val_nil();
+                if (gc_in_oldgen(new_env) && body.lambda.env_len > 0) {
+                    for (int j = 0; j < body.lambda.env_len; j++) {
+                        if (value_references_nursery(&body.lambda.env[j])) {
+                            gc_dirty_vectors_add(new_env);
+                            break;
+                        }
+                    }
+                }
                 *acc = vm_exec_env(body.lambda.code, body.lambda.code_len, new_env, new_len);
             }
             else *acc = body;
@@ -1272,6 +1282,8 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             if (env_len > 0)
                 memcpy(henv, handler.lambda.env, env_len * sizeof(Value));
             henv[env_len] = err;
+            if (gc_in_oldgen(henv) && value_references_nursery(&err))
+                gc_dirty_vectors_add(henv);
             /* Capture lambda.code AFTER allocating (GC may evacuate it) —
                handler is a volatile root so handler.lambda.code is updated
                in-place by GC, but a separately-captured local is not. */
@@ -1486,6 +1498,8 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         if (extkl.lambda.env_len > 0)
             memcpy(env1, extkl.lambda.env, extkl.lambda.env_len * sizeof(Value));
         env1[extkl.lambda.env_len] = tagged;
+        if (gc_in_oldgen(env1) && value_references_nursery(&tagged))
+            gc_dirty_vectors_add(env1);
         Value klambda = vm_exec_env(extkl.lambda.code, extkl.lambda.code_len,
                                      env1, extkl.lambda.env_len + 1);
         gc_root_push_value(&klambda);
@@ -1501,6 +1515,8 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         if (klzinc.lambda.env_len > 0)
             memcpy(env2, klzinc.lambda.env, klzinc.lambda.env_len * sizeof(Value));
         env2[klzinc.lambda.env_len] = klambda;
+        if (gc_in_oldgen(env2) && value_references_nursery(&klambda))
+            gc_dirty_vectors_add(env2);
         Value zinc_code = vm_exec_env(klzinc.lambda.code, klzinc.lambda.code_len,
                                        env2, klzinc.lambda.env_len + 1);
         gc_root_push_value(&zinc_code);
@@ -1516,6 +1532,8 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         if (tli.lambda.env_len > 0)
             memcpy(env3, tli.lambda.env, tli.lambda.env_len * sizeof(Value));
         env3[tli.lambda.env_len] = zinc_code;
+        if (gc_in_oldgen(env3) && value_references_nursery(&zinc_code))
+            gc_dirty_vectors_add(env3);
         Value tagged_result = vm_exec_env(tli.lambda.code, tli.lambda.code_len,
                                            env3, tli.lambda.env_len + 1);
         gc_root_push_value(&tagged_result);
@@ -1897,6 +1915,8 @@ static void env_push(Value **env, int *env_len, int *env_cap, Value v) {
         gc_root_pop();
     }
     (*env)[(*env_len)++] = v;
+    if (gc_in_oldgen(*env) && value_references_nursery(&v))
+        gc_dirty_vectors_add(*env);
 }
 static Value env_pop(Value **env, int *env_len) {
     if (*env_len <= 0) {
@@ -1929,6 +1949,14 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
         env = GC_VALUE_ARRAY(env_cap);
         memcpy(env, init_env, init_env_len * sizeof(Value));
         env_len = init_env_len;
+        if (gc_in_oldgen(env)) {
+            for (int j = 0; j < init_env_len; j++) {
+                if (value_references_nursery(&init_env[j])) {
+                    gc_dirty_vectors_add(env);
+                    break;
+                }
+            }
+        }
     }
     CallFrame *frame_stack = (CallFrame*)gc_alloc_oldgen(CALL_STACK_DEPTH * sizeof(CallFrame), GC_TYPE_CALLFRAME_ARRAY);
     if (!frame_stack) {
@@ -1936,7 +1964,12 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
         va_free(&stack); return acc;
     }
     memset(frame_stack, 0, CALL_STACK_DEPTH * sizeof(CallFrame));
+    /* GC-heap int for frames_sp — survives longjmp (stack locals become dangling). */
+    int *frames_sp_slot = (int*)gc_alloc_oldgen(sizeof(int), GC_TYPE_RAW);
+    *frames_sp_slot = 0;
     int frames_sp = 0;
+    gc_root_push_ptr((void**)&frames_sp_slot);  /* root the GC-heap int */
+    gc_root_push_callframe_array(frame_stack, frames_sp_slot);
     int pc = 0; Instr *cur_code = code; int cur_len = code_len;
     int instr_count = 0;
     gc_root_push_ptr((void**)&cur_code);   /* ROOT_PTR — Instr** */
@@ -1955,6 +1988,7 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
         if (pc < 0 || pc >= cur_len) {
             if (frames_sp > 0) {
                 CallFrame *cf = &frame_stack[--frames_sp];
+                *frames_sp_slot = frames_sp;
                 cur_code = cf->code; cur_len = cf->code_len; pc = cf->pc;
                 env = cf->env; env_len = cf->env_len; env_cap = cf->env_cap;
                 va_free(&stack);
@@ -2003,6 +2037,7 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
                 va_pop(&stack);
                 if (frames_sp > 0) {
                     CallFrame *cf = &frame_stack[--frames_sp];
+                    *frames_sp_slot = frames_sp;
                     cur_code = cf->code; cur_len = cf->code_len; pc = cf->pc;
                     env = cf->env; env_len = cf->env_len; env_cap = cf->env_cap;
                     stack = cf->stack;
@@ -2039,6 +2074,7 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
 
                 if (frames_sp >= CALL_STACK_DEPTH) { goto done; }
                 CallFrame *cf = &frame_stack[frames_sp++];
+                *frames_sp_slot = frames_sp;
                 cf->code = cur_code; cf->code_len = cur_len; cf->pc = pc + 1;
                 cf->env = env; cf->env_len = env_len; cf->env_cap = env_cap;
                 cf->stack = stack; va_init(&stack);
@@ -2052,11 +2088,23 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
                  * stack (&acc is rooted in vm_exec_env prologue). */
                 cur_code = acc.lambda.code; cur_len = acc.lambda.code_len;
                 Value *lambda_env = acc.lambda.env;
+                int ne_is_oldgen = gc_in_oldgen(ne);
                 if (lambda_env_len > 0 && lambda_env) {
                     memcpy(ne, lambda_env, lambda_env_len * sizeof(Value));
+                    if (ne_is_oldgen) {
+                        for (int j = 0; j < lambda_env_len; j++) {
+                            if (value_references_nursery(&lambda_env[j])) {
+                                gc_dirty_vectors_add(ne);
+                                break;
+                            }
+                        }
+                    }
                 }
-                for (int i = 0; i < nargs; i++)
+                for (int i = 0; i < nargs; i++) {
                     ne[lambda_env_len + i] = argbuf[i];
+                    if (ne_is_oldgen && value_references_nursery(&argbuf[i]))
+                        gc_dirty_vectors_add(ne);
+                }
                 env = ne; env_len = new_env_len; env_cap = new_env_len;
                 gc_root_pop();  /* argbuf */
                 pc = 0;
@@ -2083,6 +2131,7 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
         case OP_RETURN: {
             if (frames_sp > 0) {
                 CallFrame *cf = &frame_stack[--frames_sp];
+                *frames_sp_slot = frames_sp;
                 cur_code = cf->code; cur_len = cf->code_len; pc = cf->pc;
                 env = cf->env; env_len = cf->env_len; env_cap = cf->env_cap;
                 va_free(&stack);
@@ -2154,11 +2203,23 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
                 Value *ne = GC_VALUE_ARRAY(new_env_len);
                 cur_code = acc.lambda.code; cur_len = acc.lambda.code_len;
                 Value *lambda_env = acc.lambda.env;
+                int ne_is_oldgen = gc_in_oldgen(ne);
                 if (lambda_env_len > 0 && lambda_env) {
                     memcpy(ne, lambda_env, lambda_env_len * sizeof(Value));
+                    if (ne_is_oldgen) {
+                        for (int j = 0; j < lambda_env_len; j++) {
+                            if (value_references_nursery(&lambda_env[j])) {
+                                gc_dirty_vectors_add(ne);
+                                break;
+                            }
+                        }
+                    }
                 }
-                for (int i = 0; i < nargs; i++)
+                for (int i = 0; i < nargs; i++) {
                     ne[lambda_env_len + i] = argbuf[i];
+                    if (ne_is_oldgen && value_references_nursery(&argbuf[i]))
+                        gc_dirty_vectors_add(ne);
+                }
                 env = ne; env_len = new_env_len; env_cap = new_env_len;
                 gc_root_pop();
                 pc = 0; break;
@@ -2179,9 +2240,9 @@ Value vm_exec_env(Instr *code, int code_len, Value *init_env, int init_env_len) 
         }
     }
 done:
-    /* 7 pops (LIFO): frame_stack, cur_code, acc, stack.data, env, init_env, code */
+    /* 9 pops (LIFO): callframe_array, frames_sp_slot, frame_stack, cur_code, acc, stack.data, env, init_env, code */
     gc_root_pop(); gc_root_pop(); gc_root_pop(); gc_root_pop(); gc_root_pop();
-    gc_root_pop(); gc_root_pop();
+    gc_root_pop(); gc_root_pop(); gc_root_pop(); gc_root_pop();
     va_free(&stack);
     /* frame_stack is GC-allocated — no free needed */
     return acc;
@@ -2205,11 +2266,15 @@ static Value call_closure1(const char *name, Value arg) {
         return val_nil();
     }
     gc_root_push_value(&g);
+    gc_root_push_value(&arg);
     int env_len = g.lambda.env_len;
     Value *env = GC_VALUE_ARRAY(env_len + 1);
     if (env_len > 0) memcpy(env, g.lambda.env, env_len * sizeof(Value));
     env[env_len] = arg;
-    gc_root_pop();
+    if (gc_in_oldgen(env) && value_references_nursery(&arg))
+        gc_dirty_vectors_add(env);
+    gc_root_pop();  /* arg */
+    gc_root_pop();  /* g */
     return vm_exec_env(g.lambda.code, g.lambda.code_len, env, env_len + 1);
 }
 
@@ -2222,11 +2287,22 @@ static Value call_closure3(const char *name, Value a, Value b, Value c) {
         return val_nil();
     }
     gc_root_push_value(&g);
+    gc_root_push_value(&a);
+    gc_root_push_value(&b);
+    gc_root_push_value(&c);
     int env_len = g.lambda.env_len;
     Value *env = GC_VALUE_ARRAY(env_len + 3);
     if (env_len > 0) memcpy(env, g.lambda.env, env_len * sizeof(Value));
     env[env_len] = a; env[env_len+1] = b; env[env_len+2] = c;
-    gc_root_pop();
+    if (gc_in_oldgen(env)) {
+        if (value_references_nursery(&a)) gc_dirty_vectors_add(env);
+        if (value_references_nursery(&b)) gc_dirty_vectors_add(env);
+        if (value_references_nursery(&c)) gc_dirty_vectors_add(env);
+    }
+    gc_root_pop();  /* c */
+    gc_root_pop();  /* b */
+    gc_root_pop();  /* a */
+    gc_root_pop();  /* g */
     return vm_exec_env(g.lambda.code, g.lambda.code_len, env, env_len + 3);
 }
 

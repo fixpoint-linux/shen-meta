@@ -1182,6 +1182,16 @@ static void gc_scan_roots(void) {
                 gc_scan_value(&base[j]);
             break;
         }
+        case ROOT_CALLFRAME_ARRAY:
+            /* CallFrame headers (code/env/stack.data) are evacuated by the
+             * Cheney drain's GC_TYPE_CALLFRAME_ARRAY case (gc.c:578-587 for
+             * Phase-0 promotion, gc.c:668-677 for full collect, and
+             * gc.c:1365-1374 for nursery scavenges).  The frame_stack is
+             * rooted as ROOT_PTR, which queues the CallFrame array page
+             * for scanning.  An explicit walker here is redundant and can
+             * crash during Phase-0 promotion if a stack.data pointer reads
+             * a zero/invalid header — see Bug #6 (gcalloc: object too large). */
+            break;
         }
     }
 
@@ -2020,4 +2030,12 @@ void gc_register_values_table(void *table, int *len_p) {
 void gc_register_traced_code(Instr **arr, int *np) {
     reg_traced_code     = arr;
     reg_traced_code_len = np;
+}
+
+void gc_root_push_callframe_array(CallFrame *arr, int *np) {
+    if (shadow_len >= shadow_cap) shadow_stack_grow();
+    shadow_stack[shadow_len].kind = ROOT_CALLFRAME_ARRAY;
+    shadow_stack[shadow_len].slot = arr;
+    shadow_stack[shadow_len].np   = np;
+    shadow_len++;
 }

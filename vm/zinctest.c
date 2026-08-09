@@ -122,6 +122,8 @@ static Value call_bundled_1(const char *name, Value arg) {
     if (fn.lambda.env_len > 0)
         memcpy(env, fn.lambda.env, fn.lambda.env_len * sizeof(Value));
     env[fn.lambda.env_len] = arg;
+    if (gc_in_oldgen(env) && value_references_nursery(&arg))
+        gc_dirty_vectors_add(env);
     CatchFrame cf;
     cf.parent = vm_catch_chain;
     cf.in_trap_error = 0;
@@ -157,6 +159,10 @@ static Value call_bundled_2(const char *name, Value a1, Value a2) {
         memcpy(env, fn.lambda.env, fn.lambda.env_len * sizeof(Value));
     env[fn.lambda.env_len] = a1;
     env[fn.lambda.env_len + 1] = a2;
+    if (gc_in_oldgen(env)) {
+        if (value_references_nursery(&a1)) gc_dirty_vectors_add(env);
+        if (value_references_nursery(&a2)) gc_dirty_vectors_add(env);
+    }
     CatchFrame cf;
     cf.parent = vm_catch_chain;
     cf.in_trap_error = 0;

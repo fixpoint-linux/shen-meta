@@ -67,6 +67,11 @@ void *gc_move(void *p);
  * Used by the write barrier to detect old→nursery pointer stores. */
 int gc_in_nursery(void *p);
 
+/* True iff a Value carries any interior pointer into the nursery.
+ * Must mirror exactly the pointer fields gc_scan_value evacuates.
+ * Used by write barriers to decide whether to dirty the target array. */
+int value_references_nursery(Value *v);
+
 /* Old-gen predicate: true iff p's page is in the live old-gen semi-space
  * (space == current_space). */
 int gc_in_oldgen(void *p);
@@ -143,7 +148,8 @@ const unsigned long long *gc_alloc_class_counts(void);
 
 /* ---- precise-root API (Phase 3/4) --------------------------------- */
 
-typedef enum { ROOT_PTR, ROOT_VALUE, ROOT_VALUE_ARRAY, ROOT_VALUE_VOLATILE } RootKind;
+typedef enum { ROOT_PTR, ROOT_VALUE, ROOT_VALUE_ARRAY, ROOT_VALUE_VOLATILE,
+               ROOT_CALLFRAME_ARRAY } RootKind;
 /* single GC pointer slot.  MUST point at the HEAD of a GC object (not an
  * interior/tail pointer into a multi-page array).  Under 4b.1 the full-collect
  * root scan EVACUATES ROOT_PTR via gc_evacuate → gc_move, which reads the
@@ -155,6 +161,7 @@ void  gc_root_push_ptr(void **slot);
 void  gc_root_push_value(Value *vslot);            /* by-value Value, interior ptrs rewritten */
 void  gc_root_push_value_volatile(volatile Value *vslot); /* volatile-qualified Value */
 void  gc_root_push_value_array(Value *base, int *np); /* N by-value Values */
+void  gc_root_push_callframe_array(CallFrame *arr, int *np); /* N CallFrames */
 void  gc_root_pop(void);                           /* pop one entry */
 void  gc_root_pop_to(size_t watermark);            /* truncate (longjmp unwind) */
 size_t gc_root_watermark(void);                    /* snapshot depth */
