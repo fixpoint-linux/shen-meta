@@ -1415,7 +1415,7 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         static int newvar_counter = 0;
         char buf[64];
         if (stack->len > 0) va_pop(stack);  /* consume prefix arg */
-        snprintf(buf, sizeof(buf), "shen.V%d", newvar_counter++);
+        snprintf(buf, sizeof(buf), "V_%d", newvar_counter++);
         *acc = val_symbol(buf); return 0;
     }
     if (strcmp(name, "set") == 0) {

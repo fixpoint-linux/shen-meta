@@ -1897,19 +1897,179 @@ int main(int argc, char **argv) {
                 printf("\n--- Test OS-load probe: interp-load-raw of shen/probe-kl/test-add.kl ---\n"); fflush(stdout);
                 {
                     const char *path_str = "shen/probe-kl/test-add.kl";
-                    Value path = val_string(path_str, (long)strlen(path_str));
-                    printf("  Calling interp-load-raw on \"%s\" (len=%ld)...\n",
-                           path_str, (long)strlen(path_str)); fflush(stdout);
-                    Value load_res = call_bundled_1("interp-load-raw", path);
-                    printf("  interp-load-raw result: "); print_value(load_res); printf(" (tag=%d)\n", load_res.tag); fflush(stdout);
-                    if (load_res.tag == VAL_SYMBOL && strcmp(load_res.sym.name, "loaded") == 0) {
-                        printf("  OS-load probe PASS: interp-load-raw returned `loaded`\n");
-                    } else {
-                        printf("  OS-load probe FAIL: expected symbol `loaded`, got tag=%d", load_res.tag);
-                        if (load_res.tag == VAL_SYMBOL) printf(" name=%s", load_res.sym.name);
-                        printf("\n");
+
+                    /* Ordered Shen OS kernel load probe.  Loads the real OS .kl
+                     * files in the same order shen-scheme uses (shen/serialize.shen),
+                     * each via interp-load-raw (defuns land in the meta-interp's
+                     * global-table, namespace 2).  Reports per-file result and
+                     * stops at the first file that does NOT return `loaded`.
+                     * Runs AFTER the test-add.kl probe so the mechanism is already
+                     * proven; this measures how far the real OS actually loads. */
+                    {
+                        static const char *os_order[] = {
+                            "vendor/ShenOSKernel-41.2/klambda/core.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/declarations.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/types.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/macros.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/load.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/toplevel.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/sys.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/dict.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/track.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/reader.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/writer.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/yacc.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/prolog.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/sequent.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/t-star.kl",
+                            "shen/overrides-pure.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/extension-expand-dynamic.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/extension-features.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/extension-launcher.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/extension-programmable-pattern-matching.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/stlib.kl",
+                            "vendor/ShenOSKernel-41.2/klambda/init.kl",
+                            NULL
+                        };
+                        printf("\n--- Ordered Shen OS kernel load (shen-scheme order) ---\n"); fflush(stdout);
+                        for (int i = 0; os_order[i] != NULL; i++) {
+                            const char *os_path = os_order[i];
+                            Value os_p = val_string(os_path, (long)strlen(os_path));
+                            printf("  [%d] interp-load-raw \"%s\" ... ", i, os_path); fflush(stdout);
+                            Value os_res = call_bundled_1("interp-load-raw", os_p);
+                            if (os_res.tag == VAL_SYMBOL && strcmp(os_res.sym.name, "loaded") == 0) {
+                                printf("loaded\n"); fflush(stdout);
+                            } else {
+                                printf("FAIL tag=%d", os_res.tag);
+                                if (os_res.tag == VAL_SYMBOL) printf(" name=%s", os_res.sym.name);
+                                if (os_res.tag == VAL_ERROR) { printf(" msg="); print_value(os_res); }
+                                printf("\n  Ordered OS load STOPPED at file %d (%s)\n",
+                                       i, os_path); fflush(stdout);
+                                break;
+                            }
+                        }
+                        printf("--- Ordered OS load probe done ---\n"); fflush(stdout);
+
+                        /* Diagnostic: isolate which defun in types.kl fails to
+                         * compile.  Read the file, iterate forms, call interp-eval
+                         * on each and report the first that returns an error. */
+                        {
+                            const char *tp = "vendor/ShenOSKernel-41.2/klambda/types.kl";
+                            Value p = val_string(tp, (long)strlen(tp));
+                            Value forms = call_bundled_1("read-file-raw", p);
+                            printf("\n--- types.kl per-form compile isolation ---\n"); fflush(stdout);
+                            /* Walk the list of forms; each form is [defun Name Args Body]. */
+                            Value cur = forms;
+                            int fi = 0;
+                            while (cur.tag == VAL_CONS) {
+                                Value form = *cur.cons.car;
+                                Value res = call_bundled_1("interp-eval", form);
+                                if (res.tag == VAL_ERROR) {
+                                    printf("  form[%d] FAIL: ", fi); print_value(form);
+                                    printf("\n    error="); print_value(res); printf("\n"); fflush(stdout);
+                                    break;
+                                } else {
+                                    printf("  form[%d] ok -> ", fi);
+                                    if (form.cons.car != NULL && form.cons.car->tag == VAL_SYMBOL) printf("%s", form.cons.car->sym.name);
+                                    printf("\n"); fflush(stdout);
+                                }
+                                cur = *cur.cons.cdr;
+                                fi++;
+                            }
+                            printf("--- types.kl isolation done ---\n"); fflush(stdout);
+
+                            /* Isolate the exact failing construct in declare:
+                             * test curried multi-lambda application and @v/vector
+                             * forms individually through the bundled compiler. */
+                            {
+                                printf("\n--- declare sub-construct isolation ---\n"); fflush(stdout);
+                                /* Each test is a KLambda defun compiled via interp-eval. */
+                                const char *tests[] = {
+                                    "(defun t1 (X) (@v true (@v 0 (vector 0))))",
+                                    "(defun t2 (X) (vector 0))",
+                                    "(defun t3 (F) ((((F X) Y) Z) W))",
+                                    "(defun t4 (X) (shen.variancy X Y))",
+                                    "(defun t5 (X) (receive (shen.deref X Z)))",
+                                    "(defun t6 (X) (((((lambda A (lambda B (lambda C (lambda D (shen.variancy A B C D X X)))) (shen.prolog-vector)) (@v true (@v 0 (vector 0)))) 0) (freeze true)))))",
+                                    NULL
+                                };
+                                for (int ti = 0; tests[ti] != NULL; ti++) {
+                                    Value strv = val_string(tests[ti], (long)strlen(tests[ti]));
+                                    Value parsed = call_bundled_1("read-from-string", strv);
+                                    Value form = (parsed.tag == VAL_CONS) ? *parsed.cons.car : val_nil();
+                                    Value res = call_bundled_1("interp-eval", form);
+                                    printf("  %s -> ", tests[ti]);
+                                    if (res.tag == VAL_ERROR) { printf("FAIL "); print_value(res); }
+                                    else printf("ok (%s)", res.tag==VAL_SYMBOL?res.sym.name:"?");
+                                    printf("\n"); fflush(stdout);
+                                }
+                                /* Same body but loaded via read-file-raw (raw KLambda path). */
+                                {
+                                    Value p = val_string("shen/probe-kl/test-declare.kl", (long)strlen("shen/probe-kl/test-declare.kl"));
+                                    Value forms = call_bundled_1("read-file-raw", p);
+                                    if (forms.tag == VAL_CONS) {
+                                        Value form = *forms.cons.car;
+                                        Value res = call_bundled_1("interp-eval", form);
+                                        printf("  raw-kl test-declare.kl -> ");
+                                        if (res.tag == VAL_ERROR) { printf("FAIL "); print_value(res); }
+                                        else printf("ok");
+                                        printf("\n"); fflush(stdout);
+                                    }
+                                }
+                                /* Bisect raw-KLambda constructs: compile each of several
+                                 * hand-written .kl files via the exact read-file-raw path. */
+                                {
+                                    const char *bis[] = {
+                                        "shen/probe-kl/b1.kl",
+                                        "shen/probe-kl/b2.kl",
+                                        "shen/probe-kl/b3.kl",
+                                        "shen/probe-kl/b4.kl",
+                                        "shen/probe-kl/b5.kl",
+                                        "shen/probe-kl/b6.kl",
+                                        "shen/probe-kl/b7.kl",
+                                        NULL
+                                    };
+                                    printf("\n--- raw-KLambda bisect ---\n"); fflush(stdout);
+                                    for (int bi = 0; bis[bi] != NULL; bi++) {
+                                        Value p = val_string(bis[bi], (long)strlen(bis[bi]));
+                                        Value forms = call_bundled_1("read-file-raw", p);
+                                        if (forms.tag != VAL_CONS) { printf("  %s: read FAIL\n", bis[bi]); fflush(stdout); continue; }
+                                        Value form = *forms.cons.car;
+                                        Value res = call_bundled_1("interp-eval", form);
+                                        printf("  %s -> ", bis[bi]);
+                                        if (res.tag == VAL_ERROR) { printf("FAIL "); print_value(res); }
+                                        else printf("ok");
+                                        printf("\n"); fflush(stdout);
+                                    }
+                                    printf("--- raw-KLambda bisect done ---\n"); fflush(stdout);
+                                    /* Trace the failing curried-lambda form through the
+                                     * pipeline steps to find where it breaks. */
+                                    {
+                                        Value p = val_string("shen/probe-kl/b6.kl", (long)strlen("shen/probe-kl/b6.kl"));
+                                        Value forms = call_bundled_1("read-file-raw", p);
+                                        Value form = *forms.cons.car;
+                                        /* [defun t (X) BODY]: c1=t, c2=(X), c3=(BODY), body=BODY */
+                                        Value c1 = *form.cons.cdr;          /* t (X) BODY */
+                                        Value c2 = *c1.cons.cdr;            /* (X) BODY */
+                                        Value c3 = *c2.cons.cdr;            /* (BODY) */
+                                        Value body = *c3.cons.car;          /* BODY */
+                                        printf("\n--- b6 body pipeline trace ---\n"); fflush(stdout);
+                                        Value k = call_bundled_1("kmacros", body);
+                                        printf("  kmacros: "); print_value(k); printf("\n"); fflush(stdout);
+                                        Value n = call_bundled_1("normalize-term", k);
+                                        printf("  normalize-term: "); print_value(n); printf("\n"); fflush(stdout);
+                                        Value d = call_bundled_2("debruijn", val_nil(), n);
+                                        printf("  debruijn: "); print_value(d); printf("\n"); fflush(stdout);
+                                        Value z = call_bundled_1("zinc-c", d);
+                                        printf("  zinc-c: "); print_value(z); printf("\n"); fflush(stdout);
+                                        printf("--- b6 trace done ---\n"); fflush(stdout);
+                                    }
+                                }
+                                printf("--- declare isolation done ---\n"); fflush(stdout);
+                            }
+                        }
                     }
-                    fflush(stdout);
+
 
                     /* Verify the loaded closures are usable through the
                      * metacircular interp.  The defuns land in the interp's Shen
