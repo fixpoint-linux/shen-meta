@@ -11,10 +11,11 @@ run:
 	@echo "==> Checking prerequisites..."
 	@command -v clang >/dev/null 2>&1 || { echo "ERROR: clang not found (need clang >= 14)" >&2; exit 1; }
 	@command -v souffle >/dev/null 2>&1 || { echo "ERROR: souffle not found" >&2; exit 1; }
-	@echo "==> Extracting facts from vm/zincvm.c ..."
+	@echo "==> Extracting facts from vm/zincvm.c + vm/gc.c ..."
 	@mkdir -p facts
-	clang -Xclang -ast-dump=json -fsyntax-only -I ../../vm ../../vm/zincvm.c > /tmp/zincvm_ast.json 2>/dev/null
-	python3 extract.py --ast /tmp/zincvm_ast.json --out-dir facts/
+	@clang -Xclang -ast-dump=json -fsyntax-only -I ../../vm ../../vm/zincvm.c > /tmp/gcverify_zincvm.json 2>/dev/null
+	@clang -Xclang -ast-dump=json -fsyntax-only -I ../../vm ../../vm/gc.c > /tmp/gcverify_gc.json 2>/dev/null
+	python3 extract.py --ast /tmp/gcverify_zincvm.json --ast /tmp/gcverify_gc.json --out-dir facts/
 	@echo "==> Running Soufflé analysis..."
 	@mkdir -p out
 	# .input/.output filenames carry the facts/ and out/ prefixes, so the
@@ -26,9 +27,10 @@ run:
 
 selftest:
 	python3 tests/test_phase0.py -v
+	python3 tests/test_phase1.py -v
 
 # ── Clean ────────────────────────────────────────────────────────────
 
 clean:
 	rm -rf facts/ out/ __pycache__/ tests/__pycache__/
-	rm -f /tmp/zincvm_ast.json
+	rm -f /tmp/gcverify_zincvm.json /tmp/gcverify_gc.json
