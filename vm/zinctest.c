@@ -14,6 +14,7 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "zincvm.h"
 
@@ -1783,6 +1784,33 @@ int main(int argc, char **argv) {
 #ifdef ZINC_TEST_OS_LOAD
                 /* ---- OS-load probes: determine WHERE corruption first occurs. ---- */
                 {
+                    /* Fast path (env ZINC_STLIB_ONLY): time read-file-raw on
+                     * stlib.kl, count forms, exit early (skip slow ordered load). */
+                    if (getenv("ZINC_STLIB_ONLY")) {
+                        const char *sp2 = "vendor/ShenOSKernel-41.2/klambda/stlib.kl";
+                        printf("\n--- FAST: read-file-raw of stlib.kl ---\n"); fflush(stdout);
+                        clock_t t0 = clock();
+                        Value s2 = call_bundled_1("read-file-raw", val_string(sp2, (long)strlen(sp2)));
+                        clock_t t1 = clock();
+                        printf("  read-file-raw tag=%d  wall=%.2fs\n", s2.tag,
+                               (double)(t1 - t0) / CLOCKS_PER_SEC); fflush(stdout);
+                        if (s2.tag == VAL_CONS) {
+                            int cnt = 0; Value c2 = s2;
+                            while (c2.tag == VAL_CONS) { cnt++; c2 = *c2.cons.cdr; }
+                            printf("  form count=%d\n", cnt); fflush(stdout);
+                            c2 = s2;
+                            for (int k = 0; k < 3 && c2.tag == VAL_CONS; k++) {
+                                Value h = *c2.cons.car;
+                                if (h.tag == VAL_CONS && h.cons.car != NULL && h.cons.car->tag == VAL_SYMBOL)
+                                    printf("  form[%d] head=%s\n", k, h.cons.car->sym.name);
+                                c2 = *c2.cons.cdr;
+                            }
+                        } else if (s2.tag == VAL_ERROR) {
+                            printf("  read-file-raw ERROR: "); print_value(s2); printf("\n");
+                        }
+                        printf("--- FAST stlib read-file-raw done ---\n"); fflush(stdout);
+                        goto osload_done_fast;
+                    }
                     const char *path_str = "shen/probe-kl/test-add.kl";
                     long path_len = (long)strlen(path_str);
 
@@ -2141,6 +2169,7 @@ int main(int argc, char **argv) {
                     }
                     fflush(stdout);
                 }
+                osload_done_fast: ;
 #endif
 
             printf("\nSelf-hosting proven: The C VM loaded %d closures compiled by\n", defun_table_used);
