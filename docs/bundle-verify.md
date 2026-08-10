@@ -104,6 +104,31 @@ and it would reject polymorphic `id {A-->A}` (bundled).
 
 These belong in a separate workstream (roadmap item 2). Do NOT try to force Check B into Datalog.
 
+### Why B-mono was deferred (2026-08-10)
+
+The one Datalog-expressible reading of "type-safe" is a **monomorphic tag-consistency**
+check (`B-mono`): at each primitive call, verify the statically-known tag of each argument
+matches the primitive's expected input tag, over the `zinc-value` universe. It was assessed
+against the canonical `globals.csexp` and **not built**, for three empirical reasons:
+
+1. **Zero signal.** An optimistic local check found **0 true positives** and **~9,000
+   uninferable sites** (37.5% of prim calls are preceded by `[access N]` env-slot loads —
+   the interp's `C A E S R` params are by-design polymorphic zinc-values; you cannot
+   monomorphise a metacircular interpreter against itself). Only ~192 sites had a locally
+   visible literal argument, and all were already correct.
+2. **Redundant with the sound gates.** The structural safe-subset (full-arity via A1,
+   unsafe-construct/non-linear-pattern via A2) is already covered. B-mono's marginal catch
+   space is narrower than the safe-subset layer and strictly weaker than Phase 5.
+3. **Cost.** A primitive-tag table introduces a **third hand-curated primitive sync**
+   (with `exec_primitive` and the `safe.X` wrappers) — reversing the mechanical-sync gain
+   that `unknown_prim` exists to provide. Plus a per-slot tag-set stack simulation and a
+   ~9,000-row baseline churn.
+
+If a minimal `prim_tag_smell` check is ever wanted, it must be: local-only (literal args
+preceding a monomorphic prim), named to signal "candidate, not gate", WARN-never-FAIL in CI,
+and explicitly documented as **not a type check** (no polymorphism, no interprocedural flow,
+no refined types). Otherwise Phase 5 provides the real proof and subsumes it.
+
 ## Architecture / reuse
 
 Build `tools/bundle-verify/` as a **sibling** of `tools/gc-verify/`. Do NOT generalize the
@@ -120,7 +145,7 @@ gc-verify extractor (csexp parser ≠ clang AST). Copy the **governance pattern*
 | 1 | A1 cheap checks: opcode alphabet, dangling globals, unknown prims, curried adjacency + **diagnostic query** (count `[access N]` call sites) | sound (cheap) + diagnostic |
 | 2 | A1 sound full-arity check (callee kinds 1/2/4); flow analysis only if diagnostic non-empty | **sound gate** |
 | 3 | A2 source-level checks (unsafe constructs, non-linear patterns, `@p` patterns) | **sound gate** |
-| 4 | (optional, defense-in-depth) B-mono tag-consistency over zinc-value universe. Document as NOT a proof | candidate |
+| 4 | **DEFERRED** — B-mono assessed 2026-08-10, not built. Empirically 0 TP / ~9,000 uninferable sites on the canonical bundle; the safe-subset is already covered by the sound Check A gates, and the real type-safety proof is Phase 5 (non-Datalog). See Phase 5 row + "Why B-mono was deferred". | — |
 | 5 | (separate, non-Datalog) Real type safety: `tc +` upstream, or in-Shen algorithm-W | proof |
 
 ## Soundness limits
