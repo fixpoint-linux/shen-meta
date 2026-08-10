@@ -1,4 +1,4 @@
-.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug
+.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -108,6 +108,16 @@ pipeline: zincvm
 
 interp:
 	$(SHEN) script shen/interp.shen
+
+# GC-safety verifier — opt-in, not gating.  See docs/gc-verify.md.
+gc-verify:
+	@if ! command -v clang >/dev/null 2>&1; then \
+		echo "gc-verify: skipping (clang not found — install clang >= 14)"; \
+	elif ! command -v souffle >/dev/null 2>&1; then \
+		echo "gc-verify: skipping (souffle not found)"; \
+	else \
+		$(MAKE) -C tools/gc-verify run; \
+	fi
 
 setup:
 	@if [ ! -d ../shen-scheme ]; then \

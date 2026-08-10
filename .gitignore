@@ -16,3 +16,7 @@ zinctest-asan
 *.com.dbg
 *.aarch64.elf
 *.aarch64
+# GC-safety verifier generated output
+tools/gc-verify/facts/
+tools/gc-verify/out/
+tools/gc-verify/__pycache__/

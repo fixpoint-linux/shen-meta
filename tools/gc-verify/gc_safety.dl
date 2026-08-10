@@ -1,0 +1,76 @@
+// gc_safety.dl — Soufflé Datalog ruleset for GC-safety verification
+//
+// Architecture:
+//   vm/*.c --clang -Xclang -ast-dump=json--> extract.py --CSV--> gc_safety.dl
+//
+// Phased rollout: Phase 0 = schema + may_collect + skeleton rules.
+// Phases 2-3 fill in root_miss and memcpy_unbarriered.
+
+// ── Input fact schemas (all 10 CSV files) ────────────────────────────
+
+.decl function(name:symbol)
+.input function(IO=file, delimiter=",", filename="facts/function.csv")
+
+.decl cfg_edge(f:symbol, from_stmt_id:number, to_stmt_id:number, kind:symbol)
+.input cfg_edge(IO=file, delimiter=",", filename="facts/cfg_edge.csv")
+
+.decl stmt_allocs(f:symbol, stmt_id:number, callee:symbol)
+.input stmt_allocs(IO=file, delimiter=",", filename="facts/stmt_allocs.csv")
+
+.decl stmt_pushes(f:symbol, stmt_id:number, root_kind:symbol, slot_expr:symbol)
+.input stmt_pushes(IO=file, delimiter=",", filename="facts/stmt_pushes.csv")
+
+.decl stmt_pops(f:symbol, stmt_id:number, pop_count:number, pkind:symbol)
+.input stmt_pops(IO=file, delimiter=",", filename="facts/stmt_pops.csv")
+
+.decl stmt_memcpy(f:symbol, stmt_id:number, dst_expr:symbol, src_expr:symbol, nbytes:number)
+.input stmt_memcpy(IO=file, delimiter=",", filename="facts/stmt_memcpy.csv")
+
+.decl stmt_barrier(f:symbol, stmt_id:number, target_expr:symbol)
+.input stmt_barrier(IO=file, delimiter=",", filename="facts/stmt_barrier.csv")
+
+.decl var_decl(f:symbol, name:symbol, type:symbol, is_gc_managed:number)
+.input var_decl(IO=file, delimiter=",", filename="facts/var_decl.csv")
+
+.decl field_assign(f:symbol, stmt_id:number, base:symbol, field_path:symbol, rhs_kind:symbol)
+.input field_assign(IO=file, delimiter=",", filename="facts/field_assign.csv")
+
+.decl call_graph(caller:symbol, callee:symbol)
+.input call_graph(IO=file, delimiter=",", filename="facts/call_graph.csv")
+
+// ── Stratum 1: may_collect — transitive closure over call_graph ──────
+// Seeds: gc_alloc and friends are the leaf allocators that may trigger
+// a nursery collection.  collect / collect_nursery / gcalloc_internal
+// are the internal entry points.
+
+.decl may_collect(f:symbol)
+
+may_collect("gc_alloc").
+may_collect("gc_alloc_oldgen").
+may_collect("gc_alloc_atomic").
+may_collect("collect").
+may_collect("collect_nursery").
+may_collect("gcalloc_internal").
+
+// Transitive closure: if a function calls something in may_collect,
+// it is also in may_collect.
+may_collect(caller) :- call_graph(caller, callee), may_collect(callee).
+
+// ── Stratum 2+: analysis rules (Phases 2-3) ─────────────────────────
+
+// Phase 2 — root_miss: GC-managed var live across an allocating call
+// ∧ not must_rooted.  Currently vacuous; implement in Phase 2.
+.decl root_miss(f:symbol, stmt_id:number, var_name:symbol)
+root_miss(f, stmt_id, "") :- stmt_allocs(f, stmt_id, _), false.
+
+// Phase 3 — memcpy_unbarriered: raw memcpy into a fresh GC_TYPE_VALUE_ARRAY
+// target with no gc_barrier_value_array before the next may-collect.
+// Currently vacuous; implement in Phase 3.
+.decl memcpy_unbarriered(f:symbol, stmt_id:number, dst_expr:symbol)
+memcpy_unbarriered(f, stmt_id, "") :- stmt_memcpy(f, stmt_id, _, _, _), false.
+
+// ── Output relations ─────────────────────────────────────────────────
+
+.output may_collect(IO=file, delimiter=",", filename="out/may_collect.csv")
+.output root_miss(IO=file, delimiter=",", filename="out/root_miss.csv")
+.output memcpy_unbarriered(IO=file, delimiter=",", filename="out/memcpy_unbarriered.csv")
