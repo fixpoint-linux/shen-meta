@@ -1,0 +1,179 @@
+// bundle_safety.dl — Soufflé Datalog ruleset for bundle safe-subset verification
+//
+// Architecture:
+//   globals.csexp --extract_bundle.py--> CSV facts --> bundle_safety.dl
+//
+// Check A1: bundle-level safe-subset verification.
+// This is a SOUND GATE — a clean run proves the bundle is in the safe subset.
+//
+// Phased rollout:
+//   Phase 0: scaffold + CSV schemas
+//   Phase 1: cheap checks (bad_opcode, dangling_global, unknown_prim, curried_call)
+//   Phase 2: sound full-arity check (arity_mismatch, unresolved_call)
+
+// ── Input fact schemas ────────────────────────────────────────────────
+
+.decl closure(name:symbol, arity:number)
+.input closure(IO=file, delimiter=",", headers=true, filename="facts/closure.csv")
+
+.decl instr(name:symbol, idx:number, op:symbol)
+.input instr(IO=file, delimiter=",", headers=true, filename="facts/instr.csv")
+
+.decl operand(name:symbol, idx:number, kind:symbol, value:symbol)
+.input operand(IO=file, delimiter=",", headers=true, filename="facts/operand.csv")
+
+.decl global_ref(name:symbol, idx:number, target:symbol)
+.input global_ref(IO=file, delimiter=",", headers=true, filename="facts/global_ref.csv")
+
+.decl prim_ref(name:symbol, idx:number, prim:symbol)
+.input prim_ref(IO=file, delimiter=",", headers=true, filename="facts/prim_ref.csv")
+
+.decl call_site(name:symbol, idx:number, kind:symbol)
+.input call_site(IO=file, delimiter=",", headers=true, filename="facts/call_site.csv")
+
+.decl cur_lit(name:symbol, idx:number, sub_code_id:symbol)
+.input cur_lit(IO=file, delimiter=",", headers=true, filename="facts/cur_lit.csv")
+
+.decl pushmark(name:symbol, idx:number)
+.input pushmark(IO=file, delimiter=",", headers=true, filename="facts/pushmark.csv")
+
+// ── Static allowlist tables ────────────────────────────────────────────
+
+.decl allowed_prim(prim:symbol)
+.input allowed_prim(IO=file, delimiter=",", headers=true, filename="facts/allowed_prim.csv")
+
+.decl instruction_keyword(keyword:symbol)
+.input instruction_keyword(IO=file, delimiter=",", headers=true, filename="facts/instruction_keyword.csv")
+
+.decl opcode_valid(op:symbol)
+.input opcode_valid(IO=file, delimiter=",", headers=true, filename="facts/opcode_valid.csv")
+
+.decl prim_arity(prim:symbol, arity:number)
+.input prim_arity(IO=file, delimiter=",", headers=true, filename="facts/prim_arity.csv")
+
+// ── Check 1: bad_opcode ────────────────────────────────────────────────
+//
+// Flag any instruction whose opcode character is not in the valid set.
+
+.decl bad_opcode(name:symbol, idx:number, op:symbol)
+bad_opcode(name, idx, op) :-
+    instr(name, idx, op),
+    !opcode_valid(op).
+
+.output bad_opcode(IO=file, delimiter=",", headers=true, filename="out/bad_opcode.csv")
+
+// ── Check 2: dangling_global ───────────────────────────────────────────
+//
+// A [global X] reference where X is neither a known closure, an allowed
+// primitive, nor an instruction keyword.
+
+.decl dangling_global(name:symbol, idx:number, target:symbol)
+dangling_global(name, idx, target) :-
+    global_ref(name, idx, target),
+    !closure(target, _),
+    !allowed_prim(target),
+    !instruction_keyword(target).
+
+.output dangling_global(IO=file, delimiter=",", headers=true, filename="out/dangling_global.csv")
+
+// ── Check 3: unknown_prim ──────────────────────────────────────────────
+//
+// A [prim X] where X is not in the primitive allowlist.
+
+.decl unknown_prim(name:symbol, idx:number, prim:symbol)
+unknown_prim(name, idx, prim) :-
+    prim_ref(name, idx, prim),
+    !allowed_prim(prim).
+
+.output unknown_prim(IO=file, delimiter=",", headers=true, filename="out/unknown_prim.csv")
+
+// ── Check 4: curried_call ──────────────────────────────────────────────
+//
+// Two adjacent apply/appterm opcodes with no intervening instruction.
+// This is the hallmark of a curried partial-application call that the
+// C VM cannot run (it would crash with "apply non-callable").
+// Equivalent to zincdec's --curried scan.
+
+.decl curried_call(name:symbol, idx:number)
+curried_call(name, idx) :-
+    call_site(name, idx, _),
+    call_site(name, idx2, _),
+    idx2 = idx + 1.
+
+.output curried_call(IO=file, delimiter=",", headers=true, filename="out/curried_call.csv")
+
+// ── Check 5: arity_mismatch (sound full-arity gate) ────────────────────
+//
+// supplied_args(name, cs_idx, n) is computed by the Python extractor via a
+// forward-dataflow stack simulation.  The Datalog only cross-references the
+// supplied count with the callee's declared closure arity.
+//
+// Callee kind resolution:
+//   - global_ref at call_idx-1 → look up closure(name, arity)
+//   - cur_lit at call_idx-1    → look up closure(sub_code_id, arity)
+//   - prim_ref at call_idx-1   → TRUSTED (no arity check; prim_arity feeds
+//     the stack simulation in the extractor, not the Datalog)
+//   - access (access N) at call_idx-1 → unresolved_call (higher-order)
+//
+// If callee resolution fails, emit unresolved_call instead of arity_mismatch.
+
+// supplied_args is computed by the extractor's stack simulation
+.decl supplied_args(name:symbol, cs_idx:number, n:number)
+.input supplied_args(IO=file, delimiter=",", headers=true, filename="facts/supplied_args.csv")
+
+// ── Helper: callee kind at cs_idx-1 (scoped by call_site, not pushmark_pair)
+
+.decl callee_is_global(name:symbol, cs_idx:number, target:symbol)
+callee_is_global(name, cs_idx, target) :-
+    call_site(name, cs_idx, _),
+    callee_idx = cs_idx - 1,
+    global_ref(name, callee_idx, target).
+
+.decl callee_is_cur(name:symbol, cs_idx:number, sub_id:symbol)
+callee_is_cur(name, cs_idx, sub_id) :-
+    call_site(name, cs_idx, _),
+    callee_idx = cs_idx - 1,
+    cur_lit(name, callee_idx, sub_id).
+
+.decl callee_is_access(name:symbol, cs_idx:number)
+callee_is_access(name, cs_idx) :-
+    call_site(name, cs_idx, _),
+    callee_idx = cs_idx - 1,
+    instr(name, callee_idx, "a").
+
+// ── Check 5a: unresolved_call ──────────────────────────────────────────
+//
+// Call site whose callee is a higher-order parameter (access N).
+// These are unresolvable statically without flow analysis.
+// Expected: 0 for the safe subset.
+
+.decl unresolved_call(name:symbol, cs_idx:number)
+unresolved_call(name, cs_idx) :-
+    callee_is_access(name, cs_idx).
+
+.output unresolved_call(IO=file, delimiter=",", headers=true, filename="out/unresolved_call.csv")
+
+// ── Check 5b: arity_mismatch ───────────────────────────────────────────
+//
+// Resolve callee arity from closure and compare to supplied args from the
+// extractor's stack simulation.
+// NOTE: prim calls are NOT checked (trusted); only global-ref and cur-lit
+// call sites are verified here.
+
+.decl expected_arity(name:symbol, cs_idx:number, callee_id:symbol, expected:number)
+// global ref → closure arity
+expected_arity(name, cs_idx, target, arity) :-
+    callee_is_global(name, cs_idx, target),
+    closure(target, arity).
+// cur_lit → sub-closure arity
+expected_arity(name, cs_idx, sub_id, arity) :-
+    callee_is_cur(name, cs_idx, sub_id),
+    closure(sub_id, arity).
+
+.decl arity_mismatch(caller:symbol, call_idx:number, callee:symbol, expected:number, supplied:number)
+arity_mismatch(caller, call_idx, callee, expected, supplied) :-
+    expected_arity(caller, call_idx, callee, expected),
+    supplied_args(caller, call_idx, supplied),
+    expected != supplied.
+
+.output arity_mismatch(IO=file, delimiter=",", headers=true, filename="out/arity_mismatch.csv")

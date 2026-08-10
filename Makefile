@@ -119,6 +119,15 @@ gc-verify:
 		$(MAKE) -C tools/gc-verify run; \
 	fi
 
+# Bundle safe-subset verifier — opt-in, not gating.  Requires souffle.
+# See docs/bundle-verify.md and tools/bundle-verify/.
+bundle-verify:
+	@if ! command -v souffle >/dev/null 2>&1; then \
+		echo "bundle-verify: skipping (souffle not found)"; \
+	else \
+		$(MAKE) -C tools/bundle-verify run; \
+	fi
+
 setup:
 	@if [ ! -d ../shen-scheme ]; then \
 		git clone https://github.com/tizoc/shen-scheme ../shen-scheme; \

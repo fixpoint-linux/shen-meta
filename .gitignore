@@ -20,3 +20,7 @@ zinctest-asan
 tools/gc-verify/facts/
 tools/gc-verify/out/
 tools/gc-verify/__pycache__/
+# Bundle safe-subset verifier generated output
+tools/bundle-verify/facts/
+tools/bundle-verify/out/
+tools/bundle-verify/__pycache__/

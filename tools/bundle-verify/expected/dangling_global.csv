@@ -1,0 +1,17 @@
+name,idx,target
+interp-load,3,read-file
+interp-load-safe.33,3,read-file
+set-toplevel,13,ps
+set-toplevel,48,ps
+shen.collect-apply-args,77,shen.f-error
+shen.count-args,22,shen.f-error
+shen.element?-h,32,shen.f-error
+shen.interp-load,3,read-file
+shen.interp-load-safe.23,3,read-file
+shen.map-debruijn,28,shen.f-error
+shen.map-kmacros,25,shen.f-error
+shen.map-zinc-c,25,shen.f-error
+shen.normalize,436,shen.f-error
+shen.set-toplevel,13,ps
+shen.set-toplevel,48,ps
+shen.zinc-c-args,25,shen.f-error
