@@ -5,7 +5,7 @@
                     absvector? cons? cons hd tl write-byte read-byte read-file-as-string open function?
                     close = eval-kl get-time symbol? boolean? error? stream?
                     @p fst snd gensym variable? newvar
-                    c-strlen char-code substring]))
+                    c-strlen char-code substring element?]))
 
 (datatype primitive
   X : primitive >> T : Y;

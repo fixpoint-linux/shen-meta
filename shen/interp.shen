@@ -82,6 +82,15 @@
   [] Acc -> Acc
   [_ | Args] Acc -> (count-args Args (+ 1 Acc)))
 
+\* element?-h: deep list membership used by the [prim element?] interp rule.
+   Compares the needle against each list element with =.  The elements are
+   interpreted zinc-values (raw cons/symbol/number/...), so extract-kl to
+   canonical form then compare. *\
+(define element?-h { zinc-value --> (list zinc-value) --> boolean }
+  _ [] -> false
+  X [H | T] -> true where (= X H)
+  X [H | T] -> (element?-h X T))
+
 (define drop-grabs { number --> (list zinc-instruction) --> (list zinc-instruction) }
   N C -> C where (= N 0)
   N [grab | C] -> (drop-grabs (- N 1) C)
@@ -171,6 +180,9 @@
   [prim cons? | C] [cons _ _] E S R                             -> (interp C [boolean true] E S R)
   [prim cons? | C] [cons] E S R                                 -> (interp C [boolean true] E S R)
   [prim cons? | C] A E S R                                      -> (interp C [boolean false] E S R)
+  \* element?: deep_equal list membership (matches C primitive).  Leftmost arg
+     (needle) is the accumulator, rightmost (list) is on the stack. *\
+  [prim element? | C] X E [L | S] R                            -> (interp C [boolean (element?-h X L)] E S R)
   [prim absvector | C] [number A] E S R                         -> (interp C [absvector (absvector A)] E S R)
   [prim absvector? | C] [absvector _] E S R                     -> (interp C [boolean true] E S R)
   [prim absvector? | C] A E S R                                 -> (interp C [boolean false] E S R)
@@ -354,6 +366,7 @@
 (set-toplevel collect-apply-args collect-apply-args)
 (set-toplevel zinc-arity zinc-arity)
 (set-toplevel count-args count-args)
+(set-toplevel element?-h element?-h)
 (set-toplevel drop-grabs drop-grabs)
 (set-toplevel interp interp)
 (tc +)

@@ -882,7 +882,7 @@ static int exec_primitive_valid(const char *name) {
         "+","-","*","/","=","<",">","<=",">=",
         "cons","hd","tl","cn","emptylist",
         "simple-error","trap-error","error-to-string",
-        "eval-kl","absvector","<-address","address->",
+        "eval-kl","element?","absvector","<-address","address->",
         "n->string","string->n","str","tlstr","hdstr","pos",
         "intern","value","open","close","read-byte","write-byte",
         "c-strlen","char-code","substring",
@@ -1047,6 +1047,26 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             else *acc = val_string("unknown error", 13);
             gc_root_pop();
             return 0;
+        }
+        /* element?: deep_equal list membership — O(n) C scan.  The bundled Shen
+           element? ran ~1500-3000 metacircular instructions per step; as a C
+           primitive each scan step is one C VM instruction.  Preserves exact
+           semantics (deep structural equality) for debruijn scope scans,
+           primitive?/instruction-keyword? membership, and dedupe-globals. */
+        if (strcmp(name, "element?") == 0) {
+            Value x = va_pop(stack);      /* needle */
+            Value l = va_pop(stack);      /* haystack list */
+            gc_root_push_value(&x);
+            gc_root_push_value(&l);
+            int found = 0;
+            Value cur = l;
+            while (cur.tag == VAL_CONS) {
+                if (deep_equal(x, *cur.cons.car)) { found = 1; break; }
+                cur = *cur.cons.cdr;
+            }
+            gc_root_pop();  /* l */
+            gc_root_pop();  /* x */
+            *acc = val_boolean(found); return 0;
         }
         if (strcmp(name, "eval-kl") == 0) {
             Value a = va_pop(stack);
@@ -2550,7 +2570,7 @@ void init_globals(void) {
         "symbol?","boolean?","number?","string?","cons?",
         "error?","function?","stream?",
         "simple-error","trap-error","error-to-string",
-        "eval-kl","absvector","<-address","address->",
+        "eval-kl","element?","absvector","<-address","address->",
         "n->string","string->n","str","tlstr","hdstr","pos",
         "intern","value","open","close","read-byte","write-byte",
         "c-strlen","char-code","substring",
