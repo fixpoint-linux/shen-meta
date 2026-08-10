@@ -56,7 +56,8 @@
                     string->n n->string absvector address-> <-address emptylist
                     absvector? cons? cons hd tl write-byte read-byte read-file-as-string open function?
                     close = eval-kl get-time symbol? boolean? error? stream?
-                    @p fst snd gensym variable? newvar]))
+                    @p fst snd gensym variable? newvar
+                    c-strlen char-code substring]))
 
 \* Zinc instruction keywords used as list constructors in zinc-c/zinc-t RHS.
    These must NOT be wrapped with [function ...] by debruijn. *\

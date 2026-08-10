@@ -885,6 +885,7 @@ static int exec_primitive_valid(const char *name) {
         "eval-kl","absvector","<-address","address->",
         "n->string","string->n","str","tlstr","hdstr","pos",
         "intern","value","open","close","read-byte","write-byte",
+        "c-strlen","char-code","substring",
         "set","get-time","read-file-as-string",
         "@p","fst","snd","gensym","variable?","newvar",
         "shen.fail!","fail",
@@ -1013,6 +1014,23 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             }
             if (s.stream.file) fclose(s.stream.file);
             *acc = val_nil(); return 0;
+        }
+        /* c-strlen: O(1) string length (kills the per-char trap-error loop). */
+        if (strcmp(name, "c-strlen") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_STRING) PRIM_TYPE_ERROR("c-strlen on non-string");
+            *acc = val_number(a.str.len); return 0;
+        }
+        /* char-code: byte at index as integer (no 1-char string allocation). */
+        if (strcmp(name, "char-code") == 0) {
+            Value a = va_pop(stack);   /* string */
+            Value n = va_pop(stack);   /* index */
+            int i = (int)n.number;
+            if (i >= 0 && i < a.str.len)
+                *acc = val_number((unsigned char)a.str.data[i]);
+            else
+                *acc = val_number(-1);
+            return 0;
         }
         break;
 
@@ -1378,6 +1396,24 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             Value a = va_pop(stack);
             if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("snd on non-cons");
             *acc = *a.cons.cdr; return 0;
+        }
+        /* substring: zero-copy view Str[Start..Start+Len), clamped. */
+        if (strcmp(name, "substring") == 0) {
+            Value s = va_pop(stack);      /* string */
+            Value st = va_pop(stack);     /* start */
+            Value ln = va_pop(stack);     /* len */
+            int start = (int)st.number, len = (int)ln.number;
+            if (s.tag != VAL_STRING) PRIM_TYPE_ERROR("substring on non-string");
+            if (start < 0) start = 0;
+            if (start > s.str.len) start = s.str.len;
+            if (len < 0) len = 0;
+            if (start + len > s.str.len) len = s.str.len - start;
+            /* Root s across val_string_from (it may alias s's buffer and s may
+               be in the nursery; keep the source alive). */
+            gc_root_push_value(&s);
+            Value r = val_string_from(&s, start, len);
+            gc_root_pop();
+            *acc = r; return 0;
         }
         break;
 
@@ -2517,6 +2553,7 @@ void init_globals(void) {
         "eval-kl","absvector","<-address","address->",
         "n->string","string->n","str","tlstr","hdstr","pos",
         "intern","value","open","close","read-byte","write-byte",
+        "c-strlen","char-code","substring",
         "set","get-time","read-file-as-string",
         "@p","fst","snd","gensym","variable?","newvar",
         "shen.fail!","fail",
