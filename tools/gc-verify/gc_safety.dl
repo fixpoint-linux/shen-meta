@@ -60,6 +60,14 @@
 .decl defining_alloc(f:symbol, var:symbol, stmt_id:number)
 .input defining_alloc(IO=file, delimiter=",", headers=true, filename="facts/defining_alloc.csv")
 
+// ── Phase 6 new input relations ───────────────────────────────────────
+
+.decl call_site(f:symbol, stmt_id:number, callee:symbol)
+.input call_site(IO=file, delimiter=",", headers=true, filename="facts/call_site.csv")
+
+.decl array_store(f:symbol, stmt_id:number, base_var:symbol)
+.input array_store(IO=file, delimiter=",", headers=true, filename="facts/array_store.csv")
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // STRATUM 1 — may_collect transitive closure
@@ -77,6 +85,19 @@ may_collect("gcalloc_internal").
 // Transitive closure: if a function calls something in may_collect,
 // it is also in may_collect.
 may_collect(caller) :- call_graph(caller, callee), may_collect(callee).
+
+
+// ── Phase 6 (Rule 3): transitive_alloc_site ───────────────────────────
+//
+// A call site is an "allocating site" if its callee is in may_collect.
+// stmt_allocs only captures direct calls to the 6 seed allocators; this
+// relation extends that to indirect callers (a call to B that
+// transitively calls gc_alloc is invisible to stmt_allocs alone).
+// Uses call_site (all resolved callees) + may_collect TC closure.
+// Superset of stmt_allocs, so existing root_miss rows survive.
+
+.decl transitive_alloc_site(f:symbol, stmt_id:number)
+transitive_alloc_site(f, s) :- call_site(f, s, callee), may_collect(callee).
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -168,17 +189,17 @@ must_rooted(f, v, s) :- pushed_may(f, v, s).
 .decl root_miss(f:symbol, stmt_id:number, var_name:symbol)
 
 root_miss(f, s, v) :-
-    stmt_allocs(f, s, _),
+    transitive_alloc_site(f, s),
     var_decl(f, v, _, 1),       // is_gc_managed = 1
     live_at(f, v, s),
     !must_rooted(f, v, s),
     !defining_alloc(f, v, s).
 
-// Note: may_collect(_) guard omitted from body because stmt_allocs
-// already contains only known may-collect seeds (the extractor filters
-// on MAY_COLLECT_SEEDS).  Transitive may_collect for indirect callers
-// is computed by Soufflé but doesn't feed into root_miss directly (the
-// stmt_allocs relation captures the actual allocating call site).
+// Note: may_collect(_) guard omitted from body because
+// transitive_alloc_site already contains only sites whose callee is in
+// may_collect (direct seed allocators or transitive indirect callers).
+// It is a superset of the previous stmt_allocs-based set, so existing
+// root_miss rows survive.
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -221,8 +242,87 @@ memcpy_unbarriered(f, s_memcpy, dst) :-
     !barrier_covers_alloc(f, s_memcpy, dst, s_alloc).
 
 
+// ═══════════════════════════════════════════════════════════════════════
+// Phase 6 (Rule 4) — single_store_unbarriered
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Single-Value stores into GC-managed arrays (ne[i]=v, a->data[i]=v,
+// (*env)[i]=v) need a write barrier, mirroring memcpy_unbarriered.
+
+// STRATUM 5b — barrier_covers_store (depends on reach_stmt)
+.decl barrier_covers_store(f:symbol, s_store:number, base:symbol, s_alloc:number)
+barrier_covers_store(f, s_store, base, s_alloc) :-
+    array_store(f, s_store, base),
+    stmt_barrier(f, s_barrier, base),
+    stmt_allocs(f, s_alloc, _),
+    reach_stmt(f, s_store, s_barrier),
+    reach_stmt(f, s_barrier, s_alloc).
+
+// STRATUM 5c — single_store_unbarriered (negates barrier_covers_store)
+.decl single_store_unbarriered(f:symbol, stmt_id:number, base_var:symbol)
+single_store_unbarriered(f, s_store, base) :-
+    array_store(f, s_store, base),
+    stmt_allocs(f, s_alloc, _),
+    reach_stmt(f, s_store, s_alloc),
+    !barrier_covers_store(f, s_store, base, s_alloc).
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// Phase 6 (Rule 1) — push_pop_balance
+// ═══════════════════════════════════════════════════════════════════════
+//
+// A gc_root_push_* without a matching pop (or a pop without a push) on a
+// path leaks/corrupts the shadow stack.  pop_to resets depth to 0.
+// Depends only on inputs + pop_to_at (stratum 2).
+
+.decl push_at(f:symbol, stmt_id:number)
+push_at(f, s) :- stmt_pushes(f, s, _, _).
+
+.decl pop_one_at(f:symbol, stmt_id:number)
+pop_one_at(f, s) :- stmt_pops(f, s, _, "pop_one").
+
+.decl has_successor(f:symbol, stmt_id:number)
+has_successor(f, s) :- next_stmt(f, s, _).
+
+.decl any_stmt(f:symbol, stmt_id:number)
+any_stmt(f, s) :- push_at(f, s).
+any_stmt(f, s) :- pop_one_at(f, s).
+any_stmt(f, s) :- pop_to_at(f, s).
+any_stmt(f, s) :- stmt_allocs(f, s, _).
+any_stmt(f, s) :- stmt_memcpy(f, s, _, _, _).
+any_stmt(f, s) :- stmt_barrier(f, s, _).
+
+.decl func_exit(f:symbol, stmt_id:number)
+func_exit(f, s) :- any_stmt(f, s), !has_successor(f, s).
+
+.decl first_stmt(f:symbol, stmt_id:number)
+first_stmt(f, s) :- any_stmt(f, s), !next_stmt(f, _, s).
+
+.decl depth(f:symbol, stmt_id:number, d:number)
+depth(f, s, 0) :- first_stmt(f, s).
+depth(f, s2, d) :-
+    next_stmt(f, s1, s2), depth(f, s1, d),
+    !push_at(f, s1), !pop_one_at(f, s1), !pop_to_at(f, s1).
+depth(f, s2, d + 1) :-
+    next_stmt(f, s1, s2), depth(f, s1, d), push_at(f, s1),
+    !pop_to_at(f, s1), d < 128.
+depth(f, s2, d - 1) :-
+    next_stmt(f, s1, s2), depth(f, s1, d), pop_one_at(f, s1),
+    !pop_to_at(f, s1), d >= 1.
+depth(f, s2, 0) :-
+    next_stmt(f, s1, s2), pop_to_at(f, s1).
+
+.decl push_pop_balance(f:symbol, stmt_id:number, kind:symbol, current_depth:number)
+push_pop_balance(f, s, "pop_without_push", 0) :-
+    pop_one_at(f, s), depth(f, s, 0).
+push_pop_balance(f, s, "push_never_popped", d) :-
+    func_exit(f, s), depth(f, s, d), d > 0.
+
+
 // ── Output relations ───────────────────────────────────────────────────
 
 .output may_collect(IO=file, delimiter=",", headers=true, filename="out/may_collect.csv")
 .output root_miss(IO=file, delimiter=",", headers=true, filename="out/root_miss.csv")
 .output memcpy_unbarriered(IO=file, delimiter=",", headers=true, filename="out/memcpy_unbarriered.csv")
+.output single_store_unbarriered(IO=file, delimiter=",", headers=true, filename="out/single_store_unbarriered.csv")
+.output push_pop_balance(IO=file, delimiter=",", headers=true, filename="out/push_pop_balance.csv")

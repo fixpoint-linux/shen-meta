@@ -39,6 +39,8 @@ snapshot:
 	souffle gc_safety.dl -F . -D .
 	cp out/root_miss.csv expected/root_miss.csv
 	cp out/memcpy_unbarriered.csv expected/memcpy_unbarriered.csv
+	cp out/single_store_unbarriered.csv expected/single_store_unbarriered.csv
+	cp out/push_pop_balance.csv expected/push_pop_balance.csv
 	@echo "==> expected/ refreshed. Review: git diff expected/"
 
 # ── Self-test (Python stdlib only, no clang/souffle/pytest) ──────────
@@ -49,6 +51,7 @@ selftest:
 	python3 tests/test_phase2.py -v
 	python3 tests/test_phase3.py -v
 	python3 tests/test_phase5.py -v
+	python3 tests/test_phase6.py -v
 
 # ── Clean ────────────────────────────────────────────────────────────
 

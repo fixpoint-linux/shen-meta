@@ -180,6 +180,9 @@ CSV_SCHEMAS = {
     "gc_def":       ["f", "stmt_id", "v"],
     # Phase 5 additions:
     "defining_alloc": ["f", "var", "stmt_id"],
+    # Phase 6 additions:
+    "call_site":    ["f", "stmt_id", "callee"],
+    "array_store":  ["f", "stmt_id", "base_var"],
 }
 
 
@@ -558,6 +561,14 @@ class AstVisitor:
                     self._alloc_defined_var[(func_name, dv_var)] = sid
                     self._defining_var = None
 
+        # Phase 6 (Rule 3): call_site — emitted for ALL resolved callees
+        # (including non-seed indirect callers).  transitive_alloc_site in
+        # gc_safety.dl uses this to catch calls to functions that
+        # transitively allocate but are not themselves a may_collect seed.
+        # Reuses the existing stmt_id (no new ids).
+        if callee:
+            self.writer.write("call_site", [func_name, str(sid), callee])
+
     # ── Phase 2: GC root API detection ────────────────────────────
 
     def _handle_gc_root_api(self, func_name, sid, node, callee):
@@ -792,6 +803,17 @@ class AstVisitor:
                 self.writer.write("gc_def",
                                   [func_name, str(sid), vname])
 
+        # ── Phase 6 (Rule 4): array_store for single-Value writes into a
+        # GC-managed array (ne[i]=v, a->data[i]=v, (*env)[i]=v).  These
+        # need a write barrier mirroring memcpy_unbarriered.
+        if lhs_node.get("kind") == "ArraySubscriptExpr":
+            base = self._extract_base(lhs_node)
+            if base and base in self._gc_locals:
+                base_type = (self._gc_local_types.get(base) or "").replace(" ", "")
+                if base_type in {"Value*", "ValueArray*"}:
+                    self.writer.write("array_store",
+                                      [func_name, str(sid), base])
+
     # ── Variable declarations ─────────────────────────────────────
 
     def _emit_var_decl(self, func_name, node):
@@ -915,6 +937,24 @@ class AstVisitor:
             inner = node.get("inner", [])
             if inner and isinstance(inner[0], dict):
                 return self._extract_base(inner[0])
+        if kind == "ImplicitCastExpr":
+            # Array-subscript bases are often wrapped in a cast
+            # (e.g. `env[env_len]` → ImplicitCastExpr → DeclRefExpr env).
+            inner = node.get("inner", [])
+            for child in inner:
+                if isinstance(child, dict):
+                    b = self._extract_base(child)
+                    if b:
+                        return b
+        if kind == "UnaryOperator":
+            # Phase 6 (Rule 4): unwrap deref (`(*env)[i]` → env).  The
+            # operand of a UnaryOperator is typically inner[0].
+            inner = node.get("inner", [])
+            for child in inner:
+                if isinstance(child, dict):
+                    b = self._extract_base(child)
+                    if b:
+                        return b
         return ""
 
     def _classify_rhs(self, node):

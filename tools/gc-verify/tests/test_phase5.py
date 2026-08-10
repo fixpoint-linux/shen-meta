@@ -837,8 +837,8 @@ class TestPhase5Extraction(unittest.TestCase):
             self.assertTrue(path.exists(),
                             f"Missing CSV: {rel}.csv")
 
-    def test_11_all_14_schemas_in_self_test(self):
-        """All 14 CSV relations have headers produced by --self-test."""
+    def test_11_all_16_schemas_in_self_test(self):
+        """All 16 CSV relations have headers produced by --self-test."""
         rc, stdout, stderr = _run_extract(["--self-test",
                                             "--out-dir", "/tmp/gc-verify-p5-all"])
         self.assertEqual(rc, 0, f"--self-test failed: {stderr}")
@@ -846,8 +846,8 @@ class TestPhase5Extraction(unittest.TestCase):
             path = Path("/tmp/gc-verify-p5-all") / f"{rel}.csv"
             self.assertTrue(path.exists(),
                             f"Missing CSV: {rel}.csv")
-        self.assertEqual(len(extract.CSV_SCHEMAS), 14,
-                         f"Expected 14 schemas (fresh_target dropped), got {len(extract.CSV_SCHEMAS)}")
+        self.assertEqual(len(extract.CSV_SCHEMAS), 16,
+                         f"Expected 16 schemas (fresh_target dropped, +call_site/array_store), got {len(extract.CSV_SCHEMAS)}")
 
     def test_11b_fresh_target_removed(self):
         """fresh_target is NOT in CSV_SCHEMAS and no fresh_target.csv emitted."""

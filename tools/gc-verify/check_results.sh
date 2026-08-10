@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DL="$HERE/gc_safety.dl"
 VM_DIR="$HERE/../../vm"
 EXPECTED="$HERE/expected"
-RELATIONS="root_miss memcpy_unbarriered"
+RELATIONS="root_miss memcpy_unbarriered single_store_unbarriered push_pop_balance"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

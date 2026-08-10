@@ -1,0 +1,4 @@
+f,stmt_id,kind,current_depth
+exec_primitive,477,pop_without_push,0
+vm_exec_env,23,pop_without_push,0
+marshal_to_tagged,35,push_never_popped,1

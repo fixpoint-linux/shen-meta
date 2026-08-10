@@ -66,6 +66,19 @@ run_fixture root_miss_cross_case         no  root_miss            # Fix 3b: case
 run_fixture root_miss_own_defining_alloc no  root_miss            # Fix 3a: defining_alloc suppresses
 run_fixture root_miss_straight_line      yes root_miss            # positive control: still fires
 
+# Phase 6 (Rule 3): interprocedural root_miss fixtures.
+run_fixture root_miss_transitive_alloc  yes root_miss             # indirect allocator, unrooted → fires
+run_fixture root_miss_transitive_rooted no  root_miss             # indirect allocator, rooted → clean
+
+# Phase 6 (Rule 4): single_store_unbarriered fixtures.
+run_fixture single_store_unbarriered yes single_store_unbarriered
+run_fixture single_store_barriered  no  single_store_unbarriered
+
+# Phase 6 (Rule 1): push_pop_balance fixtures.
+run_fixture push_pop_balance_unmatched     yes push_pop_balance   # push never popped → fires
+run_fixture push_pop_balance_pop_no_push   yes push_pop_balance   # pop without push → fires
+run_fixture push_pop_balanced              no  push_pop_balance   # push+pop balanced → clean
+
 if [ "$fail" -eq 0 ]; then
     echo "check_fixtures: ALL PASS"
 else
