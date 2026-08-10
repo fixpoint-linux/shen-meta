@@ -8,7 +8,7 @@
                     write-byte read-byte read-file-as-string open close function?
                     trap-error simple-error error-to-string intern
                     set value eval-kl get-time error? stream?
-                    @p fst snd gensym variable? is-gensym? newvar
+                    @p fst snd gensym variable? newvar
                     c-strlen char-code substring element?]))
 
 (datatype primitive

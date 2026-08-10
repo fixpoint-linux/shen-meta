@@ -91,18 +91,6 @@
   X [H | T] -> true where (= X H)
   X [H | T] -> (element?-h X T))
 
-\* is-gensym?-h: does symbol name start with "shen.gensym_"?  Uses pos
-   (has an interp rule) rather than substring (no interp rule). *\
-(define is-gensym?-h { symbol --> boolean }
-  S -> (is-gensym?-h2 (pos S 0) (pos S 1) (pos S 2) (pos S 3)
-                      (pos S 4) (pos S 5) (pos S 6) (pos S 7)
-                      (pos S 8) (pos S 9) (pos S 10) (pos S 11)))
-(define is-gensym?-h2 { string --> string --> string --> string --> string -->
-                        string --> string --> string --> string --> string -->
-                        string --> string --> boolean }
-  "s" "h" "e" "n" "." "g" "e" "n" "s" "y" "m" "_" -> true
-  _ _ _ _ _ _ _ _ _ _ _ _ -> false)
-
 (define drop-grabs { number --> (list zinc-instruction) --> (list zinc-instruction) }
   N C -> C where (= N 0)
   N [grab | C] -> (drop-grabs (- N 1) C)
@@ -195,9 +183,6 @@
   \* element?: deep_equal list membership (matches C primitive).  Leftmost arg
      (needle) is the accumulator, rightmost (list) is on the stack. *\
   [prim element? | C] X E [L | S] R                            -> (interp C [boolean (element?-h X L)] E S R)
-  \* is-gensym?: prefix check for "shen.gensym_" — unary, arg in accumulator. *\
-  [prim is-gensym? | C] [symbol A] E S R                       -> (interp C [boolean (is-gensym?-h A)] E S R)
-  [prim is-gensym? | C] A E S R                                -> (interp C [boolean false] E S R)
   [prim absvector | C] [number A] E S R                         -> (interp C [absvector (absvector A)] E S R)
   [prim absvector? | C] [absvector _] E S R                     -> (interp C [boolean true] E S R)
   [prim absvector? | C] A E S R                                 -> (interp C [boolean false] E S R)
@@ -382,8 +367,6 @@
 (set-toplevel zinc-arity zinc-arity)
 (set-toplevel count-args count-args)
 (set-toplevel element?-h element?-h)
-(set-toplevel is-gensym?-h is-gensym?-h)
-(set-toplevel is-gensym?-h2 is-gensym?-h2)
 (set-toplevel drop-grabs drop-grabs)
 (set-toplevel interp interp)
 (tc +)

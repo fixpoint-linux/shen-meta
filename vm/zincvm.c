@@ -887,7 +887,7 @@ static int exec_primitive_valid(const char *name) {
         "intern","value","open","close","read-byte","write-byte",
         "c-strlen","char-code","substring",
         "set","get-time","read-file-as-string",
-        "@p","fst","snd","gensym","variable?","is-gensym?","newvar",
+        "@p","fst","snd","gensym","variable?","newvar",
         "shen.fail!","fail",
         "stinput","stoutput",
         /* YACC terminals (yacc.kl) — not C prims but must resolve as symbols */
@@ -1207,7 +1207,7 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         }
         break;
 
-    /* ---- 'i': intern, is-gensym? ---- */
+    /* ---- 'i': intern ---- */
     case 'i':
         if (strcmp(name, "intern") == 0) {
             Value a = va_pop(stack);
@@ -1215,13 +1215,6 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             char buf[256]; int n = a.str.len < 255 ? a.str.len : 255;
             memcpy(buf, a.str.data, n); buf[n] = '\0';
             *acc = val_symbol(buf); return 0;
-        }
-        if (strcmp(name, "is-gensym?") == 0) {
-            Value a = va_pop(stack);
-            if (a.tag != VAL_SYMBOL) { *acc = val_boolean(0); return 0; }
-            const char *s = a.sym.name;
-            /* gensym produces "shen.gensym_N".  Prefix check must match exactly. */
-            *acc = val_boolean(strncmp(s, "shen.gensym_", 12) == 0); return 0;
         }
         break;
 
@@ -2582,7 +2575,7 @@ void init_globals(void) {
         "intern","value","open","close","read-byte","write-byte",
         "c-strlen","char-code","substring",
         "set","get-time","read-file-as-string",
-        "@p","fst","snd","gensym","variable?","is-gensym?","newvar",
+        "@p","fst","snd","gensym","variable?","newvar",
         "shen.fail!","fail",
         "stinput","stoutput", NULL
     };

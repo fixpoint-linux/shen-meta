@@ -4,21 +4,6 @@
 (define newvar { --> symbol }
   -> (gensym (protect V)))
 
-\* is-gensym?: prefix check — true iff the symbol name starts with "shen.gensym_".
-   Defined as a regular Shen function so the host Shen can compile debruijn guards
-   that use it.  The C VM has an equivalent primitive for the metacircular path.
-   pos OOB returns "" which won't match any prefix char, so short symbols pass.
-   ASSUMPTION: the host Shen's `gensym` must produce "shen.gensym_"-prefixed
-   symbols (it does in shen-scheme).  debruijn's fast-path relies on this exact
-   prefix to know which symbols can be scope-bound; a different gensym format
-   would silently break it. *\
-(define is-gensym? { symbol --> boolean }
-  S -> (let Name (str S)
-         (and (= (pos Name 0) "s") (= (pos Name 1) "h") (= (pos Name 2) "e")
-              (= (pos Name 3) "n") (= (pos Name 4) ".") (= (pos Name 5) "g")
-              (= (pos Name 6) "e") (= (pos Name 7) "n") (= (pos Name 8) "s")
-              (= (pos Name 9) "y") (= (pos Name 10) "m") (= (pos Name 11) "_"))))
-
 (define index_h { A --> (list A) --> number --> number }
   X [X | Rest] C -> C
   X [_ | Rest] C -> (index_h X Rest (+ 1 C))
@@ -78,7 +63,7 @@
                     write-byte read-byte read-file-as-string open close function?
                     trap-error simple-error error-to-string intern
                     set value eval-kl get-time error? stream?
-                    @p fst snd gensym variable? is-gensym? newvar
+                    @p fst snd gensym variable? newvar
                     c-strlen char-code substring element?]))
 
 \* Zinc instruction keywords used as list constructors in zinc-c/zinc-t RHS.

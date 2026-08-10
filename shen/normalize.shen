@@ -138,20 +138,10 @@
   Scope [K X]       -> [K (debruijn Scope X)] where (instruction-keyword? K)
   Scope [K | X]     -> [K | (map-debruijn Scope X)] where (instruction-keyword? K)
 
-  \* Fast path: a non-variable, non-gensym symbol head can never be scope-bound
-     (scope holds only gensym let-vars + variable lambda params), so element? is
-     always false -> emit [function X] directly, skip the scope scan.
-     DEPENDS on is-gensym? matching the host gensym's "shen.gensym_" prefix
-     (see util.shen). *\
-  Scope [X Y]        -> [[function X] (debruijn Scope Y)] where (and (symbol? X) (not (variable? X)) (not (is-gensym? X)))
-  Scope [X | Y]      -> [[function X] | (map-debruijn Scope Y)] where (and (symbol? X) (not (variable? X)) (not (is-gensym? X)))
-  \* X is a variable or gensym -> it might be scope-bound -> keep element?. *\
   Scope [X Y]        <- (if (not (element? X Scope)) [[function X] (debruijn Scope Y)] (fail)) where (symbol? X)
   Scope [X | Y]      <- (if (not (element? X Scope)) [[function X] | (map-debruijn Scope Y)] (fail)) where (symbol? X)
   Scope [X Y]        -> [(debruijn Scope X) (debruijn Scope Y)]
   Scope [X | Y]      -> [(debruijn Scope X) | (map-debruijn Scope Y)]
   Scope X            <- (if (element? X Scope) [lookup (idx X Scope)] [symbol X]) where (variable? X)
-  \* Fast path: non-variable, non-gensym bare symbol can never be scope-bound. *\
-  Scope X            -> [symbol X] where (and (not (variable? X)) (symbol? X) (not (is-gensym? X)))
   Scope X            <- (if (and (not (variable? X)) (symbol? X) (not (element? X Scope))) [symbol X] (fail))
   Scope X            -> X)
