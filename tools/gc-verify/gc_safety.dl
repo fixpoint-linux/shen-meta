@@ -7,7 +7,7 @@
 //   Phase 0: schema + may_collect + skeleton rules
 //   Phase 1: full AST extraction, all 10 CSVs, may_collect transitive closure
 //   Phase 2: GC-liveness + must_rooted + root_miss (THIS FILE)
-//   Phase 3: memcpy_unbarriered (future)
+//   Phase 3: memcpy_unbarriered (THIS FILE)
 
 // ── Input fact schemas ────────────────────────────────────────────────
 
@@ -26,7 +26,7 @@
 .decl stmt_pops(f:symbol, stmt_id:number, pop_count:number, pkind:symbol)
 .input stmt_pops(IO=file, delimiter=",", headers=true, filename="facts/stmt_pops.csv")
 
-.decl stmt_memcpy(f:symbol, stmt_id:number, dst_expr:symbol, src_expr:symbol, nbytes:number)
+.decl stmt_memcpy(f:symbol, stmt_id:number, dst_expr:symbol, src_expr:symbol, nbytes:symbol)
 .input stmt_memcpy(IO=file, delimiter=",", headers=true, filename="facts/stmt_memcpy.csv")
 
 .decl stmt_barrier(f:symbol, stmt_id:number, target_expr:symbol)
@@ -176,11 +176,43 @@ root_miss(f, s, v) :-
 
 
 // ═══════════════════════════════════════════════════════════════════════
-// Phase 3 — memcpy_unbarriered (vacuous skeleton, remains for Phase 3)
+// STRATUM 5a — reach_stmt (positive transitive closure over next_stmt)
 // ═══════════════════════════════════════════════════════════════════════
 
+.decl reach_stmt(f:symbol, from:number, to:number)
+reach_stmt(f, a, b) :- next_stmt(f, a, b).
+reach_stmt(f, a, c) :- reach_stmt(f, a, b), next_stmt(f, b, c).
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATUM 5b — barrier_covers_alloc (depends on reach_stmt)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// A memcpy dst is covered by a barrier iff the barrier comes after the
+// memcpy and before the next may-collect allocation.
+
+.decl barrier_covers_alloc(f:symbol, s_memcpy:number, dst:symbol, s_alloc:number)
+barrier_covers_alloc(f, s_memcpy, dst, s_alloc) :-
+    stmt_memcpy(f, s_memcpy, dst, _, _),
+    stmt_barrier(f, s_barrier, dst),
+    stmt_allocs(f, s_alloc, _),
+    reach_stmt(f, s_memcpy, s_barrier),
+    reach_stmt(f, s_barrier, s_alloc).
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATUM 5c — memcpy_unbarriered (negates barrier_covers_alloc)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// A memcpy is unbarriered when a may-collect allocation follows it and
+// no barrier covers that dst-allocation pair.
+
 .decl memcpy_unbarriered(f:symbol, stmt_id:number, dst_expr:symbol)
-memcpy_unbarriered(f, stmt_id, "") :- stmt_memcpy(f, stmt_id, _, _, _), false.
+memcpy_unbarriered(f, s_memcpy, dst) :-
+    stmt_memcpy(f, s_memcpy, dst, _, _),
+    stmt_allocs(f, s_alloc, _),
+    reach_stmt(f, s_memcpy, s_alloc),
+    !barrier_covers_alloc(f, s_memcpy, dst, s_alloc).
 
 
 // ── Output relations ───────────────────────────────────────────────────

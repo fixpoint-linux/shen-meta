@@ -17,7 +17,7 @@ Phase 2 (2026-08-11): GC-liveness + must_rooted + root_miss.  Added
 next_stmt intra-BB edges, gc_use/gc_def extraction, real stmt_pushes/
 stmt_pops from gc_root_push_*/gc_root_pop_* CallExprs.
 
-Phase 3: memcpy_unbarriered — future work.
+Phase 3: memcpy_unbarriered — THIS FILE.
 """
 
 import argparse
@@ -52,6 +52,10 @@ MAY_COLLECT_SEEDS = {
     "gc_alloc", "gc_alloc_oldgen", "gc_alloc_atomic",
     "collect", "collect_nursery", "gcalloc_internal",
 }
+
+# Phase 3: function names for memcpy/barrier detection.
+MEMCPY_FN = "memcpy"
+BARRIER_FN = "gc_dirty_vectors_add"
 
 # GC root API function name prefixes (for stmt_pushes/stmt_pops extraction).
 GC_ROOT_PUSH_PREFIXES = (
@@ -437,6 +441,14 @@ class AstVisitor:
         if not callee:
             return
 
+        # Phase 3: detect memcpy / gc_dirty_vectors_add calls.
+        if callee == MEMCPY_FN:
+            self._handle_memcpy_call(func_name, sid, node)
+            return
+        if callee == BARRIER_FN:
+            self._handle_barrier_call(func_name, sid, node)
+            return
+
         # Phase 2: detect gc_root_push_* / gc_root_pop_* calls.
         if self._handle_gc_root_api(func_name, sid, node, callee):
             return  # API call handled; don't emit call_graph/stmt_allocs for it.
@@ -486,6 +498,37 @@ class AstVisitor:
 
         return False
 
+    # ── Phase 3: memcpy / barrier extraction ──────────────────────
+
+    def _handle_memcpy_call(self, func_name, sid, node):
+        """Extract stmt_memcpy fact from a memcpy(dst, src, nbytes) call.
+
+        Only emits a fact if dst is a GC-managed local (via _gc_locals).
+        """
+        args = self._call_args(node)
+        if len(args) < 3:
+            return
+        dst_var = self._extract_var_from_arg(args[0])
+        if not dst_var or dst_var not in self._gc_locals:
+            return
+        src_var = self._extract_var_from_arg(args[1])
+        nbytes_text = self._extract_literal_or_text(args[2])
+        self.writer.write("stmt_memcpy",
+                          [func_name, str(sid), dst_var, src_var, nbytes_text])
+
+    def _handle_barrier_call(self, func_name, sid, node):
+        """Extract stmt_barrier fact from a gc_dirty_vectors_add(target) call."""
+        args = self._call_args(node)
+        if not args:
+            return
+        target_var = self._extract_var_from_arg(args[0])
+        if not target_var:
+            target_var = self._extract_base(args[0])
+        if not target_var:
+            return
+        self.writer.write("stmt_barrier",
+                          [func_name, str(sid), target_var])
+
     def _extract_push_slot(self, node, callee):
         """Extract the slot variable name from a gc_root_push_* CallExpr.
 
@@ -526,7 +569,7 @@ class AstVisitor:
     def _extract_var_from_arg(self, node):
         """Extract variable name from an argument expression.
 
-        Handles: DeclRefExpr → name, UnaryOperator & → inner DeclRefExpr,
+        Handles: DeclRefExpr → name, UnaryOperator &/* → inner DeclRefExpr,
         ImplicitCastExpr → inner, CStyleCastExpr → inner.
         """
         if not isinstance(node, dict):
@@ -535,7 +578,7 @@ class AstVisitor:
         if kind == "DeclRefExpr":
             return node.get("referencedDecl", {}).get("name", "")
         if kind == "UnaryOperator":
-            # &v → recurse into operand
+            # &v and *v both resolve to v (address-of and dereference).
             for child in node.get("inner", []):
                 name = self._extract_var_from_arg(child)
                 if name:
@@ -545,6 +588,44 @@ class AstVisitor:
                 name = self._extract_var_from_arg(child)
                 if name:
                     return name
+        return ""
+
+    # ── Phase 3 helpers ───────────────────────────────────────────
+
+    def _call_args(self, node):
+        """Return list of CallExpr argument nodes (skip callee ref).
+
+        The callee is the first DeclRefExpr/UnresolvedLookupExpr/MemberExpr
+        (possibly wrapped in ImplicitCastExpr).  Everything after that is an
+        argument.
+        """
+        inner = node.get("inner", [])
+        # Collect argument nodes: skip the callee reference (first
+        # ImplicitCastExpr/DeclRefExpr/UnresolvedLookupExpr/MemberExpr).
+        args = []
+        found_callee = False
+        for child in inner:
+            if not isinstance(child, dict):
+                continue
+            ck = child.get("kind", "")
+            if not found_callee:
+                if ck in ("ImplicitCastExpr", "DeclRefExpr",
+                           "UnresolvedLookupExpr", "MemberExpr"):
+                    found_callee = True
+                continue
+            args.append(child)
+        return args
+
+    def _extract_literal_or_text(self, node):
+        """Return text representation of a literal node.
+
+        IntegerLiteral → decimal string; otherwise empty string.
+        """
+        if not isinstance(node, dict):
+            return ""
+        kind = node.get("kind", "")
+        if kind == "IntegerLiteral":
+            return node.get("value", "")
         return ""
 
     def _extract_callee(self, node):
@@ -936,6 +1017,63 @@ SELF_TEST_AST = {
                                 },
                             ],
                         },
+                        # ── memcpy(p, env, 16) → stmt_memcpy (Phase 3) ──
+                        # dst 'p' is a GC-managed void* (RETURNS_GC_POINTER),
+                        # src 'env' is GC-managed Value*.
+                        {
+                            "kind": "CallExpr",
+                            "inner": [
+                                {
+                                    "kind": "ImplicitCastExpr",
+                                    "inner": [
+                                        {
+                                            "kind": "DeclRefExpr",
+                                            "referencedDecl": {
+                                                "name": "memcpy",
+                                            },
+                                        }
+                                    ],
+                                },
+                                {
+                                    "kind": "ImplicitCastExpr",
+                                    "inner": [
+                                        {
+                                            "kind": "DeclRefExpr",
+                                            "referencedDecl": {"name": "p"},
+                                        }
+                                    ],
+                                },
+                                {
+                                    "kind": "DeclRefExpr",
+                                    "referencedDecl": {"name": "env"},
+                                },
+                                {
+                                    "kind": "IntegerLiteral",
+                                    "value": "16",
+                                },
+                            ],
+                        },
+                        # ── gc_dirty_vectors_add(p) → stmt_barrier (Phase 3) ──
+                        {
+                            "kind": "CallExpr",
+                            "inner": [
+                                {
+                                    "kind": "ImplicitCastExpr",
+                                    "inner": [
+                                        {
+                                            "kind": "DeclRefExpr",
+                                            "referencedDecl": {
+                                                "name": "gc_dirty_vectors_add",
+                                            },
+                                        }
+                                    ],
+                                },
+                                {
+                                    "kind": "DeclRefExpr",
+                                    "referencedDecl": {"name": "p"},
+                                },
+                            ],
+                        },
                         # ── v.lambda.env = GC_VALUE_ARRAY(...) ──
                         # GC field 'env' → field_assign emitted;
                         # 'v' is base of MemberExpr → gc_use of v
@@ -1074,20 +1212,15 @@ SELF_TEST_AST = {
 def run_self_test(writer):
     """Emit facts from the hardcoded SELF_TEST_AST dict.
 
-    Phase 2: all facts are now produced by real extraction from the AST.
-    Skeleton rows for cfg_edge/stmt_memcpy/stmt_barrier are kept for the
-    remaining Phase 3 relations that are not yet extracted.
+    Phase 3: stmt_memcpy and stmt_barrier are now extracted from real
+    CallExpr nodes in the self-test AST.
     """
     visitor = AstVisitor(writer)
     visitor.visit(SELF_TEST_AST)
 
-    # ── Skeleton rows for Phase 3 relations (not yet extracted) ─────
+    # ── Skeleton rows ──────────────────────────────────────────────
     # cfg_edge: still skeleton (Phase 2 uses next_stmt instead).
     writer.write("cfg_edge",    ["val_lambda", "0", "1", "fall"])
-    # stmt_memcpy + stmt_barrier: Phase 3.
-    writer.write("stmt_memcpy", ["val_lambda", "99", "v.lambda.env", "env",
-                                  "env_len * sizeof(Value)"])
-    writer.write("stmt_barrier", ["val_lambda", "99", "v.lambda.env"])
 
 
 # ── CLI ──────────────────────────────────────────────────────────────

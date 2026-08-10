@@ -30,6 +30,7 @@ run:
 selftest:
 	python3 tests/test_phase0.py -v
 	python3 tests/test_phase1.py -v
+	python3 tests/test_phase3.py -v
 
 # ── Clean ────────────────────────────────────────────────────────────
 

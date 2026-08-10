@@ -278,7 +278,7 @@ class TestPhase0(unittest.TestCase):
                 f"root_miss rule should reference '{required}'"
             )
 
-        # memcpy_unbarriered: still vacuous skeleton (Phase 3).
+        # Phase 3: memcpy_unbarriered — now a real rule (was skeleton).
         self.assertIn(
             "memcpy_unbarriered",
             dl_text,
@@ -289,11 +289,20 @@ class TestPhase0(unittest.TestCase):
             len(mcpy_text), 0,
             "No memcpy_unbarriered rule found"
         )
-        self.assertIn(
+        # Phase 3 rule is now real — must NOT use 'false'.
+        self.assertNotIn(
             "false",
             mcpy_text,
-            "memcpy_unbarriered skeleton rule should use 'false' body"
+            "memcpy_unbarriered rule should be a real Phase 3 rule, not use 'false'"
         )
+        # Verify the real rule references the required relations.
+        for required in ("stmt_memcpy", "stmt_allocs", "reach_stmt",
+                         "barrier_covers_alloc"):
+            self.assertIn(
+                required,
+                mcpy_text,
+                f"memcpy_unbarriered rule should reference '{required}'"
+            )
 
     # ── Test 10: Phase comments present ──────────────────────────────
 

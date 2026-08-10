@@ -1,6 +1,39 @@
 # GC-Safety Verifier (Soufflé Datalog)
 
-Status: **DESIGN + Phases 0-2 DONE** (committed 876e7f6, 365c50f, + Phase 2). Phase 3 (memcpy) + Phase 5 (calibration) pending. Not part of any build gate.
+Status: **DESIGN + Phases 0-3 DONE** (committed 876e7f6, 365c50f, + Phase 2, + Phase 3). Phase 4 (make gc-verify integration) + Phase 5 (calibration) pending. Not part of any build gate.
+
+## Phase 3 status (memcpy_unbarriered)
+
+Implemented and validated end-to-end (clang 22.1.8 + souffle 2.5). The
+previously-vacuous `memcpy_unbarriered` skeleton is now three strata:
+`reach_stmt` (positive TC over `next_stmt`) → `barrier_covers_alloc`
+(positive) → `memcpy_unbarriered` (negates it). The extractor emits real
+`stmt_memcpy`/`stmt_barrier` rows (intercepting `memcpy` and
+`gc_dirty_vectors_add` calls before the generic call_graph path), filtering
+memcpys whose dst is NOT a GC-managed local at extraction time. `nbytes` is
+now a symbol (was `number` — the self-test skeleton wrote
+`"env_len * sizeof(Value)"`, which would break Soufflé number parsing).
+
+- **Regression fixtures pass** (now 6 total via `check_fixtures.sh`):
+  `memcpy_unbarriered.c` fires (1), `memcpy_barriered.c` clean (0),
+  `memcpy_charbuf.c` clean (0). The three Phase-2 root_miss fixtures still
+  pass. All 52 Python unit tests pass (10 phase0 + 13 phase1 + 14 phase2 +
+  15 phase3).
+- **Real VM is clean where it should be:** all 17 historical barrier sites
+  (commit 6a660f1) are NOT flagged. `out/memcpy_unbarriered.csv` on current
+  `vm/zincvm.c` contains exactly 2 candidates, both **confirmed false
+  positives** (correct code):
+  1. `main:56 env_init` — freshly-allocated young-gen array (no old-gen
+     write barrier needed). The deferred "fresh target" pruning (Phase 5)
+     will suppress this.
+  2. `parse_body:50 code` — `GC_TYPE_INSTR_ARRAY` (an Instr array, not a
+     Value array); it does not need the Value write barrier. Fix: the
+     extractor's `_is_gc_managed_type` should not treat `Instr*`/`Instr**`
+     as barrier-relevant (it is GC-managed for root-miss liveness but not
+     for write barriers). Calibration item.
+
+These are exactly the over-flag categories the design predicted; both become
+Phase 5 `definite_assigned`/type-table calibration entries.
 
 ## Phase 2 status (make-or-break)
 
@@ -63,7 +96,7 @@ cfg_edge.csv       (f, from_stmt_id, to_stmt_id, kind)   # fall|true_br|false_br
 stmt_allocs.csv    (f, stmt_id, callee)                  # call into may-collect set
 stmt_pushes.csv    (f, stmt_id, root_kind, slot_expr)    # ROOT_PTR/VALUE/VALUE_ARRAY/VOLATILE/CALLFRAME
 stmt_pops.csv      (f, stmt_id, count, pkind)            # pop_one|pop_to
-stmt_memcpy.csv    (f, stmt_id, dst_expr, src_expr, nbytes)
+stmt_memcpy.csv    (f, stmt_id, dst_expr, src_expr, nbytes:symbol)
 stmt_barrier.csv   (f, stmt_id, target_expr)             # arg of gc_dirty_vectors_add
 var_decl.csv       (f, name, type, is_gc_managed)
 field_assign.csv   (f, stmt_id, base, field_path, rhs_kind)  # e.g. v.lambda.code = code;
@@ -122,7 +155,7 @@ fixed bug. The tool must **fire on the buggy fixtures** and **be clean on curren
 | 0 | Scaffold: `tools/gc-verify/` skeleton, `extract.py` walks one fn (`val_lambda`), Soufflé loads empty `.dl` | 0.5 d | CSVs round-trip |
 | 1 | Full AST walk of `vm/zincvm.c` + `vm/gc.c`; emit all CSVs; hand-verify call graph; compute `may_collect` | 1-2 d | spot-check 5 fns |
 | 2 | **Make-or-break.** GC-liveness + `must_rooted` + `root_miss`. Fire on fixtures, clean on current code | 2-3 d | all 9 blockers reproduced, no false positives on real code |
-| 3 | `memcpy_unbarriered` rule | 1 d | 17 barrier fixtures |
+| 3 | `memcpy_unbarriered` rule | 1 d | 3 barrier fixtures ✓ |
 | 4 | `make gc-verify` + `check_results.sh` + AGENTS.md note | 0.5 d | end-to-end clean |
 | 5 | CI non-gating; calibrate false positives into `definite_assigned` | ongoing | — |
 

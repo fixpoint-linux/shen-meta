@@ -1,9 +1,9 @@
 #!/bin/bash
 # check_fixtures.sh — regression-gate: run each fixture through the real
-# clang → extract.py → souffle pipeline and assert the root_miss outcome.
+# clang → extract.py → souffle pipeline and assert the outcome.
 #
-# Positive fixtures (BUGGY code) MUST produce ≥1 root_miss.
-# Negative fixtures (CORRECTLY ROOTED code) MUST produce 0 root_miss.
+# Positive fixtures (BUGGY code) MUST produce ≥1 row in the target relation.
+# Negative fixtures (CORRECT code) MUST produce 0 rows.
 #
 # Requires: clang >= 14, souffle on PATH. Run from tools/gc-verify/.
 set -u
@@ -15,9 +15,10 @@ trap 'rm -rf "$WORK"' EXIT
 
 fail=0
 
-# run_fixture <name> <expect_positive: yes|no>
+# run_fixture <name> <expect_positive: yes|no> [rel: root_miss|memcpy_unbarriered]
 run_fixture() {
     local name="$1" expect="$2"
+    local rel="${3:-root_miss}"
     local fx="$FX_DIR/$name.c"
     local dir="$WORK/$name"
     mkdir -p "$dir/out"
@@ -31,20 +32,20 @@ run_fixture() {
     fi
     (cd "$dir" && souffle "$DL" -F . -D . >/dev/null 2>&1)
     local n=0
-    if [ -f "$dir/out/root_miss.csv" ]; then
-        n="$(tail -n +2 "$dir/out/root_miss.csv" | wc -l)"
+    if [ -f "$dir/out/${rel}.csv" ]; then
+        n="$(tail -n +2 "$dir/out/${rel}.csv" | wc -l)"
     fi
     if [ "$expect" = "yes" ]; then
         if [ "$n" -ge 1 ]; then
-            echo "OK   $name: fires ($n root_miss) [expected]"
+            echo "OK   $name: fires ($n $rel) [expected]"
         else
-            echo "FAIL $name: expected ≥1 root_miss, got 0"; fail=1
+            echo "FAIL $name: expected ≥1 $rel, got 0"; fail=1
         fi
     else
         if [ "$n" -eq 0 ]; then
-            echo "OK   $name: clean (0 root_miss) [expected]"
+            echo "OK   $name: clean (0 $rel) [expected]"
         else
-            echo "FAIL $name: expected 0 root_miss, got $n"; fail=1
+            echo "FAIL $name: expected 0 $rel, got $n"; fail=1
         fi
     fi
 }
@@ -52,6 +53,11 @@ run_fixture() {
 run_fixture val_lambda_env yes
 run_fixture trap_error_hc  yes
 run_fixture rooted_ok     no
+
+# Phase 3: memcpy_unbarriered fixtures.
+run_fixture memcpy_unbarriered yes memcpy_unbarriered
+run_fixture memcpy_barriered  no  memcpy_unbarriered
+run_fixture memcpy_charbuf    no  memcpy_unbarriered
 
 if [ "$fail" -eq 0 ]; then
     echo "check_fixtures: ALL PASS"
