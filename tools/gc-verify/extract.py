@@ -13,8 +13,11 @@ Phase 1 (2026-08-10): Full AST walk, all 10 CSVs, call_graph dedup,
 stmt_allocs from real extraction, field_assign with GC-managed filtering,
 void* heuristic for returns_gc_pointer.
 
-Phases 2-3: cfg_edge/stmt_pushes/stmt_pops/stmt_memcpy/stmt_barrier still
-skeleton — real extraction is future work.
+Phase 2 (2026-08-11): GC-liveness + must_rooted + root_miss.  Added
+next_stmt intra-BB edges, gc_use/gc_def extraction, real stmt_pushes/
+stmt_pops from gc_root_push_*/gc_root_pop_* CallExprs.
+
+Phase 3: memcpy_unbarriered — future work.
 """
 
 import argparse
@@ -48,6 +51,28 @@ RETURNS_GC_POINTER = {
 MAY_COLLECT_SEEDS = {
     "gc_alloc", "gc_alloc_oldgen", "gc_alloc_atomic",
     "collect", "collect_nursery", "gcalloc_internal",
+}
+
+# GC root API function name prefixes (for stmt_pushes/stmt_pops extraction).
+GC_ROOT_PUSH_PREFIXES = (
+    "gc_root_push_value",
+    "gc_root_push_ptr",
+    "gc_root_push_value_volatile",
+    "gc_root_push_value_array",
+    "gc_root_push_callframe_array",
+)
+GC_ROOT_POP_PREFIXES = (
+    "gc_root_pop",
+    "gc_root_pop_to",
+)
+
+# Map gc_root_push_* callee names to root_kind values.
+PUSH_KIND_MAP = {
+    "gc_root_push_value":           "ROOT_VALUE",
+    "gc_root_push_value_volatile":  "ROOT_VOLATILE",
+    "gc_root_push_ptr":             "ROOT_PTR",
+    "gc_root_push_value_array":     "ROOT_VALUE_ARRAY",
+    "gc_root_push_callframe_array": "ROOT_CALLFRAME_ARRAY",
 }
 
 
@@ -136,11 +161,15 @@ CSV_SCHEMAS = {
     "var_decl":     ["f", "name", "type", "is_gc_managed"],
     "field_assign": ["f", "stmt_id", "base", "field_path", "rhs_kind"],
     "call_graph":   ["caller", "callee"],
+    # Phase 2 additions:
+    "next_stmt":    ["f", "from", "to"],
+    "gc_use":       ["f", "stmt_id", "v"],
+    "gc_def":       ["f", "stmt_id", "v"],
 }
 
 
 class FactWriter:
-    """Manages output CSV files for all 10 fact relations.
+    """Manages output CSV files for all fact relations.
 
     Rows are buffered in memory (per relation) so that multiple translation
     units can be visited into the same writer before anything is written to
@@ -183,13 +212,17 @@ class AstVisitor:
     --------------
     stmt_id is a per-function integer counter, assigned sequentially in
     depth-first AST walk order.  Only "interesting" nodes consume an id:
-      - CallExpr          → used in stmt_allocs
-      - BinaryOperator =  → used in field_assign
+      - CallExpr          → used in stmt_allocs, stmt_pushes/pops, gc_use
+      - BinaryOperator =  → used in field_assign, gc_def, gc_use
 
     DeclStmt, VarDecl, ParmVarDecl, and all other nodes do NOT consume
     stmt_ids.  This keeps ids dense and stable — the same source code
     always produces the same ids regardless of how many non-interesting
     nodes exist between interesting ones.
+
+    Phase 2 addition: _current_sid is threaded through the walk so that
+    DeclRefExpr and MemberExpr nodes inside a statement can emit gc_use
+    facts with the enclosing statement's id.
 
     Function filtering
     ------------------
@@ -202,12 +235,14 @@ class AstVisitor:
         self.writer = writer
         self._current_function = None
         self._stmt_counter = 0
-        self._gc_locals = set()          # names of GC-managed locals in current fn
-        self._call_graph_edges = set()   # (caller, callee) for dedup
+        self._stmt_ids = []            # Phase 2: ordered stmt_ids for next_stmt
+        self._gc_locals = set()        # names of GC-managed locals in current fn
+        self._call_graph_edges = set() # (caller, callee) for dedup
 
     def _next_stmt_id(self):
         sid = self._stmt_counter
         self._stmt_counter += 1
+        self._stmt_ids.append(sid)
         return sid
 
     # ── Top-level walk ────────────────────────────────────────────
@@ -263,6 +298,7 @@ class AstVisitor:
         # ── Initialise per-function state ──
         self._current_function = name
         self._stmt_counter = 0
+        self._stmt_ids = []
         self._gc_locals = set()
         self._call_graph_edges = set()
 
@@ -276,47 +312,92 @@ class AstVisitor:
         # Full recursive walk of the function body.
         self._walk_body(name, body)
 
+        # ── Phase 2: emit next_stmt intra-BB edges ──
+        # Connect consecutive stmt_ids in the order they were assigned
+        # (depth-first AST walk ≈ source order for straight-line code).
+        for i in range(len(self._stmt_ids) - 1):
+            self.writer.write("next_stmt",
+                              [name, str(self._stmt_ids[i]),
+                               str(self._stmt_ids[i + 1])])
+
         # Reset per-function state.
         self._current_function = None
         self._gc_locals = set()
 
-    # ── Full body walk (Phase 1) ──────────────────────────────────
+    # ── Full body walk (Phase 2) ──────────────────────────────────
 
-    def _walk_body(self, func_name, node):
+    def _walk_body(self, func_name, node, current_sid=None):
         """Full recursive walk of a function body node and its descendants.
 
         Assigns stmt_ids to CallExpr and BinaryOperator (=) nodes.
-        Extracts var_decl, call_graph, stmt_allocs, and field_assign facts.
+        Extracts var_decl, call_graph, stmt_allocs, stmt_pushes, stmt_pops,
+        field_assign, gc_use, and gc_def facts.
+
+        Phase 2: current_sid threads the enclosing statement's id through
+        child nodes so DeclRefExpr/MemberExpr can emit gc_use.
         """
         if not isinstance(node, dict):
             return
 
         kind = node.get("kind", "")
 
-        # ── CallExpr → call_graph + stmt_allocs ──
+        # ── CallExpr → call_graph + stmt_allocs + stmt_pushes/pops ──
         if kind == "CallExpr":
             sid = self._next_stmt_id()
             self._handle_call_expr(func_name, sid, node)
+            # Recurse into children with this sid for gc_use tracking.
+            for child in node.get("inner", []):
+                self._walk_body(func_name, child, current_sid=sid)
+            return
 
-        # ── VarDecl → var_decl (handles DeclStmt children, ForStmt
-        # initializers, and bare VarDecl in CompoundStmt uniformly)
+        # ── VarDecl → var_decl + (if initialized) gc_def ──
         elif kind == "VarDecl":
             self._emit_var_decl(func_name, node)
+            # A VarDecl with an initializer DEFINES the variable here, so
+            # liveness must be killed at this point (not propagated backward
+            # across an earlier alloc).  Without this, a var used later
+            # appears spuriously live before its definition → false
+            # root_miss.  Emit gc_def for the declared var, then recurse
+            # into the initializer to catch gc_use of OTHER vars it reads.
+            if node.get("init") and self._gc_locals:
+                vname = node.get("name", "")
+                if vname and vname in self._gc_locals:
+                    sid = self._next_stmt_id()
+                    self.writer.write("gc_def",
+                                      [func_name, str(sid), vname])
+                    self._walk_body(func_name, node["init"], current_sid=sid)
 
-        # ── BinaryOperator = → field_assign ──
+        # ── BinaryOperator = → field_assign + gc_def ──
         elif kind == "BinaryOperator":
             opcode = node.get("opcode", "")
             if opcode == "=":
                 sid = self._next_stmt_id()
-                self._handle_field_assign(func_name, sid, node)
+                self._handle_assignment(func_name, sid, node)
+                # Recurse with this sid for gc_use in RHS.
+                for child in node.get("inner", []):
+                    self._walk_body(func_name, child, current_sid=sid)
+                return
+
+        # ── DeclRefExpr → gc_use (if inside a statement) ──
+        elif kind == "DeclRefExpr":
+            if current_sid is not None:
+                vname = node.get("referencedDecl", {}).get("name", "")
+                if vname and vname in self._gc_locals:
+                    self.writer.write("gc_use",
+                                      [func_name, str(current_sid), vname])
+
+        # ── MemberExpr → gc_use for base (if inside a statement) ──
+        elif kind == "MemberExpr":
+            if current_sid is not None:
+                base = self._extract_base(node)
+                if base and base in self._gc_locals:
+                    self.writer.write("gc_use",
+                                      [func_name, str(current_sid), base])
 
         # ── Expression nodes that contain calls: recurse ──
-        # (ImplicitCastExpr, CStyleCastExpr, ParenExpr, UnaryOperator,
-        #  ConditionalOperator, ArraySubscriptExpr, CompoundAssignOperator, …)
         elif kind in ("ImplicitCastExpr", "CStyleCastExpr", "ParenExpr",
                        "UnaryOperator", "ConditionalOperator",
                        "ArraySubscriptExpr", "CompoundAssignOperator",
-                       "MemberExpr", "DeclRefExpr",
                        "IntegerLiteral", "StringLiteral", "CharacterLiteral",
                        "FloatingLiteral", "CXXBoolLiteralExpr",
                        "InitListExpr", "ImplicitValueInitExpr",
@@ -333,7 +414,6 @@ class AstVisitor:
             pass  # expressions — just recurse into children
 
         # ── Statement nodes (control flow, labels, etc.) ──
-        # Phase 2 will assign stmt_ids and emit cfg_edge for these.
         elif kind in ("IfStmt", "WhileStmt", "ForStmt", "DoStmt",
                        "SwitchStmt", "CaseStmt", "DefaultStmt",
                        "ReturnStmt", "LabelStmt", "GotoStmt",
@@ -342,19 +422,24 @@ class AstVisitor:
                        "AttributedStmt"):
             pass  # recurse only
 
-        # Recurse into children for ALL node kinds (including the ones
-        # we handled above — eg a CallExpr's arguments may contain nested
-        # CallExprs that also need stmt_ids).
+        # Recurse into children for ALL remaining node kinds.
+        # For nodes that return early (CallExpr, BinaryOperator =), this
+        # is not reached.
         for child in node.get("inner", []):
-            self._walk_body(func_name, child)
+            self._walk_body(func_name, child, current_sid=current_sid)
 
     # ── Call expression handling ──────────────────────────────────
 
     def _handle_call_expr(self, func_name, sid, node):
-        """Emit call_graph and (if allocator) stmt_allocs for a CallExpr."""
+        """Emit call_graph, stmt_allocs (if allocator), and stmt_pushes/pops
+        (for gc_root_* API calls)."""
         callee = self._extract_callee(node)
         if not callee:
             return
+
+        # Phase 2: detect gc_root_push_* / gc_root_pop_* calls.
+        if self._handle_gc_root_api(func_name, sid, node, callee):
+            return  # API call handled; don't emit call_graph/stmt_allocs for it.
 
         # Dedup call_graph edges.
         edge = (func_name, callee)
@@ -367,6 +452,100 @@ class AstVisitor:
         # by Soufflé.
         if callee in MAY_COLLECT_SEEDS:
             self.writer.write("stmt_allocs", [func_name, str(sid), callee])
+
+    # ── Phase 2: GC root API detection ────────────────────────────
+
+    def _handle_gc_root_api(self, func_name, sid, node, callee):
+        """Detect gc_root_push_* / gc_root_pop_* calls and emit stmt_pushes/pops.
+
+        Returns True if the call was recognized as a GC root API call
+        (and was handled), False otherwise.
+        """
+        # ── gc_root_push_* ──
+        if callee in PUSH_KIND_MAP:
+            root_kind = PUSH_KIND_MAP[callee]
+            slot_expr = self._extract_push_slot(node, callee)
+            if slot_expr:
+                self.writer.write("stmt_pushes",
+                                  [func_name, str(sid), root_kind, slot_expr])
+            return True
+
+        # ── gc_root_pop (no args) → pop_one ──
+        if callee == "gc_root_pop":
+            # gc_root_pop() takes no arguments; count = 1
+            self.writer.write("stmt_pops",
+                              [func_name, str(sid), "1", "pop_one"])
+            return True
+
+        # ── gc_root_pop_to(watermark) → pop_to ──
+        if callee == "gc_root_pop_to":
+            # Count is irrelevant for pop_to; use 0.
+            self.writer.write("stmt_pops",
+                              [func_name, str(sid), "0", "pop_to"])
+            return True
+
+        return False
+
+    def _extract_push_slot(self, node, callee):
+        """Extract the slot variable name from a gc_root_push_* CallExpr.
+
+        gc_root_push_value(&v)        → "v"
+        gc_root_push_ptr((void **)&p) → "p"
+        gc_root_push_value_array(arr, &n) → "arr"
+        gc_root_push_callframe_array(cf, &n) → "cf"
+
+        Returns the first argument's variable name (stripping & and casts),
+        or empty string if unresolvable.
+        """
+        inner = node.get("inner", [])
+        # Skip past ImplicitCastExpr to find the first real argument.
+        for child in inner:
+            if not isinstance(child, dict):
+                continue
+            # Skip the callee DeclRefExpr/ImplicitCastExpr (first child
+            # is usually the function pointer).  The second child is arg 0.
+            pass
+
+        # Find the first argument expression (skip the callee ref).
+        # The callee is the first DeclRefExpr (possibly wrapped in
+        # ImplicitCastExpr).  Arguments follow.
+        found_callee = False
+        for child in inner:
+            if not isinstance(child, dict):
+                continue
+            ck = child.get("kind", "")
+            if not found_callee:
+                if ck in ("ImplicitCastExpr", "DeclRefExpr"):
+                    found_callee = True
+                continue
+            # This is the first argument.
+            return self._extract_var_from_arg(child)
+
+        return ""
+
+    def _extract_var_from_arg(self, node):
+        """Extract variable name from an argument expression.
+
+        Handles: DeclRefExpr → name, UnaryOperator & → inner DeclRefExpr,
+        ImplicitCastExpr → inner, CStyleCastExpr → inner.
+        """
+        if not isinstance(node, dict):
+            return ""
+        kind = node.get("kind", "")
+        if kind == "DeclRefExpr":
+            return node.get("referencedDecl", {}).get("name", "")
+        if kind == "UnaryOperator":
+            # &v → recurse into operand
+            for child in node.get("inner", []):
+                name = self._extract_var_from_arg(child)
+                if name:
+                    return name
+        if kind in ("ImplicitCastExpr", "CStyleCastExpr", "ParenExpr"):
+            for child in node.get("inner", []):
+                name = self._extract_var_from_arg(child)
+                if name:
+                    return name
+        return ""
 
     def _extract_callee(self, node):
         """Extract the callee function name from a CallExpr or ImplicitCastExpr.
@@ -391,12 +570,52 @@ class AstVisitor:
                 return child.get("name", "")
         return ""
 
+    # ── Assignment handling (Phase 2: adds gc_def) ────────────────
+
+    def _handle_assignment(self, func_name, sid, node):
+        """Handle BinaryOperator '=': field_assign (Phase 1) + gc_def (Phase 2)."""
+        inner = node.get("inner", [])
+        if len(inner) < 2:
+            return
+
+        lhs_node = inner[0]
+        rhs_node = inner[1]
+
+        if not isinstance(lhs_node, dict):
+            return
+
+        # ── Phase 1: field_assign ──
+        field_path = self._extract_field_path(lhs_node)
+        base = self._extract_base(lhs_node)
+        rhs_kind = self._classify_rhs(rhs_node)
+
+        if base and field_path:
+            # Filter 1: base must be a GC-managed local.
+            if base in self._gc_locals:
+                # Filter 2: leaf member must be a GC-managed field.
+                leaf_member = (field_path.rsplit(".", 1)[-1]
+                               if "." in field_path
+                               else field_path.lstrip("."))
+                if leaf_member in GC_MANAGED_FIELD_NAMES:
+                    self.writer.write("field_assign", [
+                        func_name, str(sid), base, field_path, rhs_kind
+                    ])
+
+        # ── Phase 2: gc_def for direct assignment to GC-managed var ──
+        # v = expr  (where LHS is a DeclRefExpr to a GC-managed var)
+        if lhs_node.get("kind") == "DeclRefExpr":
+            vname = lhs_node.get("referencedDecl", {}).get("name", "")
+            if vname and vname in self._gc_locals:
+                self.writer.write("gc_def",
+                                  [func_name, str(sid), vname])
+
     # ── Variable declarations ─────────────────────────────────────
 
     def _emit_var_decl(self, func_name, node):
         """Emit a var_decl fact for a ParmVarDecl or VarDecl.
 
-        Also populates self._gc_locals for use by field_assign filtering.
+        Also populates self._gc_locals for use by field_assign filtering
+        and gc_use/gc_def extraction.
         """
         vname = node.get("name", "")
         if not vname:
@@ -441,48 +660,7 @@ class AstVisitor:
                         return self._extract_callee(gc)
         return ""
 
-    # ── Field assignment ──────────────────────────────────────────
-
-    def _handle_field_assign(self, func_name, sid, node):
-        """Handle BinaryOperator '=' for field_assign fact emission.
-
-        Only emits a row when:
-          1. The LHS base variable is a GC-managed local.
-          2. The leaf member being assigned is in GC_MANAGED_FIELD_NAMES
-             (code, env, car, cdr, data).
-
-        This filters out noise like v.tag = VAL_LAMBDA (tag is not a
-        GC-managed field) while capturing v.lambda.code = code.
-        """
-        inner = node.get("inner", [])
-        if len(inner) < 2:
-            return
-
-        lhs_node = inner[0]
-        rhs_node = inner[1]
-
-        if not isinstance(lhs_node, dict):
-            return
-
-        field_path = self._extract_field_path(lhs_node)
-        base = self._extract_base(lhs_node)
-        rhs_kind = self._classify_rhs(rhs_node)
-
-        if not base or not field_path:
-            return
-
-        # Filter 1: base must be a GC-managed local.
-        if base not in self._gc_locals:
-            return
-
-        # Filter 2: leaf member must be a GC-managed field.
-        leaf_member = field_path.rsplit(".", 1)[-1] if "." in field_path else field_path.lstrip(".")
-        if leaf_member not in GC_MANAGED_FIELD_NAMES:
-            return
-
-        self.writer.write("field_assign", [
-            func_name, str(sid), base, field_path, rhs_kind
-        ])
+    # ── Field assignment helpers ──────────────────────────────────
 
     def _extract_field_path(self, node):
         """Extract field path like 'lambda.code' from a MemberExpr chain.
@@ -547,10 +725,10 @@ class AstVisitor:
         return "unknown"
 
 
-# ── Self-test: hardcoded AST ─────────────────────────────────────────
+# ── Self-test: hardcoded AST (Phase 2 update) ─────────────────────────
 #
 # The self-test AST represents a simplified val_lambda-like function
-# that exercises all Phase 1 extraction pathways:
+# that exercises all Phase 1+2 extraction pathways:
 #   - GC-managed params (code, env) and locals (v → Value, p → void*)
 #   - Non-GC local (msg → char*)
 #   - CallExpr to allocator (gc_alloc → stmt_allocs)
@@ -558,6 +736,11 @@ class AstVisitor:
 #   - Field assignments: v.lambda.code (GC field → emitted),
 #     v.lambda.env (GC field → emitted), v.tag (non-GC field → skipped)
 #   - void* with gc_alloc_oldgen initializer → is_gc_managed=1
+#   - Phase 2: gc_root_push_value / gc_root_pop / gc_root_pop_to calls
+#     → real stmt_pushes/stmt_pops
+#   - Phase 2: gc_use from DeclRefExpr/MemberExpr inside CallExpr args
+#   - Phase 2: gc_def from direct assignment to GC-managed var
+#   - Phase 2: next_stmt edges between consecutive stmt_ids
 #
 
 SELF_TEST_AST = {
@@ -677,6 +860,60 @@ SELF_TEST_AST = {
                                 }
                             ],
                         },
+                        # ── gc_root_push_value(&code) → stmt_pushes ──
+                        {
+                            "kind": "CallExpr",
+                            "inner": [
+                                {
+                                    "kind": "ImplicitCastExpr",
+                                    "inner": [
+                                        {
+                                            "kind": "DeclRefExpr",
+                                            "referencedDecl": {
+                                                "name": "gc_root_push_value",
+                                            },
+                                        }
+                                    ],
+                                },
+                                {
+                                    "kind": "UnaryOperator",
+                                    "opcode": "&",
+                                    "inner": [
+                                        {
+                                            "kind": "DeclRefExpr",
+                                            "referencedDecl": {"name": "code"},
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                        # ── gc_root_push_value(&env) → stmt_pushes ──
+                        {
+                            "kind": "CallExpr",
+                            "inner": [
+                                {
+                                    "kind": "ImplicitCastExpr",
+                                    "inner": [
+                                        {
+                                            "kind": "DeclRefExpr",
+                                            "referencedDecl": {
+                                                "name": "gc_root_push_value",
+                                            },
+                                        }
+                                    ],
+                                },
+                                {
+                                    "kind": "UnaryOperator",
+                                    "opcode": "&",
+                                    "inner": [
+                                        {
+                                            "kind": "DeclRefExpr",
+                                            "referencedDecl": {"name": "env"},
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
                         # ── gc_alloc call (IS an allocator → stmt_allocs) ──
                         {
                             "kind": "CallExpr",
@@ -691,11 +928,17 @@ SELF_TEST_AST = {
                                             },
                                         }
                                     ],
-                                }
+                                },
+                                # Pass 'code' as an argument → gc_use of code
+                                {
+                                    "kind": "DeclRefExpr",
+                                    "referencedDecl": {"name": "code"},
+                                },
                             ],
                         },
                         # ── v.lambda.env = GC_VALUE_ARRAY(...) ──
-                        # GC field 'env' → emitted
+                        # GC field 'env' → field_assign emitted;
+                        # 'v' is base of MemberExpr → gc_use of v
                         {
                             "kind": "BinaryOperator",
                             "opcode": "=",
@@ -735,7 +978,8 @@ SELF_TEST_AST = {
                             ],
                         },
                         # ── v.lambda.code = code ──
-                        # GC field 'code' → emitted
+                        # GC field 'code' → field_assign emitted;
+                        # 'v' is base → gc_use of v; 'code' in RHS → gc_use
                         {
                             "kind": "BinaryOperator",
                             "opcode": "=",
@@ -762,8 +1006,30 @@ SELF_TEST_AST = {
                                 },
                             ],
                         },
+                        # ── gc_root_pop_to(some_wm) → stmt_pops pop_to ──
+                        {
+                            "kind": "CallExpr",
+                            "inner": [
+                                {
+                                    "kind": "ImplicitCastExpr",
+                                    "inner": [
+                                        {
+                                            "kind": "DeclRefExpr",
+                                            "referencedDecl": {
+                                                "name": "gc_root_pop_to",
+                                            },
+                                        }
+                                    ],
+                                },
+                                {
+                                    "kind": "DeclRefExpr",
+                                    "referencedDecl": {"name": "some_wm"},
+                                },
+                            ],
+                        },
                         # ── v.tag = VAL_LAMBDA ──
-                        # 'tag' is NOT a GC field → NOT emitted
+                        # 'tag' is NOT a GC field → NOT emitted as field_assign;
+                        # but 'v' is base → gc_use of v
                         {
                             "kind": "BinaryOperator",
                             "opcode": "=",
@@ -808,26 +1074,20 @@ SELF_TEST_AST = {
 def run_self_test(writer):
     """Emit facts from the hardcoded SELF_TEST_AST dict.
 
-    The visitor emits function, var_decl, call_graph, stmt_allocs, and
-    field_assign from real AST walk.  We then emit synthetic skeleton rows
-    for the remaining 5 relations (cfg_edge, stmt_pushes, stmt_pops,
-    stmt_memcpy, stmt_barrier) — these are Phase 2/3 work and are not yet
-    extracted from the real AST.
+    Phase 2: all facts are now produced by real extraction from the AST.
+    Skeleton rows for cfg_edge/stmt_memcpy/stmt_barrier are kept for the
+    remaining Phase 3 relations that are not yet extracted.
     """
     visitor = AstVisitor(writer)
     visitor.visit(SELF_TEST_AST)
 
-    # ── Skeleton rows for Phase 2/3 relations ──────────────────────
-    # These keep the self-test round-trip gate green until Phases 2-3
-    # implement real extraction.
-
+    # ── Skeleton rows for Phase 3 relations (not yet extracted) ─────
+    # cfg_edge: still skeleton (Phase 2 uses next_stmt instead).
     writer.write("cfg_edge",    ["val_lambda", "0", "1", "fall"])
-    writer.write("stmt_pushes", ["val_lambda", "3", "ROOT_PTR", "code"])
-    writer.write("stmt_pushes", ["val_lambda", "4", "ROOT_PTR", "env"])
-    writer.write("stmt_pops",   ["val_lambda", "5", "2", "pop_to"])
-    writer.write("stmt_memcpy", ["val_lambda", "6", "v.lambda.env", "env",
+    # stmt_memcpy + stmt_barrier: Phase 3.
+    writer.write("stmt_memcpy", ["val_lambda", "99", "v.lambda.env", "env",
                                   "env_len * sizeof(Value)"])
-    writer.write("stmt_barrier", ["val_lambda", "7", "v.lambda.env"])
+    writer.write("stmt_barrier", ["val_lambda", "99", "v.lambda.env"])
 
 
 # ── CLI ──────────────────────────────────────────────────────────────

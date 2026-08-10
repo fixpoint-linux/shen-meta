@@ -1,6 +1,30 @@
 # GC-Safety Verifier (Soufflé Datalog)
 
-Status: **DESIGN** (advisor-offpeak 2026-08-10). Phase 0 scaffold in progress. Not part of any build gate.
+Status: **DESIGN + Phases 0-2 DONE** (committed 876e7f6, 365c50f, + Phase 2). Phase 3 (memcpy) + Phase 5 (calibration) pending. Not part of any build gate.
+
+## Phase 2 status (make-or-break)
+
+Implemented and validated end-to-end (clang 22.1.8 + souffle 2.5):
+- **Regression fixtures pass** (`check_fixtures.sh`, wired into `make gc-verify`):
+  `val_lambda_env.c` fires (2), `trap_error_hc.c` fires (2), `rooted_ok.c`
+  clean (0). This is the core value: historical bugs become permanent
+  regression tests.
+- **False-positive fix:** VarDecl-with-initializer now emits `gc_def` (kills
+  backward liveness at the definition point). Without it, a var used after
+  its definition appears spuriously live across an earlier alloc.
+- **Souffle header fix:** all `.input`/`.output` use `headers=true`. Without
+  it, souffle treats the header row as data (silently broken for symbol-only
+  relations, hard error for `number` columns like `stmt_id`).
+
+**Remaining over-flagging on current VM (~52 root_miss candidates):** the
+intra-BB linear `next_stmt` approximation treats each function as one basic
+block, so vars live in *other* switch cases appear live across an alloc. Most
+candidates are safe-by-design (e.g. `val_lambda`'s local `Value v` is
+unrooted intentionally; the code/env it stores are separately rooted via
+`gc_root_push_ptr`). This is the `definite_assigned` / basic-block calibration
+refinement — Phase 5. The tool is behaving correctly as a **candidate
+generator**: it surfaces sites for review, and the calibration pass decides
+which are genuine. See Phase 5 below.
 
 ## Goal
 

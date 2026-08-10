@@ -22,6 +22,8 @@ run:
 	# fact dir (-F) and output dir (-D) must be '.' to avoid double-prefixing.
 	souffle gc_safety.dl -F . -D .
 	@echo "==> Results in out/ (may_collect.csv, root_miss.csv, memcpy_unbarriered.csv)"
+	@echo "==> Running regression fixtures..."
+	@bash check_fixtures.sh
 
 # ── Self-test (Python stdlib only, no clang/souffle/pytest) ──────────
 

@@ -3,45 +3,62 @@
 // Architecture:
 //   vm/*.c --clang -Xclang -ast-dump=json--> extract.py --CSV--> gc_safety.dl
 //
-// Phased rollout: Phase 0 = schema + may_collect + skeleton rules.
-// Phases 2-3 fill in root_miss and memcpy_unbarriered.
+// Phased rollout:
+//   Phase 0: schema + may_collect + skeleton rules
+//   Phase 1: full AST extraction, all 10 CSVs, may_collect transitive closure
+//   Phase 2: GC-liveness + must_rooted + root_miss (THIS FILE)
+//   Phase 3: memcpy_unbarriered (future)
 
-// ── Input fact schemas (all 10 CSV files) ────────────────────────────
+// ── Input fact schemas ────────────────────────────────────────────────
 
 .decl function(name:symbol)
-.input function(IO=file, delimiter=",", filename="facts/function.csv")
+.input function(IO=file, delimiter=",", headers=true, filename="facts/function.csv")
 
 .decl cfg_edge(f:symbol, from_stmt_id:number, to_stmt_id:number, kind:symbol)
-.input cfg_edge(IO=file, delimiter=",", filename="facts/cfg_edge.csv")
+.input cfg_edge(IO=file, delimiter=",", headers=true, filename="facts/cfg_edge.csv")
 
 .decl stmt_allocs(f:symbol, stmt_id:number, callee:symbol)
-.input stmt_allocs(IO=file, delimiter=",", filename="facts/stmt_allocs.csv")
+.input stmt_allocs(IO=file, delimiter=",", headers=true, filename="facts/stmt_allocs.csv")
 
 .decl stmt_pushes(f:symbol, stmt_id:number, root_kind:symbol, slot_expr:symbol)
-.input stmt_pushes(IO=file, delimiter=",", filename="facts/stmt_pushes.csv")
+.input stmt_pushes(IO=file, delimiter=",", headers=true, filename="facts/stmt_pushes.csv")
 
 .decl stmt_pops(f:symbol, stmt_id:number, pop_count:number, pkind:symbol)
-.input stmt_pops(IO=file, delimiter=",", filename="facts/stmt_pops.csv")
+.input stmt_pops(IO=file, delimiter=",", headers=true, filename="facts/stmt_pops.csv")
 
 .decl stmt_memcpy(f:symbol, stmt_id:number, dst_expr:symbol, src_expr:symbol, nbytes:number)
-.input stmt_memcpy(IO=file, delimiter=",", filename="facts/stmt_memcpy.csv")
+.input stmt_memcpy(IO=file, delimiter=",", headers=true, filename="facts/stmt_memcpy.csv")
 
 .decl stmt_barrier(f:symbol, stmt_id:number, target_expr:symbol)
-.input stmt_barrier(IO=file, delimiter=",", filename="facts/stmt_barrier.csv")
+.input stmt_barrier(IO=file, delimiter=",", headers=true, filename="facts/stmt_barrier.csv")
 
 .decl var_decl(f:symbol, name:symbol, type:symbol, is_gc_managed:number)
-.input var_decl(IO=file, delimiter=",", filename="facts/var_decl.csv")
+.input var_decl(IO=file, delimiter=",", headers=true, filename="facts/var_decl.csv")
 
 .decl field_assign(f:symbol, stmt_id:number, base:symbol, field_path:symbol, rhs_kind:symbol)
-.input field_assign(IO=file, delimiter=",", filename="facts/field_assign.csv")
+.input field_assign(IO=file, delimiter=",", headers=true, filename="facts/field_assign.csv")
 
 .decl call_graph(caller:symbol, callee:symbol)
-.input call_graph(IO=file, delimiter=",", filename="facts/call_graph.csv")
+.input call_graph(IO=file, delimiter=",", headers=true, filename="facts/call_graph.csv")
 
-// ── Stratum 1: may_collect — transitive closure over call_graph ──────
-// Seeds: gc_alloc and friends are the leaf allocators that may trigger
-// a nursery collection.  collect / collect_nursery / gcalloc_internal
-// are the internal entry points.
+// ── Phase 2 new input relations ───────────────────────────────────────
+
+.decl next_stmt(f:symbol, from:number, to:number)
+// Phase-2-approx: intra-BB sequential edges only (one linear order per function).
+// Full CFG with branch/if/switch edges is deferred to a later phase (~80% of
+// historical sites are straight-line within one switch case).
+.input next_stmt(IO=file, delimiter=",", headers=true, filename="facts/next_stmt.csv")
+
+.decl gc_use(f:symbol, stmt_id:number, v:symbol)
+.input gc_use(IO=file, delimiter=",", headers=true, filename="facts/gc_use.csv")
+
+.decl gc_def(f:symbol, stmt_id:number, v:symbol)
+.input gc_def(IO=file, delimiter=",", headers=true, filename="facts/gc_def.csv")
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATUM 1 — may_collect transitive closure
+// ═══════════════════════════════════════════════════════════════════════
 
 .decl may_collect(f:symbol)
 
@@ -56,21 +73,118 @@ may_collect("gcalloc_internal").
 // it is also in may_collect.
 may_collect(caller) :- call_graph(caller, callee), may_collect(callee).
 
-// ── Stratum 2+: analysis rules (Phases 2-3) ─────────────────────────
 
-// Phase 2 — root_miss: GC-managed var live across an allocating call
-// ∧ not must_rooted.  Currently vacuous; implement in Phase 2.
+// ═══════════════════════════════════════════════════════════════════════
+// STRATUM 2 — pop_to_at (helper, depends only on inputs)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// pop_to_at is in a lower stratum than pushed_may because pushed_may
+// negates it.  Soufflé requires a negated relation to be fully computed
+// before the negating rule runs.
+
+.decl pop_to_at(f:symbol, stmt_id:number)
+pop_to_at(f, s) :- stmt_pops(f, s, _, "pop_to").
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATUM 3a — pushed_may forward fixpoint (intra-BB)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// pushed_may(f, v, s): variable v MAY be on the shadow stack at
+// statement s (on at least one path).  Propagates forward through
+// next_stmt edges unless killed by pop_to.
+//
+// Phase 2 intra-BB approximation: there is only one path per function,
+// so pushed_may == "is pushed" (deterministic).  When we add branches
+// in a later phase, pushed_may correctly tracks "may" semantics.
+
+.decl pushed_may(f:symbol, v:symbol, stmt_id:number)
+
+// Base: a push at statement s makes v pushed at s.
+pushed_may(f, v, s) :- stmt_pushes(f, s, _, v).
+
+// Propagation: if v is pushed at s, and s_next follows s, and s is not
+// a pop_to, then v is still pushed at s_next.
+pushed_may(f, v, s_next) :-
+    pushed_may(f, v, s),
+    next_stmt(f, s, s_next),
+    !pop_to_at(f, s).
+
+// Note: pop_one (gc_root_pop()) is NOT modelled as a kill in Phase 2.
+// This is conservative (over-approximates rootedness), meaning we may
+// miss some root-miss patterns that involve pop_one.  pop_to is the
+// dominant pattern in the historical bug fixes (longjmp unwind).
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATUM 3b — live_at backward fixpoint (GC-liveness, intra-BB)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// live_at(f, v, s): GC-managed variable v is live at statement s
+// (its current value may be read at or after s).  Standard backward
+// dataflow: a use generates liveness, a definition kills it.
+
+.decl live_at(f:symbol, v:symbol, stmt_id:number)
+
+// Base: a read (gc_use) at statement s makes v live at s.
+live_at(f, v, s) :- gc_use(f, s, v).
+
+// Propagation: if v is live at s_next, and s precedes s_next, and
+// s does NOT define v, then v is live at s.
+live_at(f, v, s) :-
+    next_stmt(f, s, s_next),
+    live_at(f, v, s_next),
+    !gc_def(f, s, v).
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATUM 3c — must_rooted (intra-BB: same as pushed_may)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// must_rooted(f, v, s): variable v IS rooted at statement s on ALL
+// paths.  For intra-BB (single path), must_rooted = pushed_may.
+// When branches are added, must_rooted will require pushed_may on
+// every incoming CFG edge.
+
+.decl must_rooted(f:symbol, v:symbol, stmt_id:number)
+must_rooted(f, v, s) :- pushed_may(f, v, s).
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATUM 4 — root_miss violation
+// ═══════════════════════════════════════════════════════════════════════
+//
+// root_miss(f, s, v): GC-managed var v is live across an allocating
+// call at statement s, but v is NOT must_rooted at s.  The GC may move
+// the object v points to, leaving v stale.
+//
+// Negates must_rooted (stratum 3) → must be stratum 4.
+
 .decl root_miss(f:symbol, stmt_id:number, var_name:symbol)
-root_miss(f, stmt_id, "") :- stmt_allocs(f, stmt_id, _), false.
 
-// Phase 3 — memcpy_unbarriered: raw memcpy into a fresh GC_TYPE_VALUE_ARRAY
-// target with no gc_barrier_value_array before the next may-collect.
-// Currently vacuous; implement in Phase 3.
+root_miss(f, s, v) :-
+    stmt_allocs(f, s, _),
+    var_decl(f, v, _, 1),       // is_gc_managed = 1
+    live_at(f, v, s),
+    !must_rooted(f, v, s).
+
+// Note: may_collect(_) guard omitted from body because stmt_allocs
+// already contains only known may-collect seeds (the extractor filters
+// on MAY_COLLECT_SEEDS).  Transitive may_collect for indirect callers
+// is computed by Soufflé but doesn't feed into root_miss directly (the
+// stmt_allocs relation captures the actual allocating call site).
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// Phase 3 — memcpy_unbarriered (vacuous skeleton, remains for Phase 3)
+// ═══════════════════════════════════════════════════════════════════════
+
 .decl memcpy_unbarriered(f:symbol, stmt_id:number, dst_expr:symbol)
 memcpy_unbarriered(f, stmt_id, "") :- stmt_memcpy(f, stmt_id, _, _, _), false.
 
-// ── Output relations ─────────────────────────────────────────────────
 
-.output may_collect(IO=file, delimiter=",", filename="out/may_collect.csv")
-.output root_miss(IO=file, delimiter=",", filename="out/root_miss.csv")
-.output memcpy_unbarriered(IO=file, delimiter=",", filename="out/memcpy_unbarriered.csv")
+// ── Output relations ───────────────────────────────────────────────────
+
+.output may_collect(IO=file, delimiter=",", headers=true, filename="out/may_collect.csv")
+.output root_miss(IO=file, delimiter=",", headers=true, filename="out/root_miss.csv")
+.output memcpy_unbarriered(IO=file, delimiter=",", headers=true, filename="out/memcpy_unbarriered.csv")

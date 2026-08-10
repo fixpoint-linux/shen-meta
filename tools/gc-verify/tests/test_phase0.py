@@ -224,54 +224,74 @@ class TestPhase0(unittest.TestCase):
                 f"Missing may_collect seed: {seed}"
             )
 
-    # ── Test 9: skeleton rules are present and vacuous ───────────────
+    # ── Test 9: Phase 2 real root_miss, Phase 3 vacuous memcpy_unbarriered ──
 
-    def test_09_skeleton_rules(self):
-        """gc_safety.dl has skeleton root_miss and memcpy_unbarriered rules
-        using 'false' body."""
+    def test_09_rules(self):
+        """gc_safety.dl has a real root_miss rule (Phase 2) and a
+        vacuous memcpy_unbarriered skeleton (Phase 3, uses 'false')."""
         dl_text = GC_SAFETY_DL.read_text()
+        lines = dl_text.split("\n")
 
+        # ── Helper: find the body of a rule (lines between .decl and
+        # the next .decl/.output/.input, excluding comment-only lines).
+        def find_rule_body(rel_name):
+            in_rule = False
+            body_lines = []
+            for line in lines:
+                stripped = line.strip()
+                # Skip comments and empty lines
+                if not stripped or stripped.startswith("//"):
+                    if in_rule:
+                        body_lines.append(line)
+                    continue
+                if stripped.startswith(".decl " + rel_name):
+                    in_rule = True
+                    continue
+                if in_rule:
+                    if stripped.startswith(".decl") or stripped.startswith(".input") or stripped.startswith(".output"):
+                        break
+                    body_lines.append(stripped)
+            return "\n".join(body_lines)
+
+        # root_miss: Phase 2 real rule — not vacuous, no 'false' body.
         self.assertIn(
             "root_miss",
             dl_text,
             "Missing root_miss rule"
         )
-        # root_miss should have a rule body with 'false'
-        # Find the root_miss rule line (non-decl, non-output)
-        root_miss_rules = [
-            line for line in dl_text.split("\n")
-            if "root_miss" in line
-            and not line.strip().startswith(".")
-            and not line.strip().startswith("//")
-        ]
+        root_miss_text = find_rule_body("root_miss")
         self.assertGreater(
-            len(root_miss_rules), 0,
+            len(root_miss_text), 0,
             "No root_miss rule found (only .decl/.output)"
         )
-        self.assertIn(
+        # Phase 2: root_miss is a real rule — it should NOT use 'false'.
+        self.assertNotIn(
             "false",
-            root_miss_rules[0],
-            "root_miss skeleton rule should use 'false' body"
+            root_miss_text,
+            "root_miss rule should be a real Phase 2 rule, not use 'false'"
         )
+        # Verify the real rule references the required relations.
+        for required in ("stmt_allocs", "var_decl", "live_at", "must_rooted"):
+            self.assertIn(
+                required,
+                root_miss_text,
+                f"root_miss rule should reference '{required}'"
+            )
 
+        # memcpy_unbarriered: still vacuous skeleton (Phase 3).
         self.assertIn(
             "memcpy_unbarriered",
             dl_text,
             "Missing memcpy_unbarriered rule"
         )
-        mcpy_rules = [
-            line for line in dl_text.split("\n")
-            if "memcpy_unbarriered" in line
-            and not line.strip().startswith(".")
-            and not line.strip().startswith("//")
-        ]
+        mcpy_text = find_rule_body("memcpy_unbarriered")
         self.assertGreater(
-            len(mcpy_rules), 0,
+            len(mcpy_text), 0,
             "No memcpy_unbarriered rule found"
         )
         self.assertIn(
             "false",
-            mcpy_rules[0],
+            mcpy_text,
             "memcpy_unbarriered skeleton rule should use 'false' body"
         )
 
