@@ -177,3 +177,26 @@ arity_mismatch(caller, call_idx, callee, expected, supplied) :-
     expected != supplied.
 
 .output arity_mismatch(IO=file, delimiter=",", headers=true, filename="out/arity_mismatch.csv")
+
+// ── Check A2: source-level safe-subset checks ─────────────────────
+//
+// Phase 3 adds SOURCE-level checks over the 12 .shen files that feed the
+// reduced self-contained bundle (see serialize-reduced.shen:28-43).  The
+// Python extractor (extract_source.py) pre-computes the violations; these
+// relations are pass-through (no Datalog rules).
+
+.decl source_file(name:symbol)
+.input source_file(IO=file, delimiter=",", headers=true, filename="facts/source_file.csv")
+.output source_file(IO=file, delimiter=",", headers=true, filename="out/source_file.csv")
+
+.decl unsafe_construct(file:symbol, line:number, head:symbol)
+.input unsafe_construct(IO=file, delimiter=",", headers=true, filename="facts/unsafe_construct.csv")
+.output unsafe_construct(IO=file, delimiter=",", headers=true, filename="out/unsafe_construct.csv")
+
+.decl nonlinear_pattern(file:symbol, line:number, var:symbol)
+.input nonlinear_pattern(IO=file, delimiter=",", headers=true, filename="facts/nonlinear_pattern.csv")
+.output nonlinear_pattern(IO=file, delimiter=",", headers=true, filename="out/nonlinear_pattern.csv")
+
+.decl tuple_pattern(file:symbol, line:number)
+.input tuple_pattern(IO=file, delimiter=",", headers=true, filename="facts/tuple_pattern.csv")
+.output tuple_pattern(IO=file, delimiter=",", headers=true, filename="out/tuple_pattern.csv")

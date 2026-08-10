@@ -35,6 +35,13 @@ From the repo root, `make bundle-verify` delegates here (opt-in, non-gating).
 | `curried_call` | no adjacent apply/appterm (no partial-application crash) |
 | `arity_mismatch` | every statically-resolvable call site supplies full arity |
 | `unresolved_call` | call sites whose callee is a higher-order param (`[access N]`) |
+| `unsafe_construct` | source head not in the safe-subset allowlist (flags `defmacro`/`datatype`/`freeze`/`thaw`/`cond`/`case`) |
+| `nonlinear_pattern` | a pattern var repeats in one clause (silent-overwrite hazard) |
+| `tuple_pattern` | a pattern whose constructor is `@p` |
+
+The last three are **source-level (Check A2)** checks over the 12 `.shen` files
+that feed the reduced bundle (`extract_source.py` parses the source; the
+bundle-level A1 checks can't see these because `shen->kl` erases them).
 
 ## Arity model
 
@@ -65,6 +72,20 @@ The real-bundle baseline is NOT empty — it contains vetted, known rows:
 - **`unresolved_call` (49 rows)** — `[access N]` higher-order parameter calls.
   The meta-interpreter's params are data, not callables; a full resolution
   needs points-to flow analysis (deferred).
+- **`unsafe_construct` (4 rows)** — `types.shen` uses `datatype` at lines
+  14/24/49/129. These are Shen sequent-calculus type rules that `shen->kl`
+  skips (`[datatype _ | _] -> shen.skip`); they're type-level annotations, not
+  executable code. Vetted known-accepted.
+- **`nonlinear_pattern` (2 rows)** — genuine silent-overwrite hazards caught
+  by the source check:
+  - `util.shen:7` `index_h` — clause `X [X | Rest] C -> C` repeats `X`.
+  - `interp.shen:43` `interp-jmp` — clause `[label L | C] L -> C` repeats `L`.
+  These are non-linear patterns (a pattern var appearing more than once in one
+  clause), the exact class `docs/compiler.md:48-61` warns about. Whether the C
+  VM matcher handles them or silently overwrites is a review item — the check
+  surfaces them for exactly that purpose.
+- **`tuple_pattern` (0 rows)** — `@p` appears only in body position, never as
+  a pattern constructor.
 
 ## Soundness scope
 

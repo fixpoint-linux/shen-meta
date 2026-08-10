@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DL="$HERE/bundle_safety.dl"
 BUNDLE="$HERE/../../globals.csexp"
 EXPECTED="$HERE/expected"
-RELATIONS="bad_opcode dangling_global unknown_prim curried_call arity_mismatch unresolved_call"
+RELATIONS="bad_opcode dangling_global unknown_prim curried_call arity_mismatch unresolved_call source_file unsafe_construct nonlinear_pattern tuple_pattern"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -36,6 +36,8 @@ fi
 mkdir -p "$WORK/facts" "$WORK/out"
 
 python3 "$HERE/extract_bundle.py" --bundle "$BUNDLE" --out-dir "$WORK/facts" >/dev/null 2>&1
+
+python3 "$HERE/extract_source.py" --source-dir "$HERE/../../shen/" --out-dir "$WORK/facts" >/dev/null 2>&1
 
 (cd "$WORK" && souffle "$DL" -F . -D . >/dev/null 2>&1)
 
