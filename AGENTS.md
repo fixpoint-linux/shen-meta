@@ -131,6 +131,22 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
   scan since 4a.6); typed `gc_scan_value`/`gc_evacuate` in `zincvm.c` handle
   interior pointers. Write barrier at `address->` vector writes (site 1,
   required); `global_set` barrier deferred (see `docs/gc.md`).
+  A static-analysis verifier (`tools/gc-verify/`, opt-in via
+  `make gc-verify`) cross-checks root discipline and write barriers
+  against this design: it runs `clang -Xclang -ast-dump=json` over
+  `vm/zincvm.c` + `vm/gc.c`, extracts facts to CSV, and runs Soufflé
+  Datalog rules (`gc_safety.dl`) that flag (a) GC-managed locals live
+  across an allocating call without a shadow-stack push (`root_miss`)
+  and (b) raw `memcpy` into a fresh `Value` array with no
+  `gc_dirty_vectors_add` before the next allocation
+  (`memcpy_unbarriered`). It is a **verifier + candidate generator,
+  not a gate**: requires clang ≥ 14 + souffle on the host (not part of
+  `make`/`make test`), `make gc-verify` runs end-to-end (regression
+  fixtures + real-VM baseline diff against `expected/`), and a flagged
+  site is a review prompt, not a build break. See
+  `tools/gc-verify/README.md` for the soundness scope (catches
+  named-slot + missing-barrier classes; cannot catch register-cached
+  temps, collector-invariant bugs, or non-GC-typed flows).
 
 - csexp atoms: `[len:type]value` — type is `s`/`n`/`S`/`b`
 - Opcodes are single chars: `m` pushmark, `p` apply, `r` grab, `v` return, etc.

@@ -40,6 +40,34 @@ make selftest
 make clean
 ```
 
+## Regression baseline
+
+The `expected/` directory holds the **curated clean-baseline allowlist** for
+the real VM (`vm/zincvm.c` + `vm/gc.c`).  `check_results.sh` diffs each
+Soufflé output CSV against its expected counterpart:
+
+- **FAIL** on any row that appears in the output but NOT in `expected/` —
+  a new candidate (regression or new code pattern that needs review).
+- **WARN** on any row in `expected/` that no longer fires — usually a fix;
+  re-run `make snapshot` to refresh.
+- **OK** if the output matches exactly.
+
+`make run` (or `make gc-verify` from the repo root) runs both the regression
+fixtures (`check_fixtures.sh`) and the real-VM baseline diff
+(`check_results.sh`) end-to-end.
+
+To refresh the allowlist after reviewing and accepting changes:
+
+```sh
+make snapshot          # re-runs pipeline, copies out/*.csv → expected/
+git diff expected/     # review every change before committing
+```
+
+The current allowlist contains ~52 `root_miss` rows (Phase 2 intra-BB
+over-approximation + known safe-by-design patterns) and 2
+`memcpy_unbarriered` rows (Phase 3 false positives from fresh-allocation
+and non-Value GC types).  All rows have been hand-reviewed.
+
 ## Soundness limits
 
 | Class | Catchable? | Why |

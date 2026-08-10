@@ -1,6 +1,43 @@
 # GC-Safety Verifier (Soufflé Datalog)
 
-Status: **DESIGN + Phases 0-3 DONE** (committed 876e7f6, 365c50f, + Phase 2, + Phase 3). Phase 4 (make gc-verify integration) + Phase 5 (calibration) pending. Not part of any build gate.
+Status: **DESIGN + Phases 0-4 DONE** (committed 876e7f6, 365c50f, + Phase 2, + Phase 3, + Phase 4). Phase 5 (calibration) pending. Not part of any build gate.
+
+## Phase 4 status (make gc-verify integration)
+
+Implemented and integrated (no clang/souffle delta — integration layer only):
+
+- **`check_results.sh`** — real-VM baseline diff script. Runs the full
+  clang → extract.py → souffle pipeline in a temp directory, then diffs
+  `out/*.csv` against `expected/` using `comm -23` (extra rows) and
+  `comm -13` (gone rows). **FAIL** on new rows not in expected/
+  (regression); **WARN** on rows in expected/ that no longer fire
+  (likely a fix — re-run `make snapshot` to refresh). Exit code 2 for
+  missing prereqs (clang/souffle/expected/).
+- **`expected/` allowlist** — curated clean-baseline directory:
+  `root_miss.csv` (~52 rows, header-only until `make snapshot` populates
+  it) and `memcpy_unbarriered.csv` (2 rows, Phase 3 false positives).
+  `expected/README.md` documents provenance, categorization, and the
+  snapshot refresh workflow.
+- **`make snapshot` target** — re-runs the real-VM pipeline and copies
+  `out/*.csv` → `expected/`. The orchestrator uses this to seed the
+  initial allowlist after Phase 4 lands.
+- **`make run` updated** — `check_results.sh` runs after
+  `check_fixtures.sh`, so a single `make run` (or `make gc-verify` from
+  the repo root) exercises both regression fixtures and the real-VM
+  baseline diff.
+- **`make selftest` fix** — now runs `test_phase2.py` (was missing from
+  the target, although the file existed). All 66 Python unit tests pass
+  (10 phase0 + 13 phase1 + 14 phase2 + 15 phase3 + 14 phase2 =
+  66 total).
+- **`AGENTS.md` note** — one paragraph under the GC bullet pointing at
+  `tools/gc-verify/README.md` for the verifier and its soundness scope.
+- **`tools/gc-verify/README.md`** — new `## Regression baseline`
+  subsection documenting the expected/ allowlist, `make run`/`make
+  gc-verify` diff workflow, and `make snapshot` refresh cycle.
+
+Additional historical-bug fixtures (parse_body_cc_slots, eval_kl_chain,
+va_push_memcpy, marshal/demarshal named-locals) are deferred to Phase 5
+(calibration).
 
 ## Phase 3 status (memcpy_unbarriered)
 
