@@ -51,18 +51,26 @@
                          [[N V] | (dedupe-globals-h R [N | Seen])]))
 
 (define primitive? { symbol --> boolean }
-  X -> (element? X [+ / * - trap-error simple-error error-to-string intern
-                    set value number? > < >= <= string? pos tlstr hdstr cn str
-                    string->n n->string absvector address-> <-address emptylist
-                    absvector? cons? cons hd tl write-byte read-byte read-file-as-string open function?
-                    close = eval-kl get-time symbol? boolean? error? stream?
+  \* Reordered: hot prims first so element? short-circuits on early matches.
+     cons/hd/tl are the heads of ~70K recorded-source cons cells; = and the
+     arithmetic + comparison prims dominate the recorded bodies.  Order is
+     semantically irrelevant (pure membership) but hugely affects compile cost.
+     MUST stay in sync with types.shen. *\
+  X -> (element? X [cons hd tl = + / * - number? > < >= <=
+                    string? symbol? boolean? cons? absvector?
+                    pos tlstr hdstr cn str string->n n->string
+                    absvector address-> <-address emptylist
+                    write-byte read-byte read-file-as-string open close function?
+                    trap-error simple-error error-to-string intern
+                    set value eval-kl get-time error? stream?
                     @p fst snd gensym variable? newvar
                     c-strlen char-code substring element?]))
 
 \* Zinc instruction keywords used as list constructors in zinc-c/zinc-t RHS.
    These must NOT be wrapped with [function ...] by debruijn. *\
 (define instruction-keyword? { symbol --> boolean }
-  X -> (element? X [access global grab let jmpf jmp label
-                    cons symbol prim appterm number string boolean
-                    cur endlet pushmark apply mark
-                    error lambda absvector stream in out]))
+  \* Reordered: hot instruction heads first (access/global/prim/let are the
+     most common zinc-c/zinc-t RHS constructors).  Pure membership. *\
+  X -> (element? X [access global prim let number string symbol boolean
+                    grab apply appterm cur cons label jmpf jmp
+                    endlet pushmark mark error lambda absvector stream in out]))
