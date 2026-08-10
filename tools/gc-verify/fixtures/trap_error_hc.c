@@ -56,33 +56,34 @@ extern void gc_root_pop_to(size_t watermark);
 #define GC_VALUE_ARRAY(n) \
     ((Value *)gc_alloc((n) * sizeof(Value), GC_TYPE_VALUE_ARRAY))
 
-// ── BROKEN trap-error handler path (BEFORE fix) ─────────────────────
+// ── make_handler_env — the BROKEN (pre-fix) shape from vm/zincvm.c:1494 ─
 //
-// Pattern: a GC-managed local pointer (Instr *hc) is assigned from a
-// GC-managed field (handler.lambda.code), then an allocating call occurs
-// (GC_VALUE_ARRAY), then hc is used.  hc is NOT pushed on the shadow
-// stack, so if GC fires during the allocation, hc becomes stale.
+// Pattern:
+//   1. Instr *hc = handler->lambda.code;   // captures interior ptr into local
+//   2. Value *henv = GC_VALUE_ARRAY(...);   // allocating call — may trigger GC
+//   3. if (env_len > 0) memcpy(...);
+//   4. henv[0].lambda.code = hc;            // uses hc AFTER the alloc
 //
-// The verifier should flag hc as a root_miss at the gc_alloc call site.
+// hc is a LOCAL (NOT a parameter), so param_rooted does NOT apply.
+// It is live across the GC_VALUE_ARRAY allocation but is NOT pushed on
+// the shadow stack.  If nursery GC fires at step 2, henv is evacuated but
+// hc remains stale (it was captured before the collection point).
 
-Value *make_handler_env(Instr *hc, int hl, Value *handler, int env_len) {
-    // hc is a GC-managed parameter (Instr *) — captured before the alloc.
-    // In the buggy code, hc was a local variable assigned from
-    // handler.lambda.code.  We model it as a parameter here so it's
-    // clearly GC-managed.
+Value *make_handler_env(Value *handler, int env_len) {
+    // Step 1: capture handler's code pointer.  This creates a gc_use of
+    // 'handler' (via the MemberExpr chain) and a gc_def of 'hc'.
+    Instr *hc = handler->lambda.code;
 
-    // BUG: hc is live here (it was passed in and will be used below),
-    // but NOT pushed on the shadow stack before the allocation.
+    // Step 2: may-collect allocation.  hc is live across this (it will be
+    // used at step 4) but NOT pushed on the shadow stack → root_miss.
     Value *henv = GC_VALUE_ARRAY(env_len + 1);
 
     if (env_len > 0)
         memcpy(henv, handler->lambda.env, env_len * sizeof(Value));
 
-    // Use hc after the allocating call — this is the stale-pointer scenario.
-    // The verifier sees hc used here, so hc is live at the GC_VALUE_ARRAY
-    // call above.  Since hc is not rooted, this is a root_miss.
-    (void)hc;
-    (void)hl;
+    // Step 3: use hc AFTER the allocating call.  This creates a gc_use of
+    // 'hc', confirming it is live at the GC_VALUE_ARRAY call above.
+    henv[0].lambda.code = hc;
 
     return henv;
 }

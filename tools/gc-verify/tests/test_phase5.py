@@ -846,8 +846,8 @@ class TestPhase5Extraction(unittest.TestCase):
             path = Path("/tmp/gc-verify-p5-all") / f"{rel}.csv"
             self.assertTrue(path.exists(),
                             f"Missing CSV: {rel}.csv")
-        self.assertEqual(len(extract.CSV_SCHEMAS), 16,
-                         f"Expected 16 schemas (fresh_target dropped, +call_site/array_store), got {len(extract.CSV_SCHEMAS)}")
+        self.assertEqual(len(extract.CSV_SCHEMAS), 17,
+                         f"Expected 17 schemas (fresh_target dropped, +call_site/array_store/param_rooted), got {len(extract.CSV_SCHEMAS)}")
 
     def test_11b_fresh_target_removed(self):
         """fresh_target is NOT in CSV_SCHEMAS and no fresh_target.csv emitted."""

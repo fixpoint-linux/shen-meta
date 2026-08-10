@@ -183,6 +183,8 @@ CSV_SCHEMAS = {
     # Phase 6 additions:
     "call_site":    ["f", "stmt_id", "callee"],
     "array_store":  ["f", "stmt_id", "base_var"],
+    # Phase 7 additions:
+    "param_rooted": ["f", "var"],
 }
 
 
@@ -263,6 +265,11 @@ class AstVisitor:
         self._current_bb = 0           # current basic-block id (Fix 3b)
         self._stmt_bb = {}             # sid -> bb_id (Fix 3b)
         self._defining_var = None      # (f, var) or None (Fix 3a context)
+        # Phase 7: node-id → sid map for _build_cfg (additive, Pass 1 unchanged)
+        self._sid_of_node = {}
+        # Phase 7 (Fix 3): param_rooted refinement
+        self._param_rooted_candidates = set()   # (fn, vname) of GC-managed pointer params
+        self._explicitly_pushed_params = set()  # (fn, vname) that are gc_root_push'd
 
     def _next_stmt_id(self):
         sid = self._stmt_counter
@@ -331,6 +338,9 @@ class AstVisitor:
         self._stmt_bb = {}
         self._defining_var = None
         self._seed_alloc_sids[name] = []
+        self._sid_of_node = {}   # Phase 7: node-id → sid map (per-function)
+        self._param_rooted_candidates = set()   # Phase 7 (Fix 3)
+        self._explicitly_pushed_params = set()  # Phase 7 (Fix 3)
 
         # Emit function fact.
         self.writer.write("function", [name])
@@ -342,6 +352,15 @@ class AstVisitor:
         # Full recursive walk of the function body.
         self._walk_body(name, body)
 
+        # ── Phase 7 (Fix 3): emit param_rooted for candidates NOT explicitly pushed ──
+        for (fn, vname) in self._param_rooted_candidates:
+            if (fn, vname) not in self._explicitly_pushed_params:
+                self.writer.write("param_rooted", [fn, vname])
+
+        # ── Phase 7: real CFG edges (Pass 2) ──
+        # Emits cfg_edge rows with branch/loop/fall semantics.
+        self._build_cfg(name, body)
+
         # ── Phase 5: next_stmt intra-BB edges (CaseStmt-scoped) ──
         # Fix 3b: next_stmt edges only connect stmt_ids within the same
         # basic block.  CaseStmt/DefaultStmt boundaries increment the BB
@@ -350,6 +369,9 @@ class AstVisitor:
         # (drops cross-case sequencing + loop-back edges) — safe for
         # root_miss (fewer live facts ⇒ no new FPs).  Historical root-miss
         # bugs are intra-case straight-line, so they are still caught.
+        #
+        # NOTE (Phase 7): next_stmt now ONLY serves push_pop_balance.
+        # All other analyses (pushed_may, live_at, reach_stmt) use cfg_edge.
         for i in range(len(self._stmt_ids) - 1):
             a, b = self._stmt_ids[i], self._stmt_ids[i + 1]
             if self._stmt_bb.get(a) == self._stmt_bb.get(b):
@@ -387,6 +409,7 @@ class AstVisitor:
         # ── CallExpr → call_graph + stmt_allocs + stmt_pushes/pops ──
         if kind == "CallExpr":
             sid = self._next_stmt_id()
+            self._sid_of_node[id(node)] = sid   # Phase 7: cfg node→sid
             self._handle_call_expr(func_name, sid, node)
             # Recurse into children with this sid for gc_use tracking.
             for child in node.get("inner", []):
@@ -409,6 +432,7 @@ class AstVisitor:
             init_in_key = isinstance(node.get("init"), dict)
             if has_init and vname and vname in self._gc_locals:
                 sid = self._next_stmt_id()
+                self._sid_of_node[id(node)] = sid   # Phase 7: cfg node→sid
                 self.writer.write("gc_def",
                                   [func_name, str(sid), vname])
                 if init_in_key:
@@ -448,6 +472,7 @@ class AstVisitor:
             opcode = node.get("opcode", "")
             if opcode == "=":
                 sid = self._next_stmt_id()
+                self._sid_of_node[id(node)] = sid   # Phase 7: cfg node→sid
                 self._handle_assignment(func_name, sid, node)
                 # Recurse with this sid for gc_use in RHS.
                 for child in node.get("inner", []):
@@ -584,6 +609,10 @@ class AstVisitor:
             if slot_expr:
                 self.writer.write("stmt_pushes",
                                   [func_name, str(sid), root_kind, slot_expr])
+                # Phase 7 (Fix 3): track explicitly pushed params so they
+                # are NOT emitted as param_rooted.
+                if (func_name, slot_expr) in self._param_rooted_candidates:
+                    self._explicitly_pushed_params.add((func_name, slot_expr))
             return True
 
         # ── gc_root_pop (no args) → pop_one ──
@@ -848,6 +877,15 @@ class AstVisitor:
 
         self.writer.write("var_decl", [func_name, vname, vtype, str(is_gc)])
 
+        # Phase 7 (Fix 3c): param_rooted — GC-managed POINTER params are
+        # rooted by the caller (the slot whose address is passed).
+        # By-value Value params are NOT param_rooted (caller can't root them).
+        node_kind = node.get("kind", "")
+        if node_kind == "ParmVarDecl" and is_gc and "*" in vtype:
+            # Phase 7 (Fix 3): defer — collect candidate; emit after body walk
+            # so we know whether the param is explicitly pushed.
+            self._param_rooted_candidates.add((func_name, vname))
+
     def _extract_var_init_callee(self, var_decl_node):
         """Extract callee name from a VarDecl's initializer, if it's a call.
 
@@ -978,6 +1016,500 @@ class AstVisitor:
         if kind == "UnaryOperator":
             return "unary"
         return "unknown"
+
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 7 — real basic-block CFG (two-pass)
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # Pass 1 (unchanged from Phase 2): _walk_body assigns stmt_ids and
+    # populates _sid_of_node via id(node) → sid mapping at each of the
+    # three sid-assignment sites (CallExpr, BinaryOperator =, VarDecl-init).
+    #
+    # Pass 2 (new): _build_cfg traverses the same AST and emits cfg_edge
+    # rows with branch/loop/fall semantics.  The next_stmt post-pass
+    # (intra-BB chain) is left unchanged for push_pop_balance.
+
+    def _build_cfg(self, func_name, body_node):
+        """Emit cfg_edge rows for a function body (Pass 2 of two-pass CFG).
+
+        Sets up continuation-passing _cfg_walk and writes all discovered
+        edges to the fact writer.
+        """
+        self._func_exit_sid = self._stmt_counter
+        self._func_entry_sid = -1                # synthetic; only appears as a cfg_edge *from*
+        self._pending_branches = {}              # id(ifstmt_node) -> [(target_sid, kind), ...]
+        self._break_target_stack = []
+        self._continue_target_stack = []
+        self._cfg_edges = set()   # set of (from, to, kind) tuples
+
+        self._cfg_walk(body_node, None)
+
+        for (frm, to, kind) in sorted(self._cfg_edges):
+            self.writer.write("cfg_edge",
+                              [func_name, str(frm), str(to), kind])
+
+    def _cfg_walk(self, node, k_sid, k_kind="fall"):
+        """Continuation-passing CFG walk over a clang JSON AST node.
+
+        Returns (entry_sid, exit_sid) — the first and last real stmt_ids
+        in the subtree, or (None, None) if the subtree contains no sid nodes.
+
+        k_sid: continuation stmt_id (what follows this subtree), or None.
+        k_kind: edge kind for the fall-through edge to k_sid.
+
+        Emits edges to self._cfg_edges: (sid, k_sid, kind) tuples.
+        """
+        if not isinstance(node, dict):
+            return (None, None)
+
+        kind = node.get("kind", "")
+        inner = node.get("inner", [])
+
+        # ── CompoundStmt — sequential chain ─────────────────────────
+        if kind == "CompoundStmt":
+            # Pass A: walk children right-to-left threading continuation.
+            next_k = k_sid
+            entries_exits = []
+            for child in reversed(inner):
+                e, x = self._cfg_walk(child, next_k, "fall")
+                entries_exits.insert(0, (e, x))
+                if e is not None:
+                    next_k = e
+            # First non-None entry, last non-None exit.
+            first_entry = None
+            last_exit = None
+            for e, x in entries_exits:
+                if e is not None and first_entry is None:
+                    first_entry = e
+                if x is not None:
+                    last_exit = x
+
+            # Pass B: resolve pending branches (Fix 2).
+            preds = [None] * len(inner)
+            pred = None
+            for i in range(len(inner)):
+                preds[i] = pred
+                if entries_exits[i][1] is not None:
+                    pred = entries_exits[i][1]
+            for i in range(len(inner)):
+                nid = id(inner[i])
+                if nid in self._pending_branches:
+                    dispatch = preds[i] if preds[i] is not None else self._func_entry_sid
+                    for (tgt, knd) in self._pending_branches[nid]:
+                        if tgt is not None:
+                            self._cfg_edges.add((dispatch, tgt, knd))
+                    del self._pending_branches[nid]
+
+            return (first_entry, last_exit)
+
+        # ── IfStmt — branch ─────────────────────────────────────────
+        if kind == "IfStmt":
+            # inner: [cond, then_body, else_body?]
+            cond_node = inner[0] if len(inner) >= 1 else None
+            then_node = inner[1] if len(inner) >= 2 else None
+            else_node = inner[2] if len(inner) >= 3 else None
+
+            # Walk then/else with continuation k_sid.
+            e_then, x_then = (None, None)
+            if then_node is not None:
+                e_then, x_then = self._cfg_walk(then_node, k_sid, "fall")
+            e_else, x_else = (None, None)
+            if else_node is not None:
+                e_else, x_else = self._cfg_walk(else_node, k_sid, "fall")
+
+            # Determine cond continuation: earliest of then_entry/else_entry/k.
+            cond_k = k_sid
+            # Prefer a real sid if available (the plan says k, e_then, or e_else).
+            if e_then is not None:
+                cond_k = e_then
+            if e_else is not None:
+                cond_k = e_else
+
+            e_cond, x_cond = (None, None)
+            if cond_node is not None:
+                e_cond, x_cond = self._cfg_walk(cond_node, cond_k, "fall")
+
+            # Emit branch edges from cond exit.
+            xc = x_cond
+            if xc is not None:
+                if e_then is not None:
+                    self._cfg_edges.add((xc, e_then, "true_br"))
+                elif k_sid is not None:
+                    self._cfg_edges.add((xc, k_sid, "true_br"))
+                if e_else is not None:
+                    self._cfg_edges.add((xc, e_else, "false_br"))
+                elif k_sid is not None:
+                    self._cfg_edges.add((xc, k_sid, "false_br"))
+            else:
+                # Fix 2: cond has no sid (e.g. `if (env_len > 0)`).
+                # Defer branch edges — the container will resolve with the
+                # predecessor sid (or func_entry_sid).
+                pending = []
+                if e_then is not None:
+                    pending.append((e_then, "true_br"))
+                elif k_sid is not None:
+                    pending.append((k_sid, "true_br"))
+                if e_else is not None:
+                    pending.append((e_else, "false_br"))
+                elif k_sid is not None:
+                    pending.append((k_sid, "false_br"))
+                if pending:
+                    self._pending_branches[id(node)] = pending
+
+            entry = e_cond or e_then or e_else
+            exit_sid = x_then or x_else or x_cond
+            return (entry, exit_sid)
+
+        # ── SwitchStmt — no implicit fall-through ───────────────────
+        if kind == "SwitchStmt":
+            # inner: [cond, CaseStmt*, DefaultStmt?]
+            cond_node = inner[0] if inner else None
+            case_nodes = inner[1:] if len(inner) > 1 else []
+
+            e_cond, x_cond = (None, None)
+            if cond_node is not None:
+                e_cond, x_cond = self._cfg_walk(cond_node, None)
+
+            # Push break target.
+            self._break_target_stack.append(k_sid)
+
+            first_case_entry = None
+            for case_node in case_nodes:
+                case_kind = case_node.get("kind", "")
+                if case_kind in ("CaseStmt", "DefaultStmt"):
+                    # Walk case body with continuation k_sid.
+                    e_case, x_case = self._cfg_walk(case_node, k_sid, "case")
+                    if e_case is not None:
+                        if first_case_entry is None:
+                            first_case_entry = e_case
+                        # Edge from cond (or from before first case if cond empty)
+                        # to each case entry.
+                        if x_cond is not None:
+                            self._cfg_edges.add((x_cond, e_case, "case"))
+                        elif k_sid is not None:
+                            self._cfg_edges.add((k_sid, e_case, "case"))
+
+            self._break_target_stack.pop()
+
+            entry = e_cond or first_case_entry
+            return (entry, k_sid)
+
+        # ── WhileStmt — loop ────────────────────────────────────────
+        if kind == "WhileStmt":
+            # inner: [cond, body]
+            cond_node = inner[0] if len(inner) >= 1 else None
+            body_node = inner[1] if len(inner) >= 2 else None
+
+            # Compute loop-head sid (cond entry, or body entry if no cond).
+            loop_head_sid = None
+            if cond_node is not None:
+                # Walk cond first to find its entry (but don't emit edges yet).
+                e_cond_pre, _ = self._cfg_walk(cond_node, None)
+                loop_head_sid = e_cond_pre
+            if loop_head_sid is None and body_node is not None:
+                e_body_pre, _ = self._cfg_walk(body_node, None)
+                loop_head_sid = e_body_pre
+
+            # Walk body with continuation = loop_head_sid (back edge).
+            self._break_target_stack.append(k_sid)
+            self._continue_target_stack.append(loop_head_sid or k_sid)
+
+            e_body, x_body = (None, None)
+            if body_node is not None:
+                e_body, x_body = self._cfg_walk(body_node, loop_head_sid, "back")
+
+            self._break_target_stack.pop()
+            self._continue_target_stack.pop()
+
+            # Walk cond with continuation: true_br → body_entry, false_br → k.
+            e_cond, x_cond = (None, None)
+            if cond_node is not None:
+                # We need cond to emit true_br → body and false_br → k.
+                # Walk cond with a special continuation handling.
+                e_cond, x_cond = self._cfg_walk(cond_node, None)
+                if x_cond is not None:
+                    if e_body is not None:
+                        self._cfg_edges.add((x_cond, e_body, "true_br"))
+                    elif k_sid is not None:
+                        self._cfg_edges.add((x_cond, k_sid, "true_br"))
+                    if k_sid is not None:
+                        self._cfg_edges.add((x_cond, k_sid, "false_br"))
+                # Also add: body exit back-edge to cond entry.
+                if x_body is not None and e_cond is not None:
+                    self._cfg_edges.add((x_body, e_cond, "back"))
+
+            entry = e_cond or e_body
+            # Loop exit is k_sid (break target).
+            return (entry, k_sid)
+
+        # ── DoStmt — loop (body first, then cond) ───────────────────
+        if kind == "DoStmt":
+            # inner: [body, cond]
+            body_node = inner[0] if len(inner) >= 1 else None
+            cond_node = inner[1] if len(inner) >= 2 else None
+
+            # Compute loop-head sid (body entry).
+            loop_head_sid = None
+            if body_node is not None:
+                e_body_pre, _ = self._cfg_walk(body_node, None)
+                loop_head_sid = e_body_pre
+
+            self._break_target_stack.append(k_sid)
+            self._continue_target_stack.append(loop_head_sid or k_sid)
+
+            # Walk cond first to find its entry sid (the body's back-edge
+            # continuation must be a SID, not a node dict).
+            e_cond, x_cond = (None, None)
+            if cond_node is not None:
+                e_cond, x_cond = self._cfg_walk(cond_node, None)
+
+            # Walk body with continuation = cond entry (or loop_head if cond
+            # has no sid); the back edge is emitted by cond → body below.
+            e_body, x_body = (None, None)
+            if body_node is not None:
+                body_k = e_cond if e_cond is not None else loop_head_sid
+                e_body, x_body = self._cfg_walk(body_node, body_k, "back")
+
+            if cond_node is not None and x_cond is not None:
+                if loop_head_sid is not None:
+                    self._cfg_edges.add((x_cond, loop_head_sid, "true_br"))
+                elif k_sid is not None:
+                    self._cfg_edges.add((x_cond, k_sid, "true_br"))
+                if k_sid is not None:
+                    self._cfg_edges.add((x_cond, k_sid, "false_br"))
+                # body exit → cond entry
+                if x_body is not None and e_cond is not None:
+                    self._cfg_edges.add((x_body, e_cond, "back"))
+
+            self._break_target_stack.pop()
+            self._continue_target_stack.pop()
+
+            entry = loop_head_sid
+            return (entry, k_sid)
+
+        # ── ForStmt — loop ──────────────────────────────────────────
+        if kind == "ForStmt":
+            # inner: [init, cond, incr, body]
+            init_node = inner[0] if len(inner) >= 1 else None
+            cond_node = inner[1] if len(inner) >= 2 else None
+            incr_node = inner[2] if len(inner) >= 3 else None
+            body_node = inner[3] if len(inner) >= 4 else None
+
+            # Walk init first (runs once).
+            e_init, x_init = (None, None)
+            if init_node is not None:
+                e_init, x_init = self._cfg_walk(init_node, None)
+
+            # Compute cond entry.
+            e_cond_pre, _ = (None, None)
+            if cond_node is not None:
+                e_cond_pre, _ = self._cfg_walk(cond_node, None)
+            loop_head_sid = e_cond_pre or (
+                e_init if init_node is not None else None)
+
+            # Walk incr to find its entry (for body→incr edge).
+            e_incr_pre, _ = (None, None)
+            if incr_node is not None:
+                e_incr_pre, _ = self._cfg_walk(incr_node, None)
+
+            self._break_target_stack.append(k_sid)
+            self._continue_target_stack.append(e_incr_pre or loop_head_sid)
+
+            # Walk body with continuation = incr entry (or loop_head).
+            e_body, x_body = (None, None)
+            if body_node is not None:
+                e_body, x_body = self._cfg_walk(
+                    body_node, e_incr_pre or loop_head_sid, "back")
+
+            # Walk incr with continuation = loop_head (back to cond).
+            e_incr, x_incr = (None, None)
+            if incr_node is not None:
+                e_incr, x_incr = self._cfg_walk(incr_node, loop_head_sid, "back")
+
+            self._break_target_stack.pop()
+            self._continue_target_stack.pop()
+
+            # Walk cond: true_br → body, false_br → k.
+            e_cond, x_cond = (None, None)
+            if cond_node is not None:
+                e_cond, x_cond = self._cfg_walk(cond_node, None)
+                if x_cond is not None:
+                    if e_body is not None:
+                        self._cfg_edges.add((x_cond, e_body, "true_br"))
+                    elif k_sid is not None:
+                        self._cfg_edges.add((x_cond, k_sid, "true_br"))
+                    if k_sid is not None:
+                        self._cfg_edges.add((x_cond, k_sid, "false_br"))
+
+            # init → cond (or body if no cond)
+            if x_init is not None and e_cond is not None:
+                self._cfg_edges.add((x_init, e_cond, "fall"))
+            elif x_init is not None and e_body is not None:
+                self._cfg_edges.add((x_init, e_body, "fall"))
+
+            # body → incr (already handled via body's k_sid)
+            # incr → cond (already handled via incr's k_sid = loop_head_sid)
+
+            entry = e_init or e_cond or e_body
+            return (entry, k_sid)
+
+        # ── BreakStmt → break target ────────────────────────────────
+        if kind == "BreakStmt":
+            if self._break_target_stack:
+                target = self._break_target_stack[-1]
+                if target is not None:
+                    self._cfg_edges.add((k_sid or self._func_exit_sid,
+                                         target, "break"))
+            return (None, None)
+
+        # ── ContinueStmt → continue target ──────────────────────────
+        if kind == "ContinueStmt":
+            if self._continue_target_stack:
+                target = self._continue_target_stack[-1]
+                if target is not None:
+                    self._cfg_edges.add((k_sid or self._func_exit_sid,
+                                         target, "continue"))
+            return (None, None)
+
+        # ── ReturnStmt → func_exit ───────────────────────────────────
+        if kind == "ReturnStmt":
+            # Walk children with continuation = func_exit_sid.
+            e_ret = None
+            x_ret = None
+            for child in inner:
+                e, x = self._cfg_walk(child, self._func_exit_sid, "fall")
+                if e is not None and e_ret is None:
+                    e_ret = e
+                if x is not None:
+                    x_ret = x
+            return (e_ret, x_ret or e_ret)
+
+        # ── CaseStmt / DefaultStmt — walk children ──────────────────
+        if kind in ("CaseStmt", "DefaultStmt"):
+            # Pass A: walk all children sequentially (like CompoundStmt).
+            next_k = k_sid
+            entries_exits = []
+            for child in reversed(inner):
+                e, x = self._cfg_walk(child, next_k, k_kind)
+                entries_exits.insert(0, (e, x))
+                if e is not None:
+                    next_k = e
+            first_entry = None
+            last_exit = None
+            for e, x in entries_exits:
+                if e is not None and first_entry is None:
+                    first_entry = e
+                if x is not None:
+                    last_exit = x
+
+            # Pass B: resolve pending branches (Fix 2).
+            preds = [None] * len(inner)
+            pred = None
+            for i in range(len(inner)):
+                preds[i] = pred
+                if entries_exits[i][1] is not None:
+                    pred = entries_exits[i][1]
+            for i in range(len(inner)):
+                nid = id(inner[i])
+                if nid in self._pending_branches:
+                    dispatch = preds[i] if preds[i] is not None else self._func_entry_sid
+                    for (tgt, knd) in self._pending_branches[nid]:
+                        if tgt is not None:
+                            self._cfg_edges.add((dispatch, tgt, knd))
+                    del self._pending_branches[nid]
+
+            return (first_entry, last_exit)
+
+        # ── GotoStmt — document, emit no edges ──────────────────────
+        if kind == "GotoStmt":
+            return (None, None)
+
+        # ── DeclStmt — walk children (contains VarDecl) ─────────────
+        if kind == "DeclStmt":
+            # Pass A: right-to-left walk threading continuation.
+            next_k = k_sid
+            entries_exits = []
+            for child in reversed(inner):
+                e, x = self._cfg_walk(child, next_k, k_kind)
+                entries_exits.insert(0, (e, x))
+                if e is not None:
+                    next_k = e
+            first_entry = None
+            last_exit = None
+            for e, x in entries_exits:
+                if e is not None and first_entry is None:
+                    first_entry = e
+                if x is not None:
+                    last_exit = x
+
+            # Pass B: resolve pending branches (Fix 2).
+            preds = [None] * len(inner)
+            pred = None
+            for i in range(len(inner)):
+                preds[i] = pred
+                if entries_exits[i][1] is not None:
+                    pred = entries_exits[i][1]
+            for i in range(len(inner)):
+                nid = id(inner[i])
+                if nid in self._pending_branches:
+                    dispatch = preds[i] if preds[i] is not None else self._func_entry_sid
+                    for (tgt, knd) in self._pending_branches[nid]:
+                        if tgt is not None:
+                            self._cfg_edges.add((dispatch, tgt, knd))
+                    del self._pending_branches[nid]
+
+            return (first_entry, last_exit)
+
+        # ── All other nodes — recurse into children ─────────────────
+        # (LabelStmt, NullStmt, AttributedStmt, expression nodes, etc.)
+        # Pass A: right-to-left walk threading continuation.
+        next_k = k_sid
+        entries_exits = []
+        kids = [c for c in inner if isinstance(c, dict)]
+        for child in reversed(kids):
+            e, x = self._cfg_walk(child, next_k, k_kind)
+            entries_exits.insert(0, (e, x))
+            if e is not None:
+                next_k = e
+        first_entry = None
+        last_exit = None
+        for e, x in entries_exits:
+            if e is not None and first_entry is None:
+                first_entry = e
+            if x is not None:
+                last_exit = x
+
+        # Pass B: resolve pending branches (Fix 2).
+        preds = [None] * len(kids)
+        pred = None
+        for i in range(len(kids)):
+            preds[i] = pred
+            if entries_exits[i][1] is not None:
+                pred = entries_exits[i][1]
+        for i in range(len(kids)):
+            nid = id(kids[i])
+            if nid in self._pending_branches:
+                dispatch = preds[i] if preds[i] is not None else self._func_entry_sid
+                for (tgt, knd) in self._pending_branches[nid]:
+                    if tgt is not None:
+                        self._cfg_edges.add((dispatch, tgt, knd))
+                del self._pending_branches[nid]
+
+        # Phase 7 (Fix 1): Container-sid logic.
+        sid = self._sid_of_node.get(id(node))
+        if sid is not None:
+            if first_entry is not None:
+                # Container with nested sids (BinaryOperator= / VarDecl-init
+                # around a CallExpr).  Chain sid -> first inner sid -> ... -> k_sid.
+                self._cfg_edges.add((sid, first_entry, "fall"))
+                return (sid, last_exit)
+            # True leaf (no sid-bearing descendants).
+            if k_sid is not None:
+                self._cfg_edges.add((sid, k_sid, k_kind))
+            return (sid, sid)
+
+        return (first_entry, last_exit)
 
 
 # ── Self-test: hardcoded AST (Phase 2 update) ─────────────────────────
@@ -1483,9 +2015,9 @@ def run_self_test(writer):
     visitor = AstVisitor(writer)
     visitor.visit(SELF_TEST_AST)
 
-    # ── Skeleton rows ──────────────────────────────────────────────
-    # cfg_edge: still skeleton (Phase 2 uses next_stmt instead).
-    writer.write("cfg_edge",    ["val_lambda", "0", "1", "fall"])
+    # ── Phase 7: cfg_edge rows are now emitted by _build_cfg ─────────
+    # (The skeleton write was removed; the real CFG edges are produced
+    # during _visit_function → _build_cfg, same as real extraction.)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────

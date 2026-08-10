@@ -52,6 +52,7 @@ selftest:
 	python3 tests/test_phase3.py -v
 	python3 tests/test_phase5.py -v
 	python3 tests/test_phase6.py -v
+	python3 tests/test_phase7.py -v
 
 # ── Clean ────────────────────────────────────────────────────────────
 

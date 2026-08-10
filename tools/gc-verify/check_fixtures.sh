@@ -79,6 +79,11 @@ run_fixture push_pop_balance_unmatched     yes push_pop_balance   # push never p
 run_fixture push_pop_balance_pop_no_push   yes push_pop_balance   # pop without push → fires
 run_fixture push_pop_balanced              no  push_pop_balance   # push+pop balanced → clean
 
+# Phase 7: real CFG branch precision + param_rooted suppression fixtures.
+run_fixture root_miss_branch        no  root_miss            # branch divergence → clean
+run_fixture must_rooted_join        yes root_miss            # pushed one branch → fires
+run_fixture root_miss_param_rooted  no  root_miss            # caller-rooted param → clean
+
 if [ "$fail" -eq 0 ]; then
     echo "check_fixtures: ALL PASS"
 else
