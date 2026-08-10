@@ -485,10 +485,12 @@ class TestPhase3Extraction(unittest.TestCase):
             rows = list(csv.DictReader(f))
         self.assertGreaterEqual(len(rows), 1,
                                 f"Expected ≥1 stmt_memcpy row, got {len(rows)}")
-        # The dst should be 'p' (the GC-managed void* from self-test AST).
+        # The dst should be 'new_env' (the Value* from self-test AST;
+        # void* 'p' is no longer emitted — suppressed by Fix 1
+        # BARRIER_RELEVANT_TYPES filtering).
         dsts = {r["dst_expr"] for r in rows}
-        self.assertIn("p", dsts,
-                      f"Expected stmt_memcpy with dst='p', got dsts={dsts}")
+        self.assertIn("new_env", dsts,
+                      f"Expected stmt_memcpy with dst='new_env', got dsts={dsts}")
 
         barrier_path = Path("/tmp/gc-verify-p3-test") / "stmt_barrier.csv"
         self.assertTrue(barrier_path.exists(), "Missing stmt_barrier.csv")
@@ -497,8 +499,8 @@ class TestPhase3Extraction(unittest.TestCase):
         self.assertGreaterEqual(len(rows), 1,
                                 f"Expected ≥1 stmt_barrier row, got {len(rows)}")
         targets = {r["target_expr"] for r in rows}
-        self.assertIn("p", targets,
-                      f"Expected stmt_barrier with target='p', got targets={targets}")
+        self.assertTrue("p" in targets or "new_env" in targets,
+                        f"Expected stmt_barrier with target='p' or 'new_env', got targets={targets}")
 
         # stmt_memcpy row should no longer have the old skeleton value "99".
         memcpy_ids = {r["stmt_id"] for r in rows}

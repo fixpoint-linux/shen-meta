@@ -59,6 +59,13 @@ run_fixture memcpy_unbarriered yes memcpy_unbarriered
 run_fixture memcpy_barriered  no  memcpy_unbarriered
 run_fixture memcpy_charbuf    no  memcpy_unbarriered
 
+# Phase 5: calibration fixtures.
+run_fixture memcpy_instr_array           no  memcpy_unbarriered   # Fix 1: Instr* dst filtered
+run_fixture memcpy_fresh_target          no  memcpy_unbarriered   # barrier_covers_alloc negative control
+run_fixture root_miss_cross_case         no  root_miss            # Fix 3b: case-scoped next_stmt
+run_fixture root_miss_own_defining_alloc no  root_miss            # Fix 3a: defining_alloc suppresses
+run_fixture root_miss_straight_line      yes root_miss            # positive control: still fires
+
 if [ "$fail" -eq 0 ]; then
     echo "check_fixtures: ALL PASS"
 else

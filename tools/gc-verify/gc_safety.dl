@@ -55,6 +55,11 @@
 .decl gc_def(f:symbol, stmt_id:number, v:symbol)
 .input gc_def(IO=file, delimiter=",", headers=true, filename="facts/gc_def.csv")
 
+// ── Phase 5 new input relations ───────────────────────────────────────
+
+.decl defining_alloc(f:symbol, var:symbol, stmt_id:number)
+.input defining_alloc(IO=file, delimiter=",", headers=true, filename="facts/defining_alloc.csv")
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // STRATUM 1 — may_collect transitive closure
@@ -166,7 +171,8 @@ root_miss(f, s, v) :-
     stmt_allocs(f, s, _),
     var_decl(f, v, _, 1),       // is_gc_managed = 1
     live_at(f, v, s),
-    !must_rooted(f, v, s).
+    !must_rooted(f, v, s),
+    !defining_alloc(f, v, s).
 
 // Note: may_collect(_) guard omitted from body because stmt_allocs
 // already contains only known may-collect seeds (the extractor filters

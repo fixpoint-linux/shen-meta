@@ -53,6 +53,15 @@ MAY_COLLECT_SEEDS = {
     "collect", "collect_nursery", "gcalloc_internal",
 }
 
+# Phase 5: barrier-relevant types — only Value*/ValueArray* dst needs a write
+# barrier.  Instr*/CallFrame* arrays are GC-tag-traced, never barriered.
+# NOTE: void* is intentionally excluded — for void* locals whose type is
+# resolved via the RETURNS_GC_POINTER heuristic (e.g. void *p = gc_alloc(...)),
+# the real GC type is unknown at extract time.  This is a future calibration
+# gap: if a void* actually holds a Value* and is memcpy'd without a barrier,
+# the verifier will NOT flag it.  In practice the real VM has no such pattern.
+BARRIER_RELEVANT_TYPES = {"Value*", "ValueArray*"}
+
 # Phase 3: function names for memcpy/barrier detection.
 MEMCPY_FN = "memcpy"
 BARRIER_FN = "gc_dirty_vectors_add"
@@ -169,6 +178,8 @@ CSV_SCHEMAS = {
     "next_stmt":    ["f", "from", "to"],
     "gc_use":       ["f", "stmt_id", "v"],
     "gc_def":       ["f", "stmt_id", "v"],
+    # Phase 5 additions:
+    "defining_alloc": ["f", "var", "stmt_id"],
 }
 
 
@@ -242,11 +253,19 @@ class AstVisitor:
         self._stmt_ids = []            # Phase 2: ordered stmt_ids for next_stmt
         self._gc_locals = set()        # names of GC-managed locals in current fn
         self._call_graph_edges = set() # (caller, callee) for dedup
+        # Phase 5 additions:
+        self._gc_local_types = {}      # name -> normalized type (Fix 1)
+        self._alloc_defined_var = {}   # (f, var) -> sid_alloc (Fix 2 + 3a)
+        self._seed_alloc_sids = {}     # f -> list of stmt_allocs sids (Fix 2)
+        self._current_bb = 0           # current basic-block id (Fix 3b)
+        self._stmt_bb = {}             # sid -> bb_id (Fix 3b)
+        self._defining_var = None      # (f, var) or None (Fix 3a context)
 
     def _next_stmt_id(self):
         sid = self._stmt_counter
         self._stmt_counter += 1
         self._stmt_ids.append(sid)
+        self._stmt_bb[sid] = self._current_bb
         return sid
 
     # ── Top-level walk ────────────────────────────────────────────
@@ -305,6 +324,10 @@ class AstVisitor:
         self._stmt_ids = []
         self._gc_locals = set()
         self._call_graph_edges = set()
+        self._current_bb = 0
+        self._stmt_bb = {}
+        self._defining_var = None
+        self._seed_alloc_sids[name] = []
 
         # Emit function fact.
         self.writer.write("function", [name])
@@ -316,13 +339,26 @@ class AstVisitor:
         # Full recursive walk of the function body.
         self._walk_body(name, body)
 
-        # ── Phase 2: emit next_stmt intra-BB edges ──
-        # Connect consecutive stmt_ids in the order they were assigned
-        # (depth-first AST walk ≈ source order for straight-line code).
+        # ── Phase 5: next_stmt intra-BB edges (CaseStmt-scoped) ──
+        # Fix 3b: next_stmt edges only connect stmt_ids within the same
+        # basic block.  CaseStmt/DefaultStmt boundaries increment the BB
+        # counter, so variables used in one case are NOT live across
+        # an alloc in another case.  This is an under-approximation
+        # (drops cross-case sequencing + loop-back edges) — safe for
+        # root_miss (fewer live facts ⇒ no new FPs).  Historical root-miss
+        # bugs are intra-case straight-line, so they are still caught.
         for i in range(len(self._stmt_ids) - 1):
-            self.writer.write("next_stmt",
-                              [name, str(self._stmt_ids[i]),
-                               str(self._stmt_ids[i + 1])])
+            a, b = self._stmt_ids[i], self._stmt_ids[i + 1]
+            if self._stmt_bb.get(a) == self._stmt_bb.get(b):
+                self.writer.write("next_stmt",
+                                  [name, str(a), str(b)])
+
+        # ── Phase 5: defining_alloc (Fix 3a) ──
+        # At the stmt_allocs call that CREATES v (v's own allocating
+        # initializer), v holds no pre-existing pointer → no root_miss.
+        for (f, var), sid_alloc in self._alloc_defined_var.items():
+            if f == name:
+                self.writer.write("defining_alloc", [f, var, str(sid_alloc)])
 
         # Reset per-function state.
         self._current_function = None
@@ -357,19 +393,52 @@ class AstVisitor:
         # ── VarDecl → var_decl + (if initialized) gc_def ──
         elif kind == "VarDecl":
             self._emit_var_decl(func_name, node)
-            # A VarDecl with an initializer DEFINES the variable here, so
-            # liveness must be killed at this point (not propagated backward
-            # across an earlier alloc).  Without this, a var used later
-            # appears spuriously live before its definition → false
-            # root_miss.  Emit gc_def for the declared var, then recurse
-            # into the initializer to catch gc_use of OTHER vars it reads.
-            if node.get("init") and self._gc_locals:
-                vname = node.get("name", "")
-                if vname and vname in self._gc_locals:
-                    sid = self._next_stmt_id()
-                    self.writer.write("gc_def",
-                                      [func_name, str(sid), vname])
-                    self._walk_body(func_name, node["init"], current_sid=sid)
+            vname = node.get("name", "")
+            # Some clang versions put the initializer in the "init" key as a
+            # dict; others store it as a child of "inner".  Defensively, only
+            # trust "init" when it is a real dict (clang 22 on this host emits
+            # a junk string there and the real init is in inner[0]).
+            node_init = node.get("init")
+            if not isinstance(node_init, dict):
+                node_init = self._find_init_in_inner(node)
+            has_init = node_init is not None
+            init_callee = self._extract_init_callee(node_init) if has_init else ""
+            init_in_key = isinstance(node.get("init"), dict)
+            if has_init and vname and vname in self._gc_locals:
+                sid = self._next_stmt_id()
+                self.writer.write("gc_def",
+                                  [func_name, str(sid), vname])
+                if init_in_key:
+                    # Init is in "init" key — walk it
+                    # explicitly (it is NOT in "inner", so no double-walk
+                    # from the general recursion below).
+                    if init_callee in MAY_COLLECT_SEEDS:
+                        old_defining = self._defining_var
+                        self._defining_var = (func_name, vname)
+                        self._walk_body(func_name, node_init,
+                                        current_sid=sid)
+                        self._defining_var = old_defining
+                    else:
+                        self._walk_body(func_name, node_init,
+                                        current_sid=sid)
+                elif init_callee in MAY_COLLECT_SEEDS:
+                    # Init is in "inner" — thread _defining_var so the
+                    # general recursion records it in _handle_call_expr.
+                    # No explicit walk (avoids double-walk of the same
+                    # children that the general recursion will visit).
+                    self._defining_var = (func_name, vname)
+                else:
+                    # Inner-style non-seed init (e.g. `Value result = v;`).
+                    # The general recursion below walks inner children but
+                    # with the ENCLOSING current_sid (None at top level), so
+                    # the init's DeclRefExprs would not get a gc_use at this
+                    # VarDecl's sid.  Walk the init explicitly with our sid
+                    # so `v` in `Value result = v` becomes live here.
+                    # Guard: only if the init has NO CallExpr (a call would
+                    # be double-stmt_id'd by the general recursion below).
+                    if init_callee == "":
+                        self._walk_body(func_name, node_init, current_sid=sid)
+            # Fall through to general recursion for inner children.
 
         # ── BinaryOperator = → field_assign + gc_def ──
         elif kind == "BinaryOperator":
@@ -417,9 +486,22 @@ class AstVisitor:
                        "ExprWithCleanups"):
             pass  # expressions — just recurse into children
 
+        # ── Fix 3b: SwitchStmt — recurse normally; CaseStmt/DefaultStmt
+        # children handle BB scoping themselves.
+        elif kind == "SwitchStmt":
+            pass  # fall through to general recursion
+
+        # ── Fix 3b: CaseStmt / DefaultStmt — each case is its own BB.
+        # next_stmt edges do NOT cross case boundaries (conservative
+        # under-approximation: drops cross-case sequencing + loop-back).
+        elif kind in ("CaseStmt", "DefaultStmt"):
+            self._current_bb += 1
+            for child in node.get("inner", []):
+                self._walk_body(func_name, child, current_sid=current_sid)
+            return
+
         # ── Statement nodes (control flow, labels, etc.) ──
         elif kind in ("IfStmt", "WhileStmt", "ForStmt", "DoStmt",
-                       "SwitchStmt", "CaseStmt", "DefaultStmt",
                        "ReturnStmt", "LabelStmt", "GotoStmt",
                        "BreakStmt", "ContinueStmt", "NullStmt",
                        "IndirectGotoStmt", "CompoundStmt",
@@ -464,6 +546,17 @@ class AstVisitor:
         # by Soufflé.
         if callee in MAY_COLLECT_SEEDS:
             self.writer.write("stmt_allocs", [func_name, str(sid), callee])
+            # Fix 2: track all alloc sids for fresh_target intervening check.
+            self._seed_alloc_sids.setdefault(func_name, []).append(sid)
+            # Fix 3a: if this alloc is inside a VarDecl initializer for a
+            # GC-managed var, record the (fn, var) -> sid_alloc mapping.
+            # Clear _defining_var so only the very first alloc in the
+            # initializer is recorded (the defining alloc).
+            if self._defining_var is not None:
+                dv_fn, dv_var = self._defining_var
+                if dv_fn == func_name:
+                    self._alloc_defined_var[(func_name, dv_var)] = sid
+                    self._defining_var = None
 
     # ── Phase 2: GC root API detection ────────────────────────────
 
@@ -503,13 +596,22 @@ class AstVisitor:
     def _handle_memcpy_call(self, func_name, sid, node):
         """Extract stmt_memcpy fact from a memcpy(dst, src, nbytes) call.
 
-        Only emits a fact if dst is a GC-managed local (via _gc_locals).
+        Only emits a fact if dst is a GC-managed local (via _gc_locals)
+        AND the dst type is barrier-relevant (Value* or ValueArray*).
+        Instr*/CallFrame* arrays are GC-tag-traced, never barriered.
         """
         args = self._call_args(node)
         if len(args) < 3:
             return
         dst_var = self._extract_var_from_arg(args[0])
         if not dst_var or dst_var not in self._gc_locals:
+            return
+        # Fix 1: only barrier-relevant types need stmt_memcpy tracking.
+        # Normalize both sides by stripping whitespace: real clang emits
+        # "Value *", the hand-crafted self-test AST uses "Value*" (via
+        # "struct Value *" -> _normalize_type -> "Value*").
+        if (self._gc_local_types.get(dst_var) or "").replace(" ", "") \
+                not in BARRIER_RELEVANT_TYPES:
             return
         src_var = self._extract_var_from_arg(args[1])
         nbytes_text = self._extract_literal_or_text(args[2])
@@ -714,12 +816,13 @@ class AstVisitor:
         if not is_gc:
             norm = _normalize_type(qual_type)
             if norm == "void*":
-                init_callee = self._extract_var_init_callee(node)
-                if init_callee in RETURNS_GC_POINTER:
+                node_init = node.get("init") or self._find_init_in_inner(node)
+                if self._extract_init_callee(node_init) in RETURNS_GC_POINTER:
                     is_gc = 1
 
         if is_gc:
             self._gc_locals.add(vname)
+            self._gc_local_types[vname] = vtype
 
         self.writer.write("var_decl", [func_name, vname, vtype, str(is_gc)])
 
@@ -739,6 +842,37 @@ class AstVisitor:
                 for gc in child.get("inner", []):
                     if isinstance(gc, dict) and gc.get("kind") == "CallExpr":
                         return self._extract_callee(gc)
+        return ""
+
+    def _find_init_in_inner(self, var_decl_node):
+        """Find an init expression stored as a child in 'inner' (vs 'init' key).
+
+        Real clang 22 stores VarDecl initializers in the "init" key, but
+        hand-crafted ASTs (self-test) and older clang versions put them as
+        children of "inner".  Skips TypeLoc, NestedNameSpecifier, and
+        ParmVarDecl children that are type metadata, not expressions.
+        """
+        TYPE_META_KINDS = {"TypeLoc", "NestedNameSpecifier", "ParmVarDecl"}
+        for child in var_decl_node.get("inner", []):
+            if isinstance(child, dict) and child.get("kind", "") not in TYPE_META_KINDS:
+                return child
+        return None
+
+    def _extract_init_callee(self, init_node):
+        """Extract callee name from an init expression (handles cast wrapping).
+
+        Returns the callee function name if the init is (or wraps) a CallExpr,
+        or the empty string if the init is a DeclRefExpr, literal, etc.
+        """
+        if not isinstance(init_node, dict):
+            return ""
+        if init_node.get("kind") == "CallExpr":
+            return self._extract_callee(init_node)
+        for child in init_node.get("inner", []):
+            if isinstance(child, dict):
+                r = self._extract_init_callee(child)
+                if r:
+                    return r
         return ""
 
     # ── Field assignment helpers ──────────────────────────────────
@@ -909,6 +1043,94 @@ SELF_TEST_AST = {
                                         }
                                     ],
                                 }
+                            ],
+                        },
+                        # ── Phase 5: Value *new_env = gc_alloc(...) ──
+                        # Barrier-relevant type → memcpy into it WILL emit
+                        # stmt_memcpy.  Also exercises defining_alloc +
+                        # fresh_target (no intervening alloc before memcpy).
+                        {
+                            "kind": "DeclStmt",
+                            "inner": [
+                                {
+                                    "kind": "VarDecl",
+                                    "name": "new_env",
+                                    "type": {"qualType": "struct Value *"},
+                                    "inner": [
+                                        {
+                                            "kind": "ImplicitCastExpr",
+                                            "inner": [
+                                                {
+                                                    "kind": "CallExpr",
+                                                    "inner": [
+                                                        {
+                                                            "kind": "ImplicitCastExpr",
+                                                            "inner": [
+                                                                {
+                                                                    "kind": "DeclRefExpr",
+                                                                    "referencedDecl": {
+                                                                        "name": "gc_alloc",
+                                                                    },
+                                                                }
+                                                            ],
+                                                        }
+                                                    ],
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                        # ── memcpy(new_env, env, 16) ──
+                        # (immediately after defining alloc → fresh_target)
+                        {
+                            "kind": "CallExpr",
+                            "inner": [
+                                {
+                                    "kind": "ImplicitCastExpr",
+                                    "inner": [
+                                        {
+                                            "kind": "DeclRefExpr",
+                                            "referencedDecl": {
+                                                "name": "memcpy",
+                                            },
+                                        }
+                                    ],
+                                },
+                                {
+                                    "kind": "DeclRefExpr",
+                                    "referencedDecl": {"name": "new_env"},
+                                },
+                                {
+                                    "kind": "DeclRefExpr",
+                                    "referencedDecl": {"name": "env"},
+                                },
+                                {
+                                    "kind": "IntegerLiteral",
+                                    "value": "16",
+                                },
+                            ],
+                        },
+                        # ── gc_dirty_vectors_add(new_env) → stmt_barrier ──
+                        {
+                            "kind": "CallExpr",
+                            "inner": [
+                                {
+                                    "kind": "ImplicitCastExpr",
+                                    "inner": [
+                                        {
+                                            "kind": "DeclRefExpr",
+                                            "referencedDecl": {
+                                                "name": "gc_dirty_vectors_add",
+                                            },
+                                        }
+                                    ],
+                                },
+                                {
+                                    "kind": "DeclRefExpr",
+                                    "referencedDecl": {"name": "new_env"},
+                                },
                             ],
                         },
                         # ── memset call ──
@@ -1214,6 +1436,9 @@ def run_self_test(writer):
 
     Phase 3: stmt_memcpy and stmt_barrier are now extracted from real
     CallExpr nodes in the self-test AST.
+    Phase 5: defining_alloc + fresh_target emitted for Value* vars with
+    alloc initializers (new_env).  The void* p memcpy is suppressed by
+    BARRIER_RELEVANT_TYPES filtering (Fix 1).
     """
     visitor = AstVisitor(writer)
     visitor.visit(SELF_TEST_AST)

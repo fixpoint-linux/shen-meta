@@ -78,6 +78,7 @@ and non-Value GC types).  All rows have been hand-reviewed.
 | Collector invariant bugs | ❌ | a bug in the GC, not mutator discipline; runtime tools (`--gc-verify-codechains`) only |
 | Data flows through non-GC types (`char*` etc.) | ❌ | hand-curated type table is the contract |
 | `void*` returns from `gc_alloc*` | ⚠️ | mitigated via `returns_gc_pointer` set |
+| `fresh_target` heuristic (REJECTED) | ❌ | unsound: multi-page `gc_alloc` routes to old-gen, so fresh ≠ nursery-safe. Dropped in Phase 5 revision. |
 
 ## Environment
 

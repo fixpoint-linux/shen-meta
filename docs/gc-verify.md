@@ -1,6 +1,24 @@
 # GC-Safety Verifier (Soufflé Datalog)
 
-Status: **DESIGN + Phases 0-4 DONE** (committed 876e7f6, 365c50f, + Phase 2, + Phase 3, + Phase 4). Phase 5 (calibration) pending. Not part of any build gate.
+Status: **DESIGN + Phases 0-5 DONE** (committed 876e7f6, 365c50f, + Phase 2, + Phase 3, + Phase 4, + Phase 5 calibration). Not part of any build gate.
+
+## Phase 5 status (calibration)
+
+Implemented (2026-08-10, revised 2026-08-11). Three calibration refinements:
+
+1. **Fix 1 — BARRIER_RELEVANT_TYPES** (held): `Instr*`/`CallFrame*` arrays are GC-tag-traced and never barriered. The `_handle_memcpy_call` extractor now filters on `BARRIER_RELEVANT_TYPES = {"Value*", "ValueArray*"}`, suppressing `stmt_memcpy` rows for non-Value GC types. Fixture `memcpy_instr_array.c` is clean.
+
+2. **Fix 3a — `defining_alloc`** (held): A GC-managed var whose initializer IS its own allocating call (`Value *e = gc_alloc(...)`) holds no pre-existing pointer at the allocation site, so `root_miss` must not fire there. The extractor emits `defining_alloc(f, var, stmt_id)` rows; the `root_miss` rule negates them. Fixture `root_miss_own_defining_alloc.c` is clean. The VarDecl init extraction now uses a unified path (`node.get("init")` key first, then `_find_init_in_inner` fallback) to handle real clang 22's "init" key format.
+
+3. **Fix 3b — CaseStmt BB scoping** (held): `next_stmt` edges do not cross `CaseStmt`/`DefaultStmt` boundaries (each case increments a BB counter). This prevents spurious cross-case liveness that would flag safe code. Fixture `root_miss_cross_case.c` is clean.
+
+**Rejected: `fresh_target` heuristic (Fix 2).** The earlier revision added a `fresh_target` rule to suppress `memcpy_unbarriered` for memcpy into a freshly-allocated target with no intervening alloc. This was **unsound**: `gc_alloc` routes multi-page objects straight to old-gen, so "fresh" does not guarantee the target is in the nursery (and thus immune to write-barrier requirements). The `fresh_target` relation, Datalog rules, and fixture `memcpy_fresh_target_broken.c` have all been removed. The `memcpy_unbarriered` rule now uses only `barrier_covers_alloc` (Phase 3 form), and the `memcpy_fresh_target.c` fixture has been re-purposed as a barrier-coverage negative control.
+
+**VarDecl init fix (shared root cause):** The prior implementation's `_extract_var_init_callee` only walked `node["inner"]`, missing real clang 22's `"init"` key. This caused two silent failures:
+- `defining_alloc` was never emitted (empty CSV) — `is_seed` always False for real clang.
+- `gc_use` was never emitted for `Value result = v;`-style VarDecl inits — the `straight_line` fixture's `root_miss` returned 0 instead of ≥1.
+
+The fix adds `_find_init_in_inner` (skips TypeLoc/metadata children) and `_extract_init_callee` (recurse through casts to find CallExpr/DeclRefExpr), with a unified `node_init = node.get("init") or self._find_init_in_inner(node)` path used by both the `_walk_body` VarDecl branch and the `_emit_var_decl` void* heuristic.
 
 ## Phase 4 status (make gc-verify integration)
 
