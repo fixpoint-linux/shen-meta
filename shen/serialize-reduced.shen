@@ -42,6 +42,17 @@
 (shen-load "shen/shen-kl-helpers.shen")
 (shen-load "shen/shen->kl.shen")
 
+\* === HM type checker (safe-subset; all compile through shen->kl) ===
+   Runtime init + driver live in tc-hm-runtime.shen because top-level
+   (set ...) forms in the stage files are skipped by shen-load. *\
+(shen-load "shen/tc-hm-types.shen")
+(shen-load "shen/tc-hm-w.shen")
+(shen-load "shen/tc-hm-prims.shen")
+(shen-load "shen/tc-hm-patterns.shen")
+(shen-load "shen/tc-hm-sig.shen")
+(shen-load "shen/tc-hm.shen")
+(shen-load "shen/tc-hm-runtime.shen")
+
 \* === Safe-wrapper aliases: point short names to our-compiled safe.N closures ===
    serialize.shen (full bundle) relies on interp.shen's set-toplevel calls for
    these toplevel aliases.  Here we OVERWRITE them with our full-arity compiled
