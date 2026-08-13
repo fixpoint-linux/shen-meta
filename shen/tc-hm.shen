@@ -351,5 +351,5 @@
 (define print-tc-results
   { (list tc-result) --> string }
   [] -> ""
-  [R] -> (print-tc-result R)
+  [R] -> (cn (print-tc-result R) (n->string 10))
   [R | Rest] -> (cn (print-tc-result R) (cn (n->string 10) (print-tc-results Rest))))

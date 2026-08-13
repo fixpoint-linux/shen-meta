@@ -45,11 +45,16 @@
 
 (set tc-counter 0)
 
+\* Fresh tvars use NEGATIVE ids (-1, -2, ...) so they can never collide
+   with sig-parser tvars (tc-sig-tvar, ids 0, 1, 2, ... reset per sig).
+   A collision (e.g. tc-fresh-subs-for binding sig-tvar 0 to fresh
+   [tvar 0]) creates the self-referential substitution [[0 [tvar 0]]],
+   which makes tc-apply-subst / tc-walk loop forever. *\
 (define tc-fresh-tvar
-  { --> type }
-  -> (let N (%% value tc-counter)
-       (do (%% set tc-counter (+ N 1))
-           [tvar N])))
+  { symbol --> type }
+  _ -> (let N (%% value tc-counter)
+         (do (%% set tc-counter (+ N 1))
+             [tvar (- 0 (+ N 1))])))
 
 \* ===== Type tag dispatch ===== *\
 
@@ -70,6 +75,10 @@
 
 (define tc-tvar-id
   { type --> number }
+  \* NB: the -1 sentinel now COLLIDES with the negative fresh-tvar id space
+     (-1 is the first fresh tvar id).  Safe ONLY because every caller guards
+     with (tc-type-tag T) = tvar first; do not rely on -1 as an out-of-band
+     'not a tvar' marker (use tc-type-tag instead). *\
   T -> (if (and (cons? T) (= (hd T) (intern "tvar")))
            (hd (tl T))
            -1))

@@ -3061,6 +3061,51 @@ int main(int argc, char **argv) {
                 }
                 return 0;
             }
+            /* --tc-hm-self: run the bundled HM type checker on its own 7 source files */
+            if (ai < argc && strcmp(argv[ai], "--tc-hm-self") == 0) {
+                printf("=== HM Type Checker (self-check) ===\n");
+                fflush(stdout);
+
+                Value driver = defun_get("run-tc-hm-self");
+                if (driver.tag != VAL_LAMBDA) {
+                    fprintf(stderr, "--tc-hm-self: run-tc-hm-self not found in bundle (tag=%d)\n", driver.tag);
+                    return 1;
+                }
+                gc_root_push_value(&driver);
+                Value *env_driver = GC_VALUE_ARRAY(driver.lambda.env_len + 1);
+                if (driver.lambda.env_len > 0)
+                    memcpy(env_driver, driver.lambda.env, driver.lambda.env_len * sizeof(Value));
+                env_driver[driver.lambda.env_len] = val_number(0);
+                gc_root_pop();
+
+                CatchFrame cf;
+                cf.parent = vm_catch_chain;
+                cf.in_trap_error = 0;
+                vm_catch_chain = &cf;
+                volatile size_t driver_wm = gc_root_watermark();
+                Value result;
+                int errored = 0;
+                if (setjmp(cf.buf) == 0) {
+                    result = vm_exec_env(driver.lambda.code, driver.lambda.code_len,
+                                         env_driver, driver.lambda.env_len + 1);
+                } else {
+                    errored = 1;
+                    result = cf.error_val;
+                }
+                vm_catch_chain = cf.parent;
+                gc_root_pop_to(driver_wm);
+                if (errored) {
+                    printf("ERROR: ");
+                    print_value(result);
+                    printf("\n");
+                } else if (result.tag == VAL_STRING) {
+                    fwrite(result.str.data, 1, result.str.len, stdout);
+                    printf("\n");
+                } else {
+                    printf("result tag=%d\n", (int)result.tag);
+                }
+                return 0;
+            }
             /* --repl: run the interactive Shen REPL */
             if (ai < argc && strcmp(argv[ai], "--repl") == 0) {
                 printf("=== Shen REPL ===\n");
@@ -3137,7 +3182,7 @@ int main(int argc, char **argv) {
                     free(b2);
                 }
             } else {
-                printf("Usage: %s <bundle> [--repl | --meta-repl | --tc-hm | -d <name> | --trace <name>]\n",
+                printf("Usage: %s <bundle> [--repl | --meta-repl | --tc-hm | --tc-hm-self | -d <name> | --trace <name>]\n",
                        argv[0]);
             }
         } else {
@@ -3148,7 +3193,7 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    printf("Usage: zincvm <bundle.csexp | bytecode.csexp> [--repl | --meta-repl | --tc-hm | -d <name> | --trace <name>]\n");
+    printf("Usage: zincvm <bundle.csexp | bytecode.csexp> [--repl | --meta-repl | --tc-hm | --tc-hm-self | -d <name> | --trace <name>]\n");
     return 0;
 }
 #endif

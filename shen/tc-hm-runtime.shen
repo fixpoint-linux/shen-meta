@@ -34,3 +34,25 @@
   { --> string }
   -> (do (tc-hm-init)
          (tc-all-results-str (tc-hm-all))))
+
+\* Nullary driver entry for C VM --tc-hm-self.  Runs the checker on its own
+   7 source files in dependency order (types -> w -> prims -> patterns ->
+   sig -> hm -> runtime), so tc-global-sig-table accumulates and cross-file
+   calls resolve.  Returns the full result string.
+
+   TRUST BOUNDARY: this proves the checker is SELF-CONSISTENT — each define's
+   body respects its declared sig under the checker's own rules.  It does NOT
+   prove the sigs are semantically correct (hand-written axioms), nor that the
+   checker's permissiveness (klambda-top, opaque-cons, fresh-tvar-for-cons) is
+   sound.  The sigs remain the trust root. *\
+(define run-tc-hm-self
+  { --> string }
+  -> (do (tc-hm-init)
+         (tc-all-results-str (tc-hm-files
+                               ["shen/tc-hm-types.shen"
+                                "shen/tc-hm-w.shen"
+                                "shen/tc-hm-prims.shen"
+                                "shen/tc-hm-patterns.shen"
+                                "shen/tc-hm-sig.shen"
+                                "shen/tc-hm.shen"
+                                "shen/tc-hm-runtime.shen"]))))

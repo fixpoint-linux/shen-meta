@@ -570,7 +570,7 @@
 \* ===== infer-app-two: unify argument type with domain, then recurse ===== *\
 
 (define tc-infer-app-two
-  { env --> type --> type --> (list expr) --> subst --> infer-result }
+  { env --> type --> type --> (list expr) --> subst --> (list subst type) --> infer-result }
   Env DomType RetType Args Sub1 PairArg ->
     (let Sub2 (hd PairArg)
       (let TypeArg (hd (tl PairArg))

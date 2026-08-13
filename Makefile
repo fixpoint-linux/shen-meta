@@ -1,4 +1,4 @@
-.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify
+.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -98,6 +98,16 @@ bundle-full: shen/serialize.shen
 
 run-bundle: zinctest globals.csexp
 	./zinctest globals.csexp
+
+# HM type checker targets.  tc-hm runs the checker on the 6 Group A source
+# files (existing 58-OK baseline).  tc-hm-self rebuilds the bundle (so the
+# run-tc-hm-self driver lands in globals.csexp) and runs the checker on its
+# own 7 tc-hm*.shen source files.
+tc-hm: zincvm globals.csexp
+	./zincvm globals.csexp --tc-hm
+
+tc-hm-self: zincvm bundle
+	./zincvm globals.csexp --tc-hm-self
 
 pipeline: zincvm
 	@$(SHEN) eval -e '(tc -)' \
