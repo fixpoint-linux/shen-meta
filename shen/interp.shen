@@ -41,7 +41,7 @@
   _ _       -> (simple-error "failed lookup"))
 
 (define interp-jmp { zinc-code --> symbol --> zinc-code }
-  [label L | C] L -> C
+  [label L | C] K -> C where (= K L)
   [C1 | C] L      -> (interp-jmp C L)
   _ _             -> (simple-error "failed jump"))
 

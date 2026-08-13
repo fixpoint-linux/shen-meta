@@ -5,7 +5,7 @@
   -> (gensym (protect V)))
 
 (define index_h { A --> (list A) --> number --> number }
-  X [X | Rest] C -> C
+  X [H | Rest] C -> C where (= X H)
   X [_ | Rest] C -> (index_h X Rest (+ 1 C))
   _ _ _          -> -1)
 
