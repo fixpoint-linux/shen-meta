@@ -24,3 +24,6 @@ tools/gc-verify/__pycache__/
 tools/bundle-verify/facts/
 tools/bundle-verify/out/
 tools/bundle-verify/__pycache__/
+# scratch / build artifacts
+zinctest-osload*
+.exec_test/
