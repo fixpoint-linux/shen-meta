@@ -262,8 +262,126 @@
               [fail "infer-let: malformed let"]))
         [fail "infer-let: malformed let"]))
 
+\* ===== Guard-driven type refinement (sound narrowing) =====
+   When an if-condition is a type-predicate guard (cons?/symbol?/number?/
+   string?/boolean?) applied to a variable X, the guard genuinely
+   establishes X's type in the THEN-branch.  We refine X's binding in
+   the env passed to the then-branch (and to the continuation of an
+   and), so a body like (if (cons? T) (let H (hd T) ...)) type-checks
+   even when T's declared sig is opaque (e.g. [con type]).
+
+   Soundness: the refinement is sound because the guard establishes the
+   type at runtime.  The refined env is threaded ONLY into the then/true
+   branch and the and-continuation — never into the else branch.  The
+   refinement PREPENDS a new [X RefinedType] binding to env, shadowing
+   any existing X binding via tc-assoc's first-match semantics; we never
+   widen or destroy the original binding.  The else branch and any code
+   after the if continue to see X's original (unrefined) type.
+
+   Refined types:
+     (cons? X)    -> [app list fresh]   (cons cells are list-shaped;
+                                          matches the hd/tl domain)
+     (symbol? X)  -> [con symbol]
+     (number? X)  -> [con number]
+     (string? X)  -> [con string]
+     (boolean? X) -> [con boolean]
+
+   Limitation (not a soundness issue): bodies that, after the guard,
+   pass X to a tc-accessor (tc-con-name, tc-arrow-dom, tc-forall-vars,
+   ...) whose sig expects the OPAQUE con form [con type] are not helped
+   — the refinement models X as a list, but the accessor models its arg
+   as the opaque type.  Reconciling these two views needs a richer type
+   system (Stage 8).  Such defines stay FAIL with a different reason
+   (con/list instead of the original con/list at the guard hd) — no
+   regression in the OK count.  Likewise bodies that pass an opaque arg
+   to tc-assoc (whose sig expects a list) are unaffected by this change. *\
+
+(define tc-guard-pred?
+  { symbol --> boolean }
+  P -> (if (= P (intern "cons?")) true
+       (if (= P (intern "symbol?")) true
+       (if (= P (intern "number?")) true
+       (if (= P (intern "string?")) true
+       (if (= P (intern "boolean?")) true
+           false))))))
+
+\* tc-guard-refined-type: map a guard predicate symbol to the type it
+   establishes.  Only called when (tc-guard-pred? P) is true; the
+   [con klambda] fallback keeps the function total. *\
+
+(define tc-guard-refined-type
+  { symbol --> type }
+  P -> (let Fresh (tc-fresh-tvar (intern ""))
+         (if (= P (intern "cons?")) [app list Fresh]
+         (if (= P (intern "symbol?")) [con symbol]
+         (if (= P (intern "number?")) [con number]
+         (if (= P (intern "string?")) [con string]
+         (if (= P (intern "boolean?")) [con boolean]
+             [con klambda])))))))
+
+\* tc-refine-env-for-atom-guard: if Expr is (PRED? X) for a recognized
+   guard predicate PRED? and a bare symbol X, prepend [X RefinedType]
+   to Env (shadowing any existing X binding).  Otherwise return Env
+   unchanged.  Only singleton-argument guards are refined —
+   (cons? (hd Y)) etc. are left alone (cannot refine a sub-expression). *\
+
+(define tc-refine-env-for-atom-guard
+  { env --> expr --> env }
+  Env Expr ->
+    (if (cons? Expr)
+        (let Hd (hd Expr)
+          (if (symbol? Hd)
+              (if (tc-guard-pred? Hd)
+                  (let Args (tl Expr)
+                    (if (cons? Args)
+                        (if (tc-empty? (tl Args))
+                            (let X (hd Args)
+                              (if (symbol? X)
+                                  (let RefinedType (tc-guard-refined-type Hd)
+                                    [[X RefinedType] | Env])
+                                  Env))
+                            Env)
+                        Env))
+                  Env)
+              Env))
+        Env))
+
+\* tc-refine-env-from-cond: walk a condition (a single guard or an
+   and-chain of guards) and accumulate refinements into Env.  Handles
+   (cons? X), (symbol? X), ..., and (and A B) recursively (nested ands
+   via recursion).  Returns Env — possibly extended with shadowing
+   refined bindings — for use in the then-branch of an if or the
+   continuation of an and.  Non-guard conditions and n-ary (>2) ands
+   return Env unchanged (no refinement; no regression). *\
+
+(define tc-refine-env-from-cond
+  { env --> expr --> env }
+  Env Cond ->
+    (if (cons? Cond)
+        (let Hd (hd Cond)
+          (if (symbol? Hd)
+              (if (= Hd (intern "and"))
+                  (let Rest (tl Cond)
+                    (if (cons? Rest)
+                        (if (cons? (tl Rest))
+                            (if (tc-empty? (tl (tl Rest)))
+                                (let A (hd Rest)
+                                  (let B (hd (tl Rest))
+                                    (tc-refine-env-from-cond
+                                      (tc-refine-env-from-cond Env A)
+                                      B)))
+                                Env)
+                            Env)
+                        Env))
+                  (tc-refine-env-for-atom-guard Env Cond))
+              Env))
+        Env))
+
 \* ===== If: (if C T E) =====
-   Dispatch via explicit head-symbol check (host-Shen compatible). *\
+   Dispatch via explicit head-symbol check (host-Shen compatible).
+   Guard refinement: the then-branch T is typed in an env refined by
+   the condition C (so (if (cons? X) ...) narrows X in T).  The
+   else-branch E uses the original, unrefined env. *\
 
 (define tc-infer-if
   { env --> expr --> subst --> infer-result }
@@ -286,7 +404,7 @@
                                             (let RC2 (tc-unify TypeC [con boolean] Sub1)
                                               (if (tc-ok? RC2)
                                                   (let Sub2 (tc-ok-subst RC2)
-                                                    (let RT (tc-infer Env T Sub2)
+                                                    (let RT (tc-infer (tc-refine-env-from-cond Env C) T Sub2)
                                                       (if (tc-ok? RT)
                                                           (let PairT (tc-ok-subst-type RT)
                                                             (let Sub3 (hd PairT)
@@ -334,7 +452,7 @@
                                     (let RU1 (tc-unify TypeA [con boolean] Sub1)
                                       (if (tc-ok? RU1)
                                           (let Sub2 (tc-ok-subst RU1)
-                                            (let RB (tc-infer Env B Sub2)
+                                            (let RB (tc-infer (tc-refine-env-from-cond Env A) B Sub2)
                                               (if (tc-ok? RB)
                                                   (let PairB (tc-ok-subst-type RB)
                                                     (let Sub3 (hd PairB)

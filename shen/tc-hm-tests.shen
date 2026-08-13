@@ -250,6 +250,55 @@
        (tc-infer [] [cons 1 []] [])))
 
 \* ================================================================
+   STAGE 2b TESTS — Guard-driven type refinement
+   (if (cons? X) ...) narrows X in the then-branch.
+   ================================================================ *\
+
+\* (cons? X) narrows X from opaque [con type] to [app list fresh] in
+   the then-branch, so (hd X) type-checks against hd's (list a) domain.
+   Without refinement this fails: [con type] vs [app list fresh]. *\
+
+(define test-w-12-cons-narrows-then
+  { --> (list symbol) }
+  -> (let R (tc-infer [[X [con type]]]
+                      [if (cons? X) (hd X) 0]
+                      [])
+       (tc-assert-ok "W: (if (cons? X) (hd X) 0) narrows X in then" R)))
+
+\* (symbol? X) narrows X to [con symbol] in the then-branch, so a
+   symbol-expecting primitive (value) accepts it.  Without refinement
+   this fails: [con type] vs [con symbol] at (value X). *\
+
+(define test-w-13-symbol-narrows-then
+  { --> (list symbol) }
+  -> (let R (tc-infer [[X [con type]]]
+                      [if (symbol? X) (value X) 0]
+                      [])
+       (tc-assert-ok "W: (if (symbol? X) (value X) 0) narrows X" R)))
+
+\* Soundness: the else-branch is NOT refined.  X keeps its opaque
+   [con type], so (+ X 1) fails (number expected).  This guards against
+   an unsound refinement that would leak into the else-branch. *\
+
+(define test-w-14-no-refine-in-else
+  { --> (list symbol) }
+  -> (tc-assert-fail "W: else branch not refined (no leak)"
+       (tc-infer [[X [con type]]]
+                 [if (number? X) 0 (+ X 1)]
+                 [])))
+
+\* and-chain: (and (cons? X) (= (hd X) 5)) refines X before typing the
+   second operand, so (hd X) inside the = type-checks.  Without the
+   bool-op refinement this fails inside the and's second argument. *\
+
+(define test-w-15-and-chain-refines
+  { --> (list symbol) }
+  -> (let R (tc-infer [[X [con type]]]
+                      [if (and (cons? X) (= (hd X) 5)) 1 0]
+                      [])
+       (tc-assert-ok "W: (and (cons? X) (= (hd X) 5)) refines X" R)))
+
+\* ================================================================
    STAGE 3 TESTS — Pattern typing
    ================================================================ *\
 
@@ -352,6 +401,11 @@
          (test-w-9-if-nonbool-condition)
          (test-w-10-and-bool)
          (test-w-11-cons-data)
+         \* Stage 2b: Guard-driven type refinement *\
+         (test-w-12-cons-narrows-then)
+         (test-w-13-symbol-narrows-then)
+         (test-w-14-no-refine-in-else)
+         (test-w-15-and-chain-refines)
          \* Stage 3: Pattern typing *\
          (test-pat-1-wildcard)
          (test-pat-2-variable)
