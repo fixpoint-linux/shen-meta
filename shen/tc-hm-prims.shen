@@ -47,8 +47,8 @@
   ->
   \* List ops *\
   [[(intern "cons")    (tc-poly2 (tc-build-arrow [[tvar 0] [app list [tvar 0]]] [app list [tvar 0]]))]
-   [(intern "hd")      (tc-poly1 (tc-build-arrow [[app list [tvar 0]]] [tvar 0]))]
-   [(intern "tl")      (tc-poly1 (tc-build-arrow [[app list [tvar 0]]] [app list [tvar 0]]))]
+   [(intern "hd")      (tc-poly2 (tc-build-arrow [[app list [tvar 0]]] [tvar 1]))]
+   [(intern "tl")      (tc-poly2 (tc-build-arrow [[app list [tvar 0]]] [tvar 1]))]
    \* Equality *\
    [(intern "=")       (tc-poly1 (tc-build-arrow [[tvar 0] [tvar 0]] [con boolean]))]
    \* Arithmetic: number -> number -> number *\
@@ -97,6 +97,12 @@
    [(intern "trap-error") (tc-poly2 (tc-build-arrow [[tvar 0] [arrow [con string] [tvar 0]]] [tvar 0]))]
    [(intern "simple-error") (tc-poly1 (tc-build-arrow [[con string]] [tvar 0]))]
    [(intern "error-to-string") (tc-poly1 (tc-build-arrow [[tvar 0]] [con string]))]
+   \* fail: KLambda control-flow primitive (used in `<-` backtrack clauses).
+      Never returns — throws — so its type can be ANYTHING.  Modelled
+      as a nullary forall-quantified return.  Without this the unknown
+      fallback (fresh binary arrow) clashes with the then-branch type
+      in (if C T [fail]) constructions (zinc-t-tail, zinc-c-tail). *\
+   [(intern "fail") (tc-poly1 (tc-build-arrow [] [tvar 0]))]
    \* Symbol/intern *\
    [(intern "intern") (tc-mono (tc-build-arrow [[con string]] [con symbol]))]
    \* State *\
@@ -124,11 +130,35 @@
    [(intern "append")  (tc-poly1 (tc-build-arrow [[app list [tvar 0]] [app list [tvar 0]]] [app list [tvar 0]]))]
    [(intern "reverse") (tc-poly1 (tc-build-arrow [[app list [tvar 0]]] [app list [tvar 0]]))]
    [(intern "empty?")  (tc-poly1 (tc-build-arrow [[app list [tvar 0]]] [con boolean]))]
-   [(intern "assoc")   (tc-poly2 (tc-build-arrow [[tvar 0] [app list [prod [tvar 0] [tvar 1]]]] [prod [tvar 0] [tvar 1]]))]
+   \* assoc: maximally permissive (A --> B --> C).  Real KLambda sig
+      would be (A, list (prod A B)) -> (prod A B) | [], but HM has no
+      union type and Shen source sigs like (list (list symbol number))
+      parse as (list (list symbol)) (parser takes only the first type
+      arg of an inner (list ...)).  Returning a fresh tvar lets both
+      (empty? (assoc ...)) and (hd (tl (assoc ...))) type-check. *\
+   [(intern "assoc")   (tc-poly3 (tc-build-arrow [[tvar 0] [tvar 1]] [tvar 2]))]
    \* Boolean ops *\
    [(intern "not")     (tc-mono (tc-build-arrow [[con boolean]] [con boolean]))]
    \* Identity/generic *\
    [(intern "ps")      (tc-poly1 (tc-build-arrow [[tvar 0]] [tvar 0]))]
    \* Length *\
    [(intern "length")  (tc-poly1 (tc-build-arrow [[app list [tvar 0]]] [con number]))]
+   \* User-defined Group-A predicates reached before their home file is
+      collected into tc-global-sig-table (or via a redefinition in a later
+      file).  These mirror the sigs in types.shen / util.shen.  Harmless
+      duplicates: tc-prim-lookup checks prim-table first, so the sig-table
+      entry (added later in tc-hm-collect-sigs) is shadowed. *\
+   [(intern "primitive?")          (tc-mono (tc-build-arrow [[con symbol]] [con boolean]))]
+   [(intern "instruction-keyword?") (tc-mono (tc-build-arrow [[con symbol]] [con boolean]))]
+   \* Cross-file Group-A helpers.  These are defined in util.shen with
+      sigs, but tc-hm-collect-sigs runs per-file and tc-hm-define
+      removes the self-entry from tc-prim-table after checking each
+      define, leaving lookup dependent on tc-global-sig-table at the
+      moment of cross-file call.  Adding them to the prim-table directly
+      removes that fragility.  Sigs mirror util.shen. *\
+   [(intern "fold-str")     (tc-mono (tc-build-arrow [[app list [con string]]] [con string]))]
+   [(intern "fold-append")  (tc-poly1 (tc-build-arrow [[app list [tvar 0]] [app list [app list [tvar 0]]]] [app list [tvar 0]]))]
+   [(intern "intersperse")  (tc-poly1 (tc-build-arrow [[tvar 0] [app list [tvar 0]]] [app list [tvar 0]]))]
+   [(intern "index_h")      (tc-poly1 (tc-build-arrow [[tvar 0] [app list [tvar 0]] [con number]] [con number]))]
+   [(intern "idx")          (tc-poly1 (tc-build-arrow [[tvar 0] [app list [tvar 0]]] [con number]))]
    ])

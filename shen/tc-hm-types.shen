@@ -188,6 +188,24 @@
                          [fail (cn "occurs check: tvar " (cn (str N) " in type"))]
                          [ok [[N T] | Sub]])))))
 
+\* ===== top-type?: true iff T (assumed already walked) is [con klambda].
+   klambda is the sequent-calculus top type per types.shen datatype:
+   "all data is valid klambda".  Such a type unifies with ANYTHING.
+   This generalises the existing tc-unify-con klambda rule to non-con
+   opponents, so a body that returns an [app list A] (a cons-literal)
+   or any other concrete type can unify with a klambda return type, and
+   a bare-symbol reference to a Shen global (typed as klambda because
+   the checker cannot see Shen's value-table) can flow into a primitive
+   that expects a symbol/number/etc.  Intentionally NARROW: only klambda
+   is top.  zinc-value/zinc-code stay opaque-ground (per Stage-5 analysis
+   warning: making zinc-value top would make the checker vacuous). *\
+
+(define tc-top-type?
+  { type --> boolean }
+  T -> (if (and (cons? T) (= (hd T) (intern "con")))
+           (= (tc-con-name T) (intern "klambda"))
+           false))
+
 \* ===== unify: the core unification algorithm =====
    Returns [ok Subst] or [fail Reason] — NEVER throws simple-error. *\
 
@@ -205,23 +223,28 @@
                        (tc-unify-var W1 W2 Sub)
                        (if (= Tag2 tvar)
                            (tc-unify-var W2 W1 Sub)
-                           (if (= Tag1 con)
-                               (if (= Tag2 con)
-                                   (tc-unify-con W1 W2 Sub)
-                                   [fail "type mismatch: con vs other"])
-                               (if (= Tag1 arrow)
-                                   (if (= Tag2 arrow)
-                                       (tc-unify-arrow W1 W2 Sub)
-                                       [fail "type mismatch: arrow vs other"])
-                                   (if (= Tag1 app)
-                                       (if (= Tag2 app)
-                                           (tc-unify-app W1 W2 Sub)
-                                           [fail "type mismatch: app vs other"])
-                                       (if (= Tag1 prod)
-                                           (if (= Tag2 prod)
-                                               (tc-unify-prod W1 W2 Sub)
-                                               [fail "type mismatch: prod vs other"])
-                                           [fail (cn "type mismatch: " (cn (tc-type->str W1) (cn " vs " (tc-type->str W2))))])))))))))
+                           \* Top-type rule: klambda unifies with anything. *\
+                           (if (tc-top-type? W1)
+                               [ok Sub]
+                               (if (tc-top-type? W2)
+                                   [ok Sub]
+                                   (if (= Tag1 con)
+                                       (if (= Tag2 con)
+                                           (tc-unify-con W1 W2 Sub)
+                                           [fail "type mismatch: con vs other"])
+                                       (if (= Tag1 arrow)
+                                           (if (= Tag2 arrow)
+                                               (tc-unify-arrow W1 W2 Sub)
+                                               [fail "type mismatch: arrow vs other"])
+                                           (if (= Tag1 app)
+                                               (if (= Tag2 app)
+                                                   (tc-unify-app W1 W2 Sub)
+                                                   [fail "type mismatch: app vs other"])
+                                               (if (= Tag1 prod)
+                                                   (if (= Tag2 prod)
+                                                       (tc-unify-prod W1 W2 Sub)
+                                                       [fail "type mismatch: prod vs other"])
+                                                   [fail (cn "type mismatch: " (cn (tc-type->str W1) (cn " vs " (tc-type->str W2))))])))))))))))
 
 \* ===== Structural tc-unify helpers ===== *\
 

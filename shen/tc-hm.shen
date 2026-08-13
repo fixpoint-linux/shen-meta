@@ -180,7 +180,7 @@
                     (if (tc-ok? RU)
                         [ok Name]
                         [fail (cn (str Name) (cn ": body/ret mismatch: " (tc-fail-reason RU)))]))))))
-          [fail (cn (str Name) (cn ": body infer failed: " (tc-fail-reason R)))])))
+          [fail (cn (str Name) (cn ": body infer failed BODY=" (cn (str Body) (cn " REASON=" (tc-fail-reason R)))))])))
 
 \* ===== tc-hm-one-clause-guard: type-check a where guard, then the body =====
    Types the guard as boolean (discards its subst for body typing). *\

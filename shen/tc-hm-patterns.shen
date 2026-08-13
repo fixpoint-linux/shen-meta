@@ -200,7 +200,9 @@
   LitType DeclType Sub -> (let RU (tc-unify LitType DeclType Sub)
                             (if (tc-ok? RU)
                                 [ok [(tc-ok-subst RU) []]]
-                                RU)))
+                                (if (tc-opaque-ground? DeclType Sub)
+                                    [ok [Sub []]]
+                                    RU))))
 
 \* ===== Empty list: [app list fresh-tvar], or opaque ground =====
    `[]` against a (list A) type unifies with [app list fresh]; against
@@ -254,17 +256,25 @@
         [fail "type-pat-cons: malformed cons pattern"]))
 
 \* tc-type-pat-cons2: dispatch on whether DeclType is a list type.
-   In the list-decomposition case, the head pattern P1 is typed against
-   the element type A.  When A is itself an opaque ground type (e.g.
-   zinc-instruction), literal keyword heads like `grab` inside
-   `[grab | C] : (list zinc-instruction)` would otherwise fail to unify
-   with the opaque type — so we route P1 through tc-type-pat-opaque-sub
-   in that case, which skips literals and binds variables permissively. *\
+   OPAQUE-GROUND CHECK FIRST: if DeclType walks to [con X] for X in the
+   opaque-ground set (zinc-value, klambda, zinc-code, zinc-instruction,
+   absvector, stream, error), route straight to opaque-cons.  We cannot
+   rely on the unify-failure fallback because the tc-unify-walked
+   top-type rule (klambda is top) makes [app list A] unify with klambda
+   succeed, which would wrongly send an opaque cons into list-decomp and
+   force its literal keyword heads to unify with the post-walk element
+   type.  In the genuine list-decomp case (DeclType is [app list A] or a
+   tvar), the head pattern P1 is typed against the element type A.  When
+   A is itself an opaque ground type, literal keyword heads like `grab`
+   inside `[grab | C] : (list zinc-instruction)` are routed through
+   tc-type-pat-opaque-sub so they match permissively. *\
 
 (define tc-type-pat-cons2
   { expr --> expr --> type --> subst --> pat-result }
   P1 P2 DeclType Sub ->
-    (let A (tc-fresh-tvar (intern ""))
+    (if (tc-opaque-ground? DeclType Sub)
+        (tc-type-pat-cons-opaque P1 P2 DeclType Sub)
+        (let A (tc-fresh-tvar (intern ""))
       (let ListA [app list A]
         (let RU (tc-unify ListA DeclType Sub)
           (if (tc-ok? RU)
@@ -287,7 +297,7 @@
                                         R2)))))))
                         R1))))
               \* opaque-cons: permissive sub-pattern typing *\
-              (tc-type-pat-cons-opaque P1 P2 DeclType Sub))))))
+              (tc-type-pat-cons-opaque P1 P2 DeclType Sub)))))))
 
 \* tc-type-pat-cons-head: type the head sub-pattern P1 against the
    list element type AH.  If AH is an opaque ground type, route through

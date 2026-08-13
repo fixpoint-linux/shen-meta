@@ -108,15 +108,43 @@
                                                                                         (tc-infer-function Env Expr Sub)
                                                                                         (tc-infer-app Env Expr Sub))))))))))))))))))))
 
-\* ===== Variable lookup ===== *\
+\* ===== prim-known?: is Name in the prim-table or sig-table?
+   Lets tc-infer-var distinguish "known function used as a value"
+   (instantiate its scheme) from "unbound Shen global" (treat as
+   klambda top).  Function-call position (tc-infer-app) always uses
+   tc-prim-lookup, which falls back to a fresh arrow for unknown —
+   that permissiveness is wanted at call sites but NOT at value sites. *\
+
+(define tc-prim-known?
+  { symbol --> boolean }
+  Name -> (if (tc-empty? (tc-assoc Name (%% value tc-prim-table)))
+              (if (tc-empty? (tc-assoc Name (%% value tc-global-sig-table)))
+                  false
+                  true)
+              true))
+
+\* ===== Variable lookup =====
+   Position-aware: a bare symbol reaching tc-infer-var is in VALUE
+   position (a function-call head goes through tc-infer-app, which uses
+   tc-prim-lookup directly).  For value position:
+     - Bound in env: use env type (instantiate scheme).
+     - In prim-table OR sig-table (known function used as a value):
+       instantiate its scheme.
+     - Otherwise (unbound, e.g. a Shen global like global-table referenced
+       by bare name in source): treat as klambda — the sequent-calculus
+       top type.  The previous behavior returned a fresh function-arrow,
+       which fatally conflicted with primitives like (value S) whose arg
+       is symbol: an arrow cannot unify with symbol, so every body that
+       touched a Shen global failed at the very first primitive call. *\
 
 (define tc-infer-var
   { env --> symbol --> subst --> infer-result }
   Env Name Sub -> (let Pair (tc-assoc Name Env)
                     (if (tc-empty? Pair)
-                        \* Not in local env — try prim table *\
-                        (let PT (tc-prim-lookup Name)
-                          [ok [Sub PT]])
+                        (if (tc-prim-known? Name)
+                            (let PT (tc-prim-lookup Name)
+                              [ok [Sub PT]])
+                            [ok [Sub [con klambda]]])
                         \* In local env — tc-instantiate if it's a scheme *\
                         (let Type (hd (tl Pair))
                           [ok [Sub (tc-instantiate Type)]]))))
@@ -125,10 +153,23 @@
   { type --> subst --> infer-result }
   Type Sub -> [ok [Sub Type]])
 
+\* ===== Empty list: [] — typed as a fresh tvar.
+   In KLambda the empty list is heavily overloaded: it is the empty
+   proper list (type [app list A]), the empty code fragment (type
+   zinc-code), the empty zinc-value (the [cons] tag without arguments),
+   and the empty environment.  Typing it strictly as [app list fresh]
+   breaks every body that passes [] as a zinc-code or zinc-value
+   argument (e.g. (zinc-c-tail E []) where the sig is klambda --> zinc-code
+   --> zinc-code).  Using a fresh tvar lets the surrounding context pin
+   it down (sig arg type, primitive domain, return type) while still
+   allowing test-w-4-empty-list's check (the tvar unifies with
+   [app list A] when the context asks for a list).  Documented Stage-1
+   soundness gap: a heterogeneous use of [] across multiple branches
+   will not be caught. *\
+
 (define tc-infer-empty
   { subst --> infer-result }
-  Sub -> (let A (tc-fresh-tvar (intern ""))
-           [ok [Sub [app list A]]]))
+  Sub -> [ok [Sub (tc-fresh-tvar (intern ""))]])
 
 \* ===== Lambda: (lambda X Body) =====
    Dispatch via explicit head-symbol check (host-Shen compatible). *\
@@ -368,52 +409,31 @@
               [fail "infer-prim-escape: malformed"]))
         [fail "infer-prim-escape: malformed"]))
 
-\* ===== cons data constructor: [cons H T] with 2 args =====
-   H : A,  T : [app list A],  result : [app list A]
-   If 3+ elements after cons, treat as list literal. *\
+\* ===== cons data constructor: [cons H T] — permissive.
+   In KLambda a cons cell is heavily overloaded: it builds proper lists,
+   it builds tagged-data expressions ([lambda X Body], [access N], ...),
+   and it builds opaque code fragments ([grab | C], [prim F | C], ...).
+   Strictly typing it as [app list A] (forcing H : A and T : [app list A])
+   is WRONG for the tagged-data and code-fragment uses: there T is a
+   sibling fragment, not a list tail of the same element type, and the
+   whole cell's type is klambda / zinc-code, not a list.
+
+   The Stage-1 pragmatic fix: type [cons H T] as a FRESH TVAR (the
+   cell's content is opaque), and let the surrounding context pin it
+   down — the return-type unification, a primitive's expected arg
+   type, or a sig's arg type.  This loses element-type tracking but
+   accepts the cross-shape bodies that KLambda actually contains.
+
+   This is a documented soundness gap (Stage 1): a body like
+   [cons 1 [cons "x" []]] (heterogeneous) will type-check against any
+   ret-type, since its inferred type is a fresh tvar that unifies with
+   anything.  Tightening this is Stage 8 work (shape refinement). *\
 
 (define tc-infer-cons
   { env --> expr --> subst --> infer-result }
   Env Expr Sub ->
-    (if (and (cons? Expr)
-             (let Hd (hd Expr)
-               (= Hd (intern "cons"))))
-        (let Rest (tl Expr)
-          (if (cons? Rest)
-              (let H (hd Rest)
-                (let Rest2 (tl Rest)
-                  (if (cons? Rest2)
-                      (let T (hd Rest2)
-                        (let Rest3 (tl Rest2)
-                          \* 3+ elements? -> list literal *\
-                          (if (cons? Rest3)
-                              (tc-infer-list-literal Env Rest Sub)
-                              \* Exactly 2 args: normal cons typing *\
-                              (let A (tc-fresh-tvar (intern ""))
-                                (let RH (tc-infer Env H Sub)
-                                  (if (tc-ok? RH)
-                                      (let PairH (tc-ok-subst-type RH)
-                                        (let Sub1 (hd PairH)
-                                          (let TypeH (hd (tl PairH))
-                                            (let RU1 (tc-unify TypeH A Sub1)
-                                              (if (tc-ok? RU1)
-                                                  (let Sub2 (tc-ok-subst RU1)
-                                                    (let AT (tc-apply-subst Sub2 A)
-                                                      (let ListA [app list AT]
-                                                        (let RT (tc-infer Env T Sub2)
-                                                          (if (tc-ok? RT)
-                                                              (let PairT (tc-ok-subst-type RT)
-                                                                (let Sub3 (hd PairT)
-                                                                  (let TypeT (hd (tl PairT))
-                                                                    (let RU2 (tc-unify TypeT ListA Sub3)
-                                                                      (if (tc-ok? RU2)
-                                                                          [ok [(tc-ok-subst RU2) [app list (tc-apply-subst (tc-ok-subst RU2) AT)]]]
-                                                                          RU2)))))
-                                                              RT)))))
-                                                  RU1)))))
-                                        RH))))))
-                      (tc-infer-list-literal Env Rest Sub))))
-              [fail "infer-cons: malformed cons"]))
+    (if (and (cons? Expr) (= (hd Expr) (intern "cons")))
+        [ok [Sub (tc-fresh-tvar (intern ""))]]
         [fail "infer-cons: malformed cons"]))
 
 \* ===== list-literal: [cons E1 E2 ... En] with n>=3 (or Rest = [E1..En]) =====
