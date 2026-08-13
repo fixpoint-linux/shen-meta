@@ -161,4 +161,33 @@
    [(intern "intersperse")  (tc-poly1 (tc-build-arrow [[tvar 0] [app list [tvar 0]]] [app list [tvar 0]]))]
    [(intern "index_h")      (tc-poly1 (tc-build-arrow [[tvar 0] [app list [tvar 0]] [con number]] [con number]))]
    [(intern "idx")          (tc-poly1 (tc-build-arrow [[tvar 0] [app list [tvar 0]]] [con number]))]
+   \* Compiler pipeline helpers (zinc.shen / normalize.shen).  These mirror
+      the source sigs and are added here for the same fragility-removal
+      reason as the util.shen helpers above: tc-hm-define strips the
+      self-entry from tc-prim-table after each per-define check, leaving
+      cross-file call-site lookup dependent on tc-global-sig-table being
+      fully populated at the moment of call.  Without these entries,
+      kl->zinc's body (which threads kmacros -> normalize-term -> debruijn
+      -> zinc-c) hits the unknown-prim fallback (a fresh binary arrow)
+      whenever sig-table lookup falls behind, producing a spurious
+      arrow-typed body that fails body/ret unification. *\
+   [(intern "zinc-c")         (tc-mono (tc-build-arrow [[con klambda]] [con zinc-code]))]
+   [(intern "zinc-t")         (tc-mono (tc-build-arrow [[con klambda]] [con zinc-code]))]
+   [(intern "kmacros")        (tc-mono (tc-build-arrow [[con klambda]] [con klambda]))]
+   [(intern "normalize-term") (tc-mono (tc-build-arrow [[con klambda]] [con klambda]))]
+   [(intern "debruijn")       (tc-mono (tc-build-arrow [[app list [con symbol]] [con klambda]] [con klambda]))]
+   \* Meta-interpreter code-walkers.  Source sigs in interp.shen declare
+      these as (list zinc-instruction) --> ..., but at runtime the value
+      passed is the SAME opaque instruction stream interp's first arg
+      carries (typed zinc-code): both extract-grab / count-grab loops walk
+      the closure's code field C1 from a [lambda C1 E1] pattern, and that
+      C1 is then passed back to interp as its first arg.  Declaring the
+      arg as zinc-code here (instead of (list zinc-instruction)) keeps
+      the checker's view of C1 consistent across the zinc-arity/drop-grabs
+      calls and the recursive interp call in the apply clause - otherwise
+      tc-unify hits "app vs other" (list zinc-instruction vs zinc-code)
+      in the interp multi-arg apply body.  Narrow: only these two helpers
+      get the override; zinc-value / zinc-code stay opaque elsewhere. *\
+   [(intern "zinc-arity")     (tc-mono (tc-build-arrow [[con zinc-code]] [con number]))]
+   [(intern "drop-grabs")     (tc-mono (tc-build-arrow [[con number] [con zinc-code]] [con zinc-code]))]
    ])
