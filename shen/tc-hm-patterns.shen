@@ -355,8 +355,18 @@
   cons-pat Pat OpaqueType Sub -> (tc-type-pat-cons Pat OpaqueType Sub)
   _ Pat OpaqueType Sub -> [ok [Sub []]])
 
-\* ===== Tag pattern: [number X], [symbol X], etc. - opaque zinc-value =====
-   Whole pattern: zinc-value. Variable X: zinc-value (opaque). *\
+\* ===== Tag pattern: [number X], [symbol X], etc. =====
+   Whole pattern unifies with DeclType as zinc-value.  Variable X binds
+   to a REFINED type (number/symbol/string/boolean) per the tag, not
+   opaque zinc-value (option-C sanity check: tighter self-check). *\
+
+(define tc-tag-refined-type
+  { symbol --> type }
+  Tag -> (if (= Tag (intern "number")) [con number]
+          (if (= Tag (intern "symbol")) [con symbol]
+          (if (= Tag (intern "string")) [con string]
+          (if (= Tag (intern "boolean")) [con boolean]
+              [con zinc-value])))))
 
 (define tc-type-pat-tag
   { expr --> type --> subst --> pat-result }
@@ -366,17 +376,18 @@
           (let RU (tc-unify ZV DeclType Sub)
             (if (tc-ok? RU)
                 (let Sub1 (tc-ok-subst RU)
-                  [ok [Sub1 [[Var ZV]]]])
+                  (let Ref (tc-tag-refined-type Tag)
+                    [ok [Sub1 [[Var Ref]]]]))
                 RU)))
         [fail "type-pat-tag: second element must be a variable"])
   _ _ _ -> [fail "type-pat-tag: malformed tag pattern"])
 
 \* ===== ZV tag with arbitrary sub-patterns =====
    For [stream Dir X], [lambda C E], [error X], [absvector X].
-   Whole pattern: [con zinc-value]. Each variable sub-arg binds to
-   [con zinc-value] (opaque, Stage 1 soundness gap).  Non-variable
-   sub-args are skipped (they are literal tag keywords like the
-   direction symbol in [stream in X]). *\
+   Whole pattern: [con zinc-value].  Each variable sub-arg binds to a
+   REFINED type per the tag (option-C sanity check), instead of the
+   Stage-1 opaque [con zinc-value].  Non-variable sub-args are skipped
+   (literal tag keywords like the direction in [stream in X]). *\
 
 (define tc-type-pat-zv-tag
   { expr --> type --> subst --> pat-result }
@@ -386,24 +397,62 @@
           (let RU (tc-unify ZV DeclType Sub)
             (if (tc-ok? RU)
                 (let Sub1 (tc-ok-subst RU)
-                  (tc-type-pat-zv-tag-args (tl Pat) ZV Sub1))
+                  (tc-zv-tag-typed (hd Pat) (tl Pat) Sub1))
                 RU)))
         [fail "type-pat-zv-tag: malformed"]))
 
+\* tc-zv-tag-typed: dispatch on the tag symbol, bind each var sub-arg to
+   its refined type per types.shen.  Args is the tag's sub-pattern list. *\
+
+(define tc-zv-tag-typed
+  { symbol --> (list expr) --> subst --> pat-result }
+  Tag Args Sub ->
+    (if (= Tag (intern "lambda"))
+        (tc-type-pat-zv-tag-args Args [[con zinc-code] [app list [con zinc-value]]] Sub)
+        (if (= Tag (intern "error"))
+            (tc-type-pat-zv-tag-args Args [[con exception]] Sub)
+            (if (= Tag (intern "absvector"))
+                (tc-type-pat-zv-tag-args Args [[con absvector]] Sub)
+                (if (= Tag (intern "stream"))
+                    (tc-zv-tag-stream Args Sub)
+                    (tc-type-pat-zv-tag-args Args [] Sub))))))
+
+\* tc-zv-tag-stream: [stream Dir X].  Dir is a literal direction symbol
+   (in/out); X binds to the parameterized stream type. *\
+
+(define tc-zv-tag-stream
+  { (list expr) --> subst --> pat-result }
+  Args Sub ->
+    (if (and (cons? Args) (symbol? (hd Args)))
+        (if (= (hd Args) (intern "in"))
+            (tc-type-pat-zv-tag-args (tl Args) [[app stream [con in]]] Sub)
+            (if (= (hd Args) (intern "out"))
+                (tc-type-pat-zv-tag-args (tl Args) [[app stream [con out]]] Sub)
+                (tc-type-pat-zv-tag-args Args [] Sub)))
+        (tc-type-pat-zv-tag-args Args [] Sub)))
+
+\* tc-type-pat-zv-tag-args: bind variable sub-args to a per-arg type list.
+   TypeList is parallel to Args; literal (non-variable) sub-args consume a
+   type position but bind nothing.  Empty TypeList -> bind all vars opaque. *\
+
 (define tc-type-pat-zv-tag-args
-  { (list expr) --> type --> subst --> pat-result }
-  Args ElmType Sub -> (if (cons? Args)
+  { (list expr) --> (list type) --> subst --> pat-result }
+  Args TypeList Sub -> (if (cons? Args)
                           (let Arg (hd Args)
                             (let Rest (tl Args)
                               (if (variable? Arg)
-                                  (let R (tc-type-pat-zv-tag-args Rest ElmType Sub)
-                                    (if (tc-ok? R)
-                                        (let Pair (tc-ok-subst-bindings R)
-                                          (let Sub2 (hd Pair)
-                                            (let Binds (hd (tl Pair))
-                                              [ok [Sub2 [[Arg ElmType] | Binds]]])))
-                                        R))
-                                  (tc-type-pat-zv-tag-args Rest ElmType Sub))))
+                                  (let ArgType (if (cons? TypeList)
+                                                  (hd TypeList)
+                                                  [con zinc-value])
+                                    (let TRest (if (cons? TypeList) (tl TypeList) [])
+                                      (let R (tc-type-pat-zv-tag-args Rest TRest Sub)
+                                        (if (tc-ok? R)
+                                            (let Pair (tc-ok-subst-bindings R)
+                                              (let Sub2 (hd Pair)
+                                                (let Binds (hd (tl Pair))
+                                                  [ok [Sub2 [[Arg ArgType] | Binds]]])))
+                                            R))))
+                                  (tc-type-pat-zv-tag-args Rest (if (cons? TypeList) (tl TypeList) []) Sub))))
                           [ok [Sub []]]))
 
 \* ===== List pattern: [H | T] - proper list decomposition =====
