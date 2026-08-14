@@ -56,3 +56,12 @@
                                 "shen/tc-hm-sig.shen"
                                 "shen/tc-hm.shen"
                                 "shen/tc-hm-runtime.shen"]))))
+
+\* Nullary driver entry for C VM --tc-hm-tests.  Initializes checker state,
+   runs the ~68 synthetic unit tests in tc-hm-tests.shen, and returns the
+   Passed/Failed summary string (built by tc-hm-tests-run-all; print is not a
+   C primitive in the reduced bundle, so the runner returns a string). *\
+(define run-tc-hm-tests
+  { --> string }
+  -> (do (tc-hm-init)
+         (tc-hm-tests-run-all)))

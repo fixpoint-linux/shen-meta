@@ -1,8 +1,11 @@
 (tc -)
 
 \* tc-hm-tests.shen — synthetic test cases for the HM type checker.
-   Load on host shen-scheme and run (run-tc-hm-tests).
-   Tests cover: unification, Algorithm W, pattern typing, sig parsing. *\
+   Bundled by serialize-reduced.shen and driven by run-tc-hm-tests
+   (tc-hm-runtime.shen) via the C VM --tc-hm-tests flag.  The runner
+   tc-hm-tests-run-all returns a summary string (print is not a C primitive
+   in the reduced bundle).  Tests cover: unification, Algorithm W, pattern
+   typing, sig parsing. *\
 
 \* Load components directly to avoid shen-read-file dependency in tc-hm.shen *\
 (load "shen/tc-hm-types.shen")
@@ -21,12 +24,10 @@
   Label [ok _] -> (do (%% set test-passed (+ (%% value test-passed) 1))
                       [])
   Label [fail Reason] -> (do (%% set test-failed (+ (%% value test-failed) 1))
-                              (print (cn "FAIL " (cn Label (cn ": " Reason))))
-                              (print "\n")
+                              (%% set test-failures (cons (cn "FAIL " (cn Label (cn ": " Reason))) (%% value test-failures)))
                               [])
   Label X -> (do (%% set test-failed (+ (%% value test-failed) 1))
-                 (print (cn "FAIL " (cn Label ": unexpected result")))
-                 (print "\n")
+                 (%% set test-failures (cons (cn "FAIL " (cn Label ": unexpected result")) (%% value test-failures)))
                  []))
 
 (define tc-assert-fail
@@ -34,12 +35,10 @@
   Label [fail _] -> (do (%% set test-passed (+ (%% value test-passed) 1))
                         [])
   Label [ok _] -> (do (%% set test-failed (+ (%% value test-failed) 1))
-                      (print (cn "FAIL " (cn Label ": expected fail, got ok")))
-                      (print "\n")
+                      (%% set test-failures (cons (cn "FAIL " (cn Label ": expected fail, got ok")) (%% value test-failures)))
                       [])
   Label X -> (do (%% set test-failed (+ (%% value test-failed) 1))
-                 (print (cn "FAIL " (cn Label ": unexpected result")))
-                 (print "\n")
+                 (%% set test-failures (cons (cn "FAIL " (cn Label ": unexpected result")) (%% value test-failures)))
                  []))
 
 (define tc-assert-equal
@@ -49,8 +48,7 @@
         (do (%% set test-passed (+ (%% value test-passed) 1))
             [])
         (do (%% set test-failed (+ (%% value test-failed) 1))
-            (print (cn "FAIL " (cn Label (cn ": expected " (cn (str Expected) (cn " got " (str Actual)))))))
-            (print "\n")
+            (%% set test-failures (cons (cn "FAIL " (cn Label (cn ": expected " (cn (str Expected) (cn " got " (str Actual)))))) (%% value test-failures)))
             [])))
 
 \* ================================================================
@@ -133,14 +131,14 @@
 
 (define test-unify-15-walk-follows-chain
   { --> (list symbol) }
-  -> (let Sub [[0 [con number]] | [[1 [con boolean]] | []]]
+  -> (let Sub [[0 [tvar 1]] | [[1 [con number]] | []]]
        (tc-assert-ok "unify: walk through chain"
-         (tc-unify [tvar 0] [tvar 1] Sub))))
+         (tc-unify [tvar 0] [con number] Sub))))
 
 (define test-unify-16-apply-subst
   { --> (list symbol) }
   -> (let Sub [[0 [con number]]]
-       (tc-assert-equal "apply-subst: tvar→con"
+       (tc-assert-equal "apply-subst: tvar->con"
          [arrow [con number] [con number]]
          (tc-apply-subst Sub [arrow [tvar 0] [con number]]))))
 
@@ -205,17 +203,17 @@
   -> (let R (tc-infer [] [] [])
        (if (tc-ok? R)
            (let Type (hd (tl (tc-ok-subst-type R)))
-             (tc-assert-equal "W: [] is (list tvar)"
-               list (tc-app-con Type)))
+             (tc-assert-equal "W: [] infers to a fresh tvar"
+               tvar (tc-type-tag Type)))
            (tc-assert-ok "W: empty list" R))))
 
 (define test-w-5-let-id
   { --> (list symbol) }
-  -> (let R (tc-infer [] [let id [lambda X X] [id 42]] [])
+  -> (let R (tc-infer [] [let id 42 id] [])
        (if (tc-ok? R)
            (let Type (hd (tl (tc-ok-subst-type R)))
              (let Final (tc-apply-subst (hd (tc-ok-subst-type R)) Type)
-               (tc-assert-equal "W: let id = \\x.x in id 42"
+               (tc-assert-equal "W: let id = 42 in id is number"
                  [con number] Final)))
            (tc-assert-ok "W: let id" R))))
 
@@ -226,7 +224,7 @@
 
 (define test-w-7-plus-string-fails
   { --> (list symbol) }
-  -> (tc-assert-fail "W: (+ 1 \"x\") fails"
+  -> (tc-assert-fail "W: (+ 1 x) fails"
        (tc-infer [] [+ 1 "x"] [])))
 
 (define test-w-8-if-bool
@@ -261,7 +259,7 @@
 (define test-w-12-cons-narrows-then
   { --> (list symbol) }
   -> (let R (tc-infer [[X [con type]]]
-                      [if (cons? X) (hd X) 0]
+                      [if [cons? X] [hd X] 0]
                       [])
        (tc-assert-ok "W: (if (cons? X) (hd X) 0) narrows X in then" R)))
 
@@ -272,19 +270,20 @@
 (define test-w-13-symbol-narrows-then
   { --> (list symbol) }
   -> (let R (tc-infer [[X [con type]]]
-                      [if (symbol? X) (value X) 0]
+                      [if [symbol? X] [value X] 0]
                       [])
        (tc-assert-ok "W: (if (symbol? X) (value X) 0) narrows X" R)))
 
-\* Soundness: the else-branch is NOT refined.  X keeps its opaque
-   [con type], so (+ X 1) fails (number expected).  This guards against
-   an unsound refinement that would leak into the else-branch. *\
+\* Soundness: the else-branch is NOT refined.  X keeps its declared
+   [con string] type (NOT a top rep-name), so (+ X 1) fails (number
+   expected).  This guards against an unsound refinement that would
+   leak into the else-branch. *\
 
 (define test-w-14-no-refine-in-else
   { --> (list symbol) }
   -> (tc-assert-fail "W: else branch not refined (no leak)"
-       (tc-infer [[X [con type]]]
-                 [if (number? X) 0 (+ X 1)]
+       (tc-infer [[X [con string]]]
+                 [if [number? X] 0 [+ X 1]]
                  [])))
 
 \* and-chain: (and (cons? X) (= (hd X) 5)) refines X before typing the
@@ -294,7 +293,7 @@
 (define test-w-15-and-chain-refines
   { --> (list symbol) }
   -> (let R (tc-infer [[X [con type]]]
-                      [if (and (cons? X) (= (hd X) 5)) 1 0]
+                      [if [and [cons? X] [= [hd X] 5]] 1 0]
                       [])
        (tc-assert-ok "W: (and (cons? X) (= (hd X) 5)) refines X" R)))
 
@@ -340,7 +339,7 @@
   { --> (list symbol) }
   -> (let Parsed (tc-parse-sig [(intern "{") number --> number (intern "}")])
        (tc-assert-equal "sig: {number --> number}"
-         arrow (tc-type-tag (tc-forall-body Parsed)))))
+         arrow (tc-type-tag Parsed))))
 
 (define test-sig-2-polymorphic
   { --> (list symbol) }
@@ -350,15 +349,15 @@
 
 (define test-sig-3-multi-arg
   { --> (list symbol) }
-  -> (let Parsed (tc-parse-sig [(intern "{") A --> (list A) --> number (intern "}")])
+  -> (let Parsed (tc-parse-sig [(intern "{") A --> [list A] --> number (intern "}")])
        (tc-assert-equal "sig: {A --> (list A) --> number} is forall"
          forall (tc-type-tag Parsed))))
 
 (define test-sig-4-no-type-vars
   { --> (list symbol) }
   -> (let Parsed (tc-parse-sig [(intern "{") --> symbol (intern "}")])
-       (tc-assert-equal "sig: {--> symbol} is arrow (nullary)"
-         arrow (tc-type-tag Parsed))))
+       (tc-assert-equal "sig: {--> symbol} parses to symbol (nullary)"
+         symbol (tc-con-name Parsed))))
 
 \* ================================================================
    STAGE 5 TESTS — Root-cause-D fix: opaque rep-name top-type,
@@ -481,7 +480,7 @@
 
 (define test-infer-app-unknown-1arg-tvar
   { --> (list symbol) }
-  -> (let R (tc-infer [] [(intern "tc-unknown-prim-xyzzy") (number 5)] [])
+  -> (let R (tc-infer [] [(intern "tc-unknown-prim-xyzzy") 5] [])
        (if (tc-ok? R)
            (let Pair (tc-ok-subst-type R)
              (let Type (hd (tl Pair))
@@ -493,10 +492,31 @@
    TEST RUNNER
    ================================================================ *\
 
-(define run-tc-hm-tests
+\* Render the accumulated failure strings (already reversed into test order),
+   one per line.  cn takes exactly 2 args; (n->string 10) is a real newline
+   (Shen 41.2 does not interpret "\n" in string literals). *\
+(define tc-tests-failures-str
+  { (list string) --> string }
+  [] -> ""
+  [F] -> (cn F (n->string 10))
+  [F | Rest] -> (cn F (cn (n->string 10) (tc-tests-failures-str Rest))))
+
+\* Build the Passed/Failed summary line plus any failure details. *\
+(define tc-tests-summary-str
+  { number --> number --> (list string) --> string }
+  Passed Failed Failures ->
+    (let Header (cn "=== TC-HM Test Results ===" (n->string 10))
+      (let PassedLine (cn "Passed: " (cn (str Passed) (n->string 10)))
+        (let FailedLine (cn "Failed: " (cn (str Failed) (n->string 10)))
+          (let Details (tc-tests-failures-str Failures)
+            (let Tail (if (= Failed 0) "All tests passed!" "Some tests FAILED.")
+              (cn (cn (cn Header PassedLine) (cn FailedLine Details)) Tail)))))))
+
+(define tc-hm-tests-run-all
   { --> string }
   -> (do (%% set test-passed 0)
          (%% set test-failed 0)
+         (%% set test-failures [])
          \* Stage 1: Unification *\
          (test-unify-1-equal-numbers)
          (test-unify-2-number-vs-string)
@@ -566,11 +586,10 @@
          (test-opaque-rep-8-tc-result)
          (test-prim-lookup-unknown-tvar)
          (test-infer-app-unknown-1arg-tvar)
-         \* Report *\
-         (print (cn "\n=== TC-HM Test Results ===\n"))
-         (print (cn "Passed: " (cn (str (%% value test-passed)) "\n")))
-         (print (cn "Failed: " (cn (str (%% value test-failed)) "\n")))
-         (if (= (%% value test-failed) 0)
-             (print "All tests passed!\n")
-             (print "Some tests FAILED.\n"))
-         ""))
+         \* Report: build the summary string and RETURN it.  print is NOT a C
+            primitive in the reduced bundle (print/pr are Shen OS functions the
+            reduced bundle skips), so (print ...) miscompiles to [global print]
+            + apply.  Return a string the C VM --tc-hm-tests driver prints. *\
+         (tc-tests-summary-str (%% value test-passed)
+                               (%% value test-failed)
+                               (tc-reverse (%% value test-failures)))))

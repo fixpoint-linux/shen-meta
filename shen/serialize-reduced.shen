@@ -52,6 +52,7 @@
 (shen-load "shen/tc-hm-sig.shen")
 (shen-load "shen/tc-hm.shen")
 (shen-load "shen/tc-hm-runtime.shen")
+(shen-load "shen/tc-hm-tests.shen")
 
 \* === Safe-wrapper aliases: point short names to our-compiled safe.N closures ===
    serialize.shen (full bundle) relies on interp.shen's set-toplevel calls for
