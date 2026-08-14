@@ -559,6 +559,30 @@ Value defun_get(const char *name) {
     return val_symbol(name);
 }
 
+/* Probe whether the defun table has an explicit entry for name
+   (no val_prim/val_symbol fallback).  Used by bundle-load keyword
+   registration to avoid clobbering bundled closures (e.g. the
+   metacircular interp's `lookup` helper) with keyword symbols. */
+int defun_has(const char *name) {
+    if (defun_mode == DEFUN_BOOTSTRAP) {
+        for (int i = 0; i < bootstrap_count; i++)
+            if (strcmp(bootstrap_keys[i].name, name) == 0)
+                return 1;
+    } else {
+        uint32_t b = hash_name_h0(name) % (uint32_t)defun_buckets;
+        uint32_t d = defun_displacement[b];
+        uint32_t slot = hash_name_h1(name, d) % (uint32_t)defun_table_size;
+        if (defun_table[slot].name != NULL &&
+            strcmp(defun_table[slot].name, name) == 0)
+            return 1;
+        for (int i = defun_table_size; i < defun_table_cap; i++)
+            if (defun_table[i].name != NULL &&
+                strcmp(defun_table[i].name, name) == 0)
+                return 1;
+    }
+    return 0;
+}
+
 /* values_table stores name→value bindings, reached by (value S)/(set S V):
    streams, the Shen global-table value, and runtime (set S V) bindings.
    Open-address insert with linear probing.  No dirty-bitset: the GC always
@@ -2413,6 +2437,20 @@ static int is_defun_form(Value f) {
     return h.tag == VAL_SYMBOL && strcmp(h.sym.name, "defun") == 0;
 }
 
+/* Evaluate a KLambda form through the metacircular interpreter via eval-kl.
+   This resolves [global G] references through the interp's OWN global-table
+   (namespace 2, the Shen `global-table` list), so it can call OS closures
+   (shen.initialise, shen.repl, ...) that were loaded at runtime via
+   interp-load-raw — NOT the C VM native global_table[] (namespace 1). */
+static Value eval_kl_form(Value form) {
+    ValueArray s; va_init(&s);
+    va_push(&s, form);
+    Value acc; memset(&acc, 0, sizeof(acc));
+    exec_primitive("eval-kl", &acc, &s);
+    va_free(&s);
+    return acc;
+}
+
 /* Read one line from stdin (until newline or EOF), growing the buffer.
    Returns malloc'd string (caller frees) or NULL on EOF. */
 static char *read_stdin_line(void) {
@@ -2864,8 +2902,16 @@ int vm_load_bundle(const char *buf) {
         "list", "where",
         NULL
     };
+    /* Only register keywords that are NOT already bundle entries.
+       Pattern tags now compile to `symbol X` loads, so nothing in the
+       bundle needs e.g. [global lookup] to resolve to a symbol; but the
+       metacircular interp DOES need [global lookup] to resolve to its
+       bundled `lookup` closure.  Registering over it broke every
+       interpreted `access` instruction ("apply non-callable
+       sym=lookup"). */
     for (int i = 0; keywords[i]; i++)
-        defun_set(keywords[i], val_symbol(keywords[i]));
+        if (!defun_has(keywords[i]))
+            defun_set(keywords[i], val_symbol(keywords[i]));
 
     /* Initialize standard I/O stream variables expected by the Shen OS.
        The bundled stinput/stoutput closures use (value *stinput*),
@@ -3154,67 +3200,81 @@ int main(int argc, char **argv) {
                 }
                 return 0;
             }
-            /* --repl: run the interactive Shen REPL */
+            /* --repl: run the interactive Shen REPL.
+               The full Shen OS (.kl files) is loaded at RUNTIME into the
+               metacircular interpreter's OWN global-table (namespace 2) via
+               interp-load-raw, then shen.initialise / shen.repl are called
+               INSIDE that interpreter through eval-kl (which resolves
+               [global G] via lookup-global → namespace 2).  We do NOT use
+               defun_get here: the OS closures are not in the C VM native
+               global_table[] (namespace 1), they are runtime-loaded. */
             if (ai < argc && strcmp(argv[ai], "--repl") == 0) {
                 printf("=== Shen REPL ===\n");
                 fflush(stdout);
 
-                Value init = defun_get("shen.initialise");
-                if (init.tag != VAL_LAMBDA) {
-                    fprintf(stderr, "repl: shen.initialise not found (tag=%d)\n", init.tag);
-                    return 1;
-                }
-                gc_root_push_value(&init);
-                Value *env_init = GC_VALUE_ARRAY(init.lambda.env_len + 1);
-                if (init.lambda.env_len > 0)
-                    memcpy(env_init, init.lambda.env, init.lambda.env_len * sizeof(Value));
-                env_init[init.lambda.env_len] = val_number(0);
-                gc_root_pop();
-                {
-                    CatchFrame cf;
-                    cf.parent = vm_catch_chain;
-                    cf.in_trap_error = 0;
-                    vm_catch_chain = &cf;
-                    volatile size_t init_wm = gc_root_watermark();
-                    if (setjmp(cf.buf) == 0) {
-                        vm_exec_env(init.lambda.code, init.lambda.code_len,
-                                    env_init, init.lambda.env_len + 1);
+                /* 1. Load the Shen OS kernel .kl files into the meta-interp. */
+                static const char *os_order[] = {
+                    "vendor/ShenOSKernel-41.2/klambda/core.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/declarations.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/types.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/macros.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/load.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/toplevel.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/sys.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/dict.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/track.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/reader.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/writer.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/yacc.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/prolog.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/sequent.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/t-star.kl",
+                    "shen/overrides-pure.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/extension-expand-dynamic.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/extension-features.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/extension-launcher.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/extension-programmable-pattern-matching.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/stlib.kl",
+                    "vendor/ShenOSKernel-41.2/klambda/init.kl",
+                    NULL };
+                for (int oi = 0; os_order[oi] != NULL; oi++) {
+                    Value osp = val_string(os_order[oi], (long)strlen(os_order[oi]));
+                    gc_root_push_value(&osp);
+                    Value osr = call_closure1("interp-load-raw", osp);
+                    gc_root_pop();
+                    if (!(osr.tag == VAL_SYMBOL && strcmp(osr.sym.name, "loaded") == 0)) {
+                        fprintf(stderr, "repl: OS load failed at %s (tag=%d)\n",
+                                os_order[oi], osr.tag);
+                        return 1;
                     }
-                    vm_catch_chain = cf.parent;
-                    gc_root_pop_to(init_wm);
-                    /* S3: cf.error_val never read at this site (error swallowed). No root needed. */
+                }
+                printf("Shen OS loaded into meta-interpreter.\n");
+                fflush(stdout);
+
+                /* 2. Call shen.initialise INSIDE the meta-interpreter. */
+                {
+                    Value init_form = val_cons(val_symbol("shen.initialise"), val_nil());
+                    gc_root_push_value(&init_form);
+                    Value initr = eval_kl_form(init_form);
+                    gc_root_pop();
+                    if (initr.tag == VAL_ERROR) {
+                        fprintf(stderr, "repl: shen.initialise error: ");
+                        print_value(initr);
+                        printf("\n");
+                        return 1;
+                    }
                 }
                 printf("Shen ready.\n\n");
                 fflush(stdout);
 
-                Value repl = defun_get("shen.repl");
-                if (repl.tag != VAL_LAMBDA) {
-                    fprintf(stderr, "repl: shen.repl not found\n");
-                    return 1;
-                }
-                gc_root_push_value(&repl);
-                Value *env_repl = GC_VALUE_ARRAY(repl.lambda.env_len + 1);
-                if (repl.lambda.env_len > 0)
-                    memcpy(env_repl, repl.lambda.env, repl.lambda.env_len * sizeof(Value));
-                env_repl[repl.lambda.env_len] = val_number(0);
-                gc_root_pop();
-
-                /* Set up REPL mode: intercept "error: empty stream" to
-                   exit cleanly on EOF instead of looping forever. */
+                /* 3. Run shen.repl INSIDE the meta-interpreter.
+                   Intercept "error: empty stream" (EOF) to exit cleanly. */
                 repl_mode = 1;
                 if (setjmp(repl_exit_jmp) == 0) {
-                    CatchFrame cf;
-                    cf.parent = vm_catch_chain;
-                    cf.in_trap_error = 0;
-                    vm_catch_chain = &cf;
-                    volatile size_t repl_wm = gc_root_watermark();
-                    if (setjmp(cf.buf) == 0) {
-                        vm_exec_env(repl.lambda.code, repl.lambda.code_len,
-                                    env_repl, repl.lambda.env_len + 1);
-                    }
-                    vm_catch_chain = cf.parent;
-                    gc_root_pop_to(repl_wm);
-                    /* S3: cf.error_val never read at this site (error swallowed). No root needed. */
+                    Value repl_form = val_cons(val_symbol("shen.repl"), val_nil());
+                    gc_root_push_value(&repl_form);
+                    eval_kl_form(repl_form);
+                    gc_root_pop();
                 }
                 repl_mode = 0;
 

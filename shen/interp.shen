@@ -75,8 +75,13 @@
   [] _ -> (simple-error "missing pushmark"))
 
 (define zinc-arity { (list zinc-instruction) --> number }
+  \* The [cur] that created this closure wrapped a 1-param lambda whose
+     parameter is bound by APPLY (into env), not by a grab.  Every closure
+     therefore has arity = (leading grabs in C1) + 1.  Without the +1 a
+     3-arg defun reports A=2 and a 0-arg defun (defun->lambda gives
+     [lambda newvar Body]) reports A=0 while its dummy arg is the newvar. *\
   [grab | C] -> (+ 1 (zinc-arity C))
-  _ -> 0)
+  _ -> 1)
 
 (define count-args { (list zinc-value) --> number --> number }
   [] Acc -> Acc
