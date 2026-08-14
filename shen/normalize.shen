@@ -21,7 +21,7 @@
   [if true X Y]                                -> (kmacros X)
   [if false X Y]                               -> (kmacros Y)
   [do X]                                       -> (kmacros X)
-  [do X | Y]                                   -> (kmacros [let (newvar) (kmacros X) (kmacros [do | Y])])
+  [do X | Y]                                   -> [let (kmacros (newvar)) (kmacros X) (kmacros [do | Y])]
   [number? [type X number]]                    -> true
   [symbol? [type X symbol]]                    -> true
   [string? [type X string]]                    -> true
