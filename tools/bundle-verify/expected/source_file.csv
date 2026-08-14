@@ -1,7 +1,6 @@
 name
-interp.shen
-util.shen
 compile.shen
+interp.shen
 load.shen
 normalize.shen
 os-helpers.shen
@@ -10,4 +9,5 @@ shen->kl.shen
 shen-kl-helpers.shen
 toplevel.shen
 types.shen
+util.shen
 zinc.shen

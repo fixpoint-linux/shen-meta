@@ -1,3 +1,6 @@
 f,stmt_id,dst_expr
-main,56,env_init
+main,56,env_driver
+main,86,env_driver
+main,116,env_driver
+main,146,env_init
 vm_exec_env,12,env
