@@ -30,19 +30,6 @@
                       (tc-instantiate (hd (tl Pair2)))))
                 (tc-instantiate (hd (tl Pair))))))
 
-\* fresh-arrow: build arrow T -> T -> ... -> T (binary by default).
-   NOTE (root-cause-D, commit after 31f4248): now DEAD CODE — the D2 fix
-   replaced tc-prim-lookup's unknown-primitive fallback from this binary
-   arrow to a fresh tvar, so no caller remains.  Retained (harmless)
-   for potential future use and to avoid churn.  Do NOT reintroduce it
-   as the unknown-fn fallback — the binary arrow produced false rejects
-   (partial-application 'arrow vs other') on non-2-arg calls. *\
-
-(define tc-fresh-arrow
-  { type --> type }
-  T -> (let T1 (tc-fresh-tvar (intern ""))
-         [arrow T [arrow T1 T]]))
-
 \* ===== Expression classification ===== *\
 
 (define tc-expr-tag
