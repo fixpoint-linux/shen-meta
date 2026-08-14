@@ -1376,6 +1376,9 @@ int main(int argc, char **argv) {
             gc_set_watch_alloc(strtoull(argv[++i], NULL, 0));
         if (strcmp(argv[i], "--gc-verify") == 0) gc_set_verify(1);
         if (strcmp(argv[i], "--gc-verify-codechains") == 0) gc_set_verify_codechains(1);
+        if (strcmp(argv[i], "--gc-verify-live") == 0) gc_set_verify_live(1);
+        else if (strcmp(argv[i], "--gc-verify-live-from") == 0 && i + 1 < argc)
+            gc_set_verify_live_from(strtol(argv[++i], NULL, 0));
     }
 
     if (argc > 1) {
@@ -2037,6 +2040,83 @@ int main(int argc, char **argv) {
                                 fi++;
                             }
                             printf("--- types.kl isolation done ---\n"); fflush(stdout);
+
+                            /* stlib.kl per-form compile isolation: find the first
+                             * defun that interp-eval cannot compile (currently fails
+                             * with 'No condition was true' from normalize.shen:19). */
+                            {
+                                const char *slp = "vendor/ShenOSKernel-41.2/klambda/stlib.kl";
+                                Value p = val_string(slp, (long)strlen(slp));
+                                Value forms = call_bundled_1("read-file-raw", p);
+                                printf("\n--- stlib.kl per-form compile isolation ---\n"); fflush(stdout);
+                                if (forms.tag != VAL_CONS) {
+                                    printf("  read-file-raw(stlib.kl) tag=%d\n", forms.tag); fflush(stdout);
+                                } else {
+                                    { /* count forms */
+                                        Value cc = forms; int n = 0;
+                                        while (cc.tag == VAL_CONS) { n++; cc = *cc.cons.cdr; }
+                                        printf("  read-file-raw(stlib.kl) form count=%d\n", n); fflush(stdout);
+                                    }
+                                    Value cur = forms;
+                                    gc_root_push_value(&cur);
+                                    gc_root_push_value(&forms);
+                                    int fi = 0;
+                                    while (cur.tag == VAL_CONS) {
+                                        Value form = *cur.cons.car;
+                                        gc_root_push_value(&form);
+                                        Value res = call_bundled_1("interp-eval", form);
+                                        gc_root_pop();  /* form */
+                                        if (res.tag == VAL_ERROR) {
+                                            printf("  form[%d] FAIL: ", fi);
+                                            if (form.cons.car != NULL && form.cons.car->tag == VAL_SYMBOL) printf("%s", form.cons.car->sym.name);
+                                            printf("\n    error="); print_value(res); printf("\n"); fflush(stdout);
+                                            /* kmacros-only isolation on the body */
+                                            Value c1 = *form.cons.cdr;          /* name args body */
+                                            Value c2 = *c1.cons.cdr;            /* args body */
+                                            Value c3 = *c2.cons.cdr;            /* (body) */
+                                            Value body = *c3.cons.car;          /* body */
+                                            Value k = call_bundled_1("kmacros", body);
+                                            printf("    kmacros(body): "); print_value(k); printf("\n"); fflush(stdout);
+                                            break;
+                                        } else {
+                                            printf("  form[%d] ok -> ", fi);
+                                            if (form.cons.car != NULL && form.cons.car->tag == VAL_SYMBOL) printf("%s", form.cons.car->sym.name);
+                                            printf("\n"); fflush(stdout);
+                                        }
+                                        cur = *cur.cons.cdr;
+                                        fi++;
+                                    }
+                                    gc_root_pop();  /* forms */
+                                    gc_root_pop();  /* cur */
+                                }
+                                /* Compile ONLY the last 3 forms (345-347) individually,
+                                 * each with proper rooting, to find which one fails
+                                 * whole-file interp-load-raw. */
+                                {
+                                    Value tail = forms;
+                                    int sk = 0;
+                                    while (tail.tag == VAL_CONS && sk < 345) { tail = *tail.cons.cdr; sk++; }
+                                    printf("  last-3 skip=%d tail_tag=%d\n", sk, tail.tag); fflush(stdout);
+                                    int li = 0;
+                                    Value tc = tail;
+                                    while (tc.tag == VAL_CONS && li < 5) {
+                                        Value tf = *tc.cons.car;
+                                        if (tf.cons.car != NULL && tf.cons.car->tag == VAL_SYMBOL)
+                                            printf("  last[%d] head=%s\n", li, tf.cons.car->sym.name); fflush(stdout);
+                                        gc_root_push_value(&tf);
+                                        Value tres = call_bundled_1("interp-eval", tf);
+                                        gc_root_pop();
+                                        printf("  last[%d] -> ", li);
+                                        if (tres.tag == VAL_ERROR) { printf("FAIL "); print_value(tres); }
+                                        else if (tres.tag == VAL_SYMBOL) printf("ok (%s)", tres.sym.name);
+                                        else printf("ok (tag=%d)", tres.tag);
+                                        printf("\n"); fflush(stdout);
+                                        tc = *tc.cons.cdr;
+                                        li++;
+                                    }
+                                }
+                                printf("--- stlib.kl isolation done ---\n"); fflush(stdout);
+                            }
 
                             /* Isolate the exact failing construct in declare:
                              * test curried multi-lambda application and @v/vector

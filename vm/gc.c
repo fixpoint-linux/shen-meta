@@ -134,10 +134,24 @@ void gc_set_watch_alloc(uintptr_t addr) { gc_watch_alloc = addr; }
 void gc_set_verify(int on)              { gc_verify      = on; }
 void gc_set_verify_codechains(int on)   { gc_verify_codechains = on; }
 
+/* --gc-verify-live: post-collection live-heap pointer verifier (Bug 2 hunt).
+ * Walks every object on pages the collector just scanned/evacuated and
+ * checks each GC-managed pointer field: after a nursery scavenge a scanned
+ * object must hold NO nursery pointers (evacuation replaces them with
+ * old-gen copies); after a full collect a live object must hold no pointers
+ * into the dead semi-space and no un-forwarded aliases of nursery objects
+ * promoted by Phase 0.  A violation names the owning object (address, page,
+ * GC type, field) — the precise root-miss site.  Purely diagnostic. */
+static int  gc_verify_live = 0;
+static long gc_verify_live_from = 0;   /* enable from this collect seq on */
+void gc_set_verify_live(int on)        { gc_verify_live = on; }
+void gc_set_verify_live_from(long seq) { gc_verify_live = 1; gc_verify_live_from = seq; }
+
 /* Forward-declared so collect() (defined earlier) can call it.  Defined
  * alongside the other opt-in helpers below gc_stale_scan_stack. */
 static void gc_verify_heap(const char *when);
 static void gc_verify_codechains_fn(const char *when);
+static void gc_verify_live_fn(const char *when, int post_nursery);
 
 /* All opt-in diagnostic output routes through this; defaults to stderr.
  * Fatal error exits and the ROOT_PTR interior-pointer fatal stay on stderr. */
@@ -459,6 +473,132 @@ static void evac_instr(Instr *in) {
     gc_evacuate((void **)&in->closure_code); /* evacuate closure_code pointer */
 }
 
+/* ---- shared Cheney drain (Bug 2 fix) -------------------------------
+ * The three drain loops (full-collect Phase 0, full-collect main scavenge,
+ * nursery scavenge) share one object-scanning switch and one queue policy.
+ *
+ * Bug 2 root cause being fixed here: a page's object walk may end EARLY at
+ * cp == freep while the page still has bump slack.  That early exit is only
+ * "done" if the queue is empty — the queue can still hold OLD pages queued
+ * later via gc_move's queue(page) branch, and scans of those pages promote/
+ * evacuate MORE objects into the slack of the already-dequeued page (freep
+ * stays on it).  Those later objects would never be visited (queue()'s
+ * page_queued dedup blocks re-queueing), so their pointer fields would never
+ * be evacuated — stale pointers into recycled memory (the "[symbol let]
+ * became bare let" corruption in the Shen OS load).
+ *
+ * Fix: deferred resume.  Only the freep page can receive new objects, so at
+ * most ONE page can be mid-catch-up at any time.  When a walk ends at
+ * cp == freep with pages still queued, record (page, cp) as the resume
+ * point instead of re-queueing (re-queueing re-walks the page from its
+ * start and degenerates to quadratic re-scanning).  The deferred region is
+ * walked (a) immediately when a NEW page catches up (the old page is
+ * finalized by then — its remaining slack is filler-capped, so the walk
+ * terminates at the filler), or (b) after the queue drains.  Each object is
+ * scanned at most twice, never quadratically. */
+
+/* drain_scan_object: the shared per-object typed scan. */
+static void drain_scan_object(uintptr_t *body, int ty, uintptr_t hw) {
+    switch (ty) {
+    case 0: /* GC_TYPE_RAW */ break;
+
+    case 1: /* GC_TYPE_VALUE */
+        gc_scan_value((Value *)body);
+        break;
+
+    case 2: { /* GC_TYPE_VALUE_ARRAY */
+        uintptr_t body_bytes = (hw - 1) * WORDBYTES;
+        int count = (int)(body_bytes / sizeof(Value));
+        Value *arr = (Value *)body;
+        for (int j = 0; j < count; j++)
+            gc_scan_value(&arr[j]);
+        break;
+    }
+
+    case 3: { /* GC_TYPE_INSTR_ARRAY */
+        uintptr_t body_bytes = (hw - 1) * WORDBYTES;
+        int count = (int)(body_bytes / sizeof(Instr));
+        Instr *arr = (Instr *)body;
+        for (int j = 0; j < count; j++)
+            evac_instr(&arr[j]);
+        break;
+    }
+
+    case 4: { /* GC_TYPE_CALLFRAME_ARRAY */
+        uintptr_t body_bytes = (hw - 1) * WORDBYTES;
+        int count = (int)(body_bytes / sizeof(CallFrame));
+        CallFrame *arr = (CallFrame *)body;
+        for (int j = 0; j < count; j++) {
+            gc_evacuate((void **)&arr[j].code);
+            gc_evacuate((void **)&arr[j].env);
+            gc_evacuate((void **)&arr[j].stack.data);
+        }
+        break;
+    }
+
+    default: break;
+    }
+}
+
+/* drain_walk_page: walk objects on page qpg starting at cp, stopping at the
+ * page boundary, at freep (when freep is on this page), or at an invalid
+ * header (false-positive guard, same as the original drain loops).  Returns
+ * the cursor where the walk stopped.  Scanning may append pages to the
+ * queue and advance freep; both are picked up by the caller. */
+static uintptr_t *drain_walk_page(uintptr_t qpg, uintptr_t *cp) {
+    while (GCP_to_PAGE(cp) == qpg && cp != freep) {
+        uintptr_t hw = HEADER_WORDS(*cp);
+        int ty = HEADER_TYPE(*cp);
+
+        if (hw == 0) break;
+        if (ty < 0 || ty > GC_TYPE_CALLFRAME_ARRAY) break;
+
+        drain_scan_object(cp + 1, ty, hw);
+        cp += hw;
+    }
+    return cp;
+}
+
+/* cheney_drain: drain the Cheney queue with the deferred-resume policy. */
+static void cheney_drain(void) {
+    uintptr_t defer_pg = 0;
+    uintptr_t *defer_cp = NULL;
+
+    for (;;) {
+        while (queue_head != 0) {
+            uintptr_t qpg = queue_head;
+            uintptr_t *cp = drain_walk_page(qpg, PAGE_to_GCP(qpg));
+            queue_head = gc_link[queue_head];
+            /* Walk caught up with the bump frontier mid-page while pages
+             * remain queued: defer this page's remaining slack. */
+            if (queue_head != 0 && cp == freep && GCP_to_PAGE(freep) == qpg) {
+                if (defer_pg != 0 && defer_pg != qpg) {
+                    /* A new page caught up, so freep left the old deferred
+                     * page — its slack is filler-capped.  Walk the tail now
+                     * (its scanning may queue pages / allocate). */
+                    drain_walk_page(defer_pg, defer_cp);
+                }
+                defer_pg = qpg;
+                defer_cp = cp;
+            }
+        }
+        if (defer_pg == 0) break;
+
+        if (GCP_to_PAGE(freep) != defer_pg) {
+            /* freep moved on — the deferred page's slack is filler-capped;
+             * walk its tail once (stops at the filler / page boundary). */
+            drain_walk_page(defer_pg, defer_cp);
+            defer_pg = 0;
+            continue;   /* the tail walk may have queued pages */
+        }
+        if (freep == defer_cp) break;   /* no growth — genuinely done */
+        uintptr_t *cp = drain_walk_page(defer_pg, defer_cp);
+        defer_cp = cp;
+        if (GCP_to_PAGE(cp) != defer_pg) defer_pg = 0;   /* page crossed */
+        /* loop back: the flush walk may have queued pages */
+    }
+}
+
 /* ---- collector ---------------------------------------------------- */
 
 static void collect(const char *trigger) {
@@ -537,63 +677,9 @@ static void collect(const char *trigger) {
             }
         }
 
-        /* Cheney drain: same pattern as collect_nursery */
-        while (queue_head != 0) {
-            uintptr_t qpg  = queue_head;
-            uintptr_t *cp  = PAGE_to_GCP(qpg);
-
-            while (GCP_to_PAGE(cp) == qpg && cp != freep) {
-                uintptr_t hw = HEADER_WORDS(*cp);
-                int ty = HEADER_TYPE(*cp);
-
-                if (hw == 0) break;
-                if (ty < 0 || ty > GC_TYPE_CALLFRAME_ARRAY) break;
-                uintptr_t *body = cp + 1;
-
-                switch (ty) {
-                case 0: /* GC_TYPE_RAW */ break;
-
-                case 1: /* GC_TYPE_VALUE */
-                    gc_scan_value((Value *)body);
-                    break;
-
-                case 2: { /* GC_TYPE_VALUE_ARRAY */
-                    uintptr_t body_bytes = (hw - 1) * WORDBYTES;
-                    int count = (int)(body_bytes / sizeof(Value));
-                    Value *arr = (Value *)body;
-                    for (int j = 0; j < count; j++)
-                        gc_scan_value(&arr[j]);
-                    break;
-                }
-
-                case 3: { /* GC_TYPE_INSTR_ARRAY */
-                    uintptr_t body_bytes = (hw - 1) * WORDBYTES;
-                    int count = (int)(body_bytes / sizeof(Instr));
-                    Instr *arr = (Instr *)body;
-                    for (int j = 0; j < count; j++)
-                        evac_instr(&arr[j]);
-                    break;
-                }
-
-                case 4: { /* GC_TYPE_CALLFRAME_ARRAY */
-                    uintptr_t body_bytes = (hw - 1) * WORDBYTES;
-                    int count = (int)(body_bytes / sizeof(CallFrame));
-                    CallFrame *arr = (CallFrame *)body;
-                    for (int j = 0; j < count; j++) {
-                        gc_evacuate((void **)&arr[j].code);
-                        gc_evacuate((void **)&arr[j].env);
-                        gc_evacuate((void **)&arr[j].stack.data);
-                    }
-                    break;
-                }
-
-                default: break;
-                }
-
-                cp += hw;
-            }
-            queue_head = gc_link[queue_head];
-        }
+        /* Cheney drain (shared drain_scan_object / deferred-resume policy —
+         * see cheney_drain for the Bug 2 catch-up fix). */
+        cheney_drain();
 
         /* Promotion allocated in old-gen; finalise any partial page so the
          * full collect's gcalloc_internal starts from a clean slate in
@@ -619,74 +705,10 @@ static void collect(const char *trigger) {
     gc_scan_roots();
 
     /* ---- Cheney scavenge ---- */
-
-    while (queue_head != 0) {
-        uintptr_t *cp = PAGE_to_GCP(queue_head);
-        while (GCP_to_PAGE(cp) == queue_head && cp != freep) {
-            uintptr_t hw = HEADER_WORDS(*cp);
-
-            /* False-positive guard: a random stack value may look like a
-             * valid header.  Validate by the type tag, NOT by a word-count
-             * bound: the header type must be one of the 5 real tags.  (An
-             * upper word bound like PAGEWORDS*2 would silently skip large
-             * legitimate objects — e.g. the multi-MB frame_stack or grown
-             * env/value arrays — leaving their interior pointers unevacuated
-             * and dangling.  hw itself is bounded by HEADER_WORDS' 24-bit
-             * field, and a real header always carries a valid type tag.) */
-            int ty = HEADER_TYPE(*cp);
-            if (hw == 0) break;                       /* NULL header — false */
-            if (ty < 0 || ty > GC_TYPE_CALLFRAME_ARRAY) break;  /* false pos */
-            uintptr_t *body = cp + 1;
-
-            switch (ty) {
-            case 0: /* GC_TYPE_RAW — no pointers */
-                break;
-
-            case 1: /* GC_TYPE_VALUE — single Value */
-                gc_scan_value((Value *)body);
-                break;
-
-            case 2: { /* GC_TYPE_VALUE_ARRAY — Value[] */
-                /* bytes = (hw - 1) * WORDBYTES; count = bytes / sizeof(Value) */
-                uintptr_t body_bytes = (hw - 1) * WORDBYTES;
-                int count = (int)(body_bytes / sizeof(Value));
-                Value *arr = (Value *)body;
-                for (int j = 0; j < count; j++)
-                    gc_scan_value(&arr[j]);
-                break;
-            }
-
-            case 3: { /* GC_TYPE_INSTR_ARRAY — Instr[] */
-                uintptr_t body_bytes = (hw - 1) * WORDBYTES;
-                int count = (int)(body_bytes / sizeof(Instr));
-                Instr *arr = (Instr *)body;
-                for (int j = 0; j < count; j++)
-                    evac_instr(&arr[j]);
-                break;
-            }
-
-            case 4: { /* GC_TYPE_CALLFRAME_ARRAY — CallFrame[] */
-                uintptr_t body_bytes = (hw - 1) * WORDBYTES;
-                int count = (int)(body_bytes / sizeof(CallFrame));
-                CallFrame *arr = (CallFrame *)body;
-                for (int j = 0; j < count; j++) {
-                    gc_evacuate((void **)&arr[j].code);
-                    gc_evacuate((void **)&arr[j].env);
-                    gc_evacuate((void **)&arr[j].stack.data);
-                }
-                break;
-            }
-
-            default:
-                /* Unknown type — skip (conservative: don't crash on
-                 * false-positive header reads) */
-                break;
-            }
-
-            cp += hw;
-        }
-        queue_head = gc_link[queue_head];
-    }
+    /* Shared drain with the deferred-resume catch-up policy (Bug 2 fix —
+     * see cheney_drain): objects evacuated into a to-space page's bump
+     * slack after that page's walk caught up with freep are still scanned. */
+    cheney_drain();
 
     /* ---- finish ---- */
 
@@ -717,6 +739,7 @@ static void collect(const char *trigger) {
      * never aborts, only logs. */
     gc_verify_heap("post-collect");
     gc_verify_codechains_fn("post-collect");
+    gc_verify_live_fn("post-collect", 0);
 
     /* Restore the previous SIGALRM mask */
     sigprocmask(SIG_SETMASK, &old_sig_set, NULL);
@@ -1088,6 +1111,358 @@ static void gc_verify_codechains_fn(const char *when) {
     #undef DRAIN
 }
 
+/* ---- opt-in live-heap pointer verifier (--gc-verify-live) ------------ */
+
+/* forward decls (defined below, after the check helpers) */
+static uintptr_t vlive_rev_target1;
+static uintptr_t vlive_cur_owner;
+static void vlive_reverse_search(int post_nursery);
+
+/* vlive_check: check one GC-managed pointer field of an owner object. */
+static long vlive_bad = 0;
+static void vlive_check(const char *owner_desc, const char *field,
+                        void *ptr, int post_nursery) {
+    if (ptr == NULL) return;
+    uintptr_t pg = GCP_to_PAGE(ptr);
+    if (pg < firstheappage || pg > lastheappage) {
+        if (vlive_bad < 50)
+            fprintf(GC_LOG, "[GC VERIFY-LIVE #%ld] owner=%s %s: ptr=%p OUT OF HEAP\n",
+                    gc_collect_seq, owner_desc, field, ptr);
+        vlive_bad++;
+        return;
+    }
+    uintptr_t sp = space[pg];
+    if (sp == NURSERY) {
+        if (post_nursery) {
+            /* scanned object still holding a nursery pointer: evacuation
+             * should have replaced it with the promoted old-gen copy. */
+            if (vlive_bad < 50) {
+                uintptr_t hdr = ((uintptr_t *)ptr)[-1];
+                fprintf(GC_LOG, "[GC VERIFY-LIVE #%ld] owner=%s %s: ptr=%p NURSERY "
+                        "(post-scavenge; hdr=0x%lx fwd=%d) — unpromoted nursery ref\n",
+                        gc_collect_seq, owner_desc, field, ptr,
+                        (unsigned long)hdr, (int)FORWARDED(hdr));
+            }
+            vlive_bad++;
+        } else {
+            /* post full collect: nursery is untouched by design, but an
+             * object promoted during Phase 0 left a FORWARDED header; a
+             * live pointer still aimed at the OLD copy is a missed update. */
+            uintptr_t hdr = ((uintptr_t *)ptr)[-1];
+            if (FORWARDED(hdr)) {
+                if (vlive_bad < 50)
+                    fprintf(GC_LOG, "[GC VERIFY-LIVE #%ld] owner=%s %s: ptr=%p NURSERY "
+                            "FORWARDED (alias of promoted obj, new=%p) — Phase-0 miss\n",
+                            gc_collect_seq, owner_desc, field, ptr, (void *)hdr);
+                if (vlive_rev_target1 == 0)
+                    vlive_rev_target1 = vlive_cur_owner;  /* reverse-search this owner */
+                vlive_bad++;
+            }
+        }
+        return;
+    }
+    if (sp != current_space) {
+        if (vlive_bad < 50)
+            fprintf(GC_LOG, "[GC VERIFY-LIVE #%ld] owner=%s %s: ptr=%p page=%lu space=%lu "
+                    "(current=%lu) — DEAD SPACE\n",
+                    gc_collect_seq, owner_desc, field, ptr,
+                    (unsigned long)pg, (unsigned long)sp, (unsigned long)current_space);
+        vlive_bad++;
+    }
+}
+
+/* vlive_value2: check the GC-managed pointer fields of one Value.
+ * Mirrors gc_scan_value exactly (str.data is NOT checked — scratch-mode
+ * parse operands are malloc'd C-heap strings).  post_nursery is passed via
+ * the file-static vlive_post_nursery set by the walker (single-threaded
+ * collector — safe). */
+static int vlive_post_nursery = 0;
+static void vlive_value2(const Value *v, const char *owner_desc, const char *field) {
+    char sub[192];
+    switch (v->tag) {
+    case VAL_CONS:
+        snprintf(sub, sizeof(sub), "%s.%s.car", owner_desc, field);
+        vlive_check(sub, "cons.car", v->cons.car, vlive_post_nursery);
+        snprintf(sub, sizeof(sub), "%s.%s.cdr", owner_desc, field);
+        vlive_check(sub, "cons.cdr", v->cons.cdr, vlive_post_nursery);
+        break;
+    case VAL_LAMBDA:
+        snprintf(sub, sizeof(sub), "%s.%s.code", owner_desc, field);
+        vlive_check(sub, "lambda.code", v->lambda.code, vlive_post_nursery);
+        snprintf(sub, sizeof(sub), "%s.%s.env", owner_desc, field);
+        vlive_check(sub, "lambda.env", v->lambda.env, vlive_post_nursery);
+        break;
+    case VAL_VECTOR:
+        snprintf(sub, sizeof(sub), "%s.%s.data", owner_desc, field);
+        vlive_check(sub, "vector.data", v->vector.data, vlive_post_nursery);
+        break;
+    default:
+        break;
+    }
+}
+
+/* vlive_object: walk one object body at cp (header already validated). */
+
+static void vlive_object(uintptr_t *body, int ty, uintptr_t hw, int post_nursery) {
+    char desc[96];
+    vlive_post_nursery = post_nursery;
+    vlive_cur_owner = (uintptr_t)body;
+    switch (ty) {
+    case 1: { /* GC_TYPE_VALUE */
+        snprintf(desc, sizeof(desc), "VALUE@%p", (void *)body);
+        vlive_value2((Value *)body, desc, "");
+        break;
+    }
+    case 2: { /* GC_TYPE_VALUE_ARRAY */
+        uintptr_t body_bytes = (hw - 1) * WORDBYTES;
+        int count = (int)(body_bytes / sizeof(Value));
+        Value *arr = (Value *)body;
+        for (int j = 0; j < count; j++) {
+            snprintf(desc, sizeof(desc), "VARR@%p[%d/%d]", (void *)body, j, count);
+            vlive_value2(&arr[j], desc, "el");
+        }
+        break;
+    }
+    case 3: { /* GC_TYPE_INSTR_ARRAY */
+        uintptr_t body_bytes = (hw - 1) * WORDBYTES;
+        int count = (int)(body_bytes / sizeof(Instr));
+        Instr *arr = (Instr *)body;
+        for (int j = 0; j < count; j++) {
+            snprintf(desc, sizeof(desc), "IARR@%p[%d/%d]", (void *)body, j, count);
+            vlive_value2(&arr[j].operand, desc, "operand");
+            snprintf(desc, sizeof(desc), "IARR@%p[%d]", (void *)body, j);
+            vlive_check(desc, "closure_code", arr[j].closure_code,
+                        post_nursery);
+        }
+        break;
+    }
+    case 4: { /* GC_TYPE_CALLFRAME_ARRAY */
+        uintptr_t body_bytes = (hw - 1) * WORDBYTES;
+        int count = (int)(body_bytes / sizeof(CallFrame));
+        CallFrame *arr = (CallFrame *)body;
+        for (int j = 0; j < count; j++) {
+            snprintf(desc, sizeof(desc), "CFRAME@%p[%d/%d]", (void *)body, j, count);
+            vlive_check(desc, "code", arr[j].code, post_nursery);
+            vlive_check(desc, "env", arr[j].env, post_nursery);
+            vlive_check(desc, "stack.data", arr[j].stack.data, post_nursery);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* ---- reverse-reference search (Bug 2 localization) ------------------ */
+/* When the live verifier flags its first Phase-0 miss, find and print every
+ * heap object / root slot / table entry that references the stale owner, and
+ * one more level up — revealing the reachability path the collector missed. */
+
+static uintptr_t vlive_rev_target1;   /* stale owner array (fwd-declared) */
+static uintptr_t vlive_rev_target2 = 0;
+
+static void vlive_rev_note(const char *kind, void *referer, void *t) {
+    fprintf(GC_LOG, "[GC VERIFY-LIVE REV] %s referer=%p -> target=%p\n",
+            kind, referer, t);
+}
+
+static int vlive_rev_check_value(const Value *v, const char *where, int depth);
+
+static int vlive_rev_check_ptr(void *ptr, const char *where, int depth) {
+    if ((uintptr_t)ptr == vlive_rev_target1 ||
+        (depth == 2 && (uintptr_t)ptr == vlive_rev_target2)) {
+        vlive_rev_note(where, (void *)0, ptr);
+        if (depth == 1 && vlive_rev_target2 == 0)
+            vlive_rev_target2 = (uintptr_t)ptr;   /* remember one referer */
+        return 1;
+    }
+    return 0;
+}
+
+static int vlive_rev_check_value(const Value *v, const char *where, int depth) {
+    int hit = 0;
+    char sub[192];
+    switch (v->tag) {
+    case VAL_CONS:
+        snprintf(sub, sizeof(sub), "%s.car", where);
+        hit |= vlive_rev_check_ptr(v->cons.car, sub, depth);
+        snprintf(sub, sizeof(sub), "%s.cdr", where);
+        hit |= vlive_rev_check_ptr(v->cons.cdr, sub, depth);
+        break;
+    case VAL_LAMBDA:
+        snprintf(sub, sizeof(sub), "%s.code", where);
+        hit |= vlive_rev_check_ptr(v->lambda.code, sub, depth);
+        snprintf(sub, sizeof(sub), "%s.env", where);
+        hit |= vlive_rev_check_ptr(v->lambda.env, sub, depth);
+        break;
+    case VAL_VECTOR:
+        snprintf(sub, sizeof(sub), "%s.data", where);
+        hit |= vlive_rev_check_ptr(v->vector.data, sub, depth);
+        break;
+    default: break;
+    }
+    return hit;
+}
+
+static void vlive_reverse_search(int post_nursery) {
+    if (!vlive_rev_target1) return;
+    vlive_rev_target2 = 0;
+    char desc[96];
+    long referers = 0;
+
+    /* 1. shadow-stack root slots */
+    for (size_t i = 0; i < shadow_len; i++) {
+        GcRoot *r = &shadow_stack[i];
+        switch (r->kind) {
+        case ROOT_PTR:
+            if ((uintptr_t)*(void **)r->slot == vlive_rev_target1) {
+                fprintf(GC_LOG, "[GC VERIFY-LIVE REV] shadow[%zu] ROOT_PTR slot=%p -> target\n",
+                        i, r->slot);
+                referers++;
+            }
+            break;
+        case ROOT_VALUE:
+        case ROOT_VALUE_VOLATILE: {
+            char w[64];
+            snprintf(w, sizeof(w), "shadow[%zu].ROOT_VALUE", i);
+            referers += vlive_rev_check_value((Value *)r->slot, w, 1);
+            break;
+        }
+        case ROOT_VALUE_ARRAY: {
+            Value *base = (Value *)r->slot;
+            int n = *(r->np);
+            for (int j = 0; j < n; j++) {
+                snprintf(desc, sizeof(desc), "shadow[%zu].VARR[%d/%d]", i, j, n);
+                referers += vlive_rev_check_value(&base[j], desc, 1);
+            }
+            break;
+        }
+        default: break;
+        }
+    }
+
+    /* 2. defun + values tables */
+    if (reg_global_table && reg_global_table_len) {
+        TableEntry *gt = (TableEntry *)reg_global_table;
+        for (int i = 0; i < *reg_global_table_len; i++) {
+            if (gt[i].name == NULL) continue;
+            snprintf(desc, sizeof(desc), "defun[%d]='%s'", i, gt[i].name);
+            referers += vlive_rev_check_value(&gt[i].value, desc, 1);
+        }
+    }
+    if (reg_values_table && reg_values_table_len) {
+        TableEntry *vt = (TableEntry *)reg_values_table;
+        for (int i = 0; i < *reg_values_table_len; i++) {
+            if (vt[i].name == NULL) continue;
+            snprintf(desc, sizeof(desc), "value[%d]='%s'", i, vt[i].name);
+            referers += vlive_rev_check_value(&vt[i].value, desc, 1);
+        }
+    }
+
+    /* 3. heap objects (live pages) */
+    for (uintptr_t pg = firstheappage; pg <= lastheappage && referers < 24; pg++) {
+        if (space[pg] != current_space) continue;
+        if (type_page[pg] != OBJECT) continue;
+        if (post_nursery && !page_queued[pg]) continue;
+        uintptr_t *cp = PAGE_to_GCP(pg);
+        if (FORWARDED(*cp)) continue;
+        while (GCP_to_PAGE(cp) == pg && cp != freep) {
+            uintptr_t hdr = *cp;
+            int ty = HEADER_TYPE(hdr);
+            if (FORWARDED(hdr) || HEADER_WORDS(hdr) == 0 ||
+                ty < 0 || ty > GC_TYPE_CALLFRAME_ARRAY) break;
+            uintptr_t hw = HEADER_WORDS(hdr);
+            uintptr_t *body = cp + 1;
+            switch (ty) {
+            case 1:
+                snprintf(desc, sizeof(desc), "VALUE@%p", (void *)body);
+                vlive_rev_check_value((Value *)body, desc, 1);
+                break;
+            case 2: {
+                uintptr_t body_bytes = (hw - 1) * WORDBYTES;
+                int count = (int)(body_bytes / sizeof(Value));
+                Value *arr = (Value *)body;
+                for (int j = 0; j < count; j++) {
+                    snprintf(desc, sizeof(desc), "VARR@%p[%d/%d]", (void *)body, j, count);
+                    vlive_rev_check_value(&arr[j], desc, 1);
+                }
+                break;
+            }
+            case 3: {
+                uintptr_t body_bytes = (hw - 1) * WORDBYTES;
+                int count = (int)(body_bytes / sizeof(Instr));
+                Instr *arr = (Instr *)body;
+                for (int j = 0; j < count; j++) {
+                    snprintf(desc, sizeof(desc), "IARR@%p[%d].operand", (void *)body, j);
+                    vlive_rev_check_value(&arr[j].operand, desc, 1);
+                    snprintf(desc, sizeof(desc), "IARR@%p[%d].cc", (void *)body, j);
+                    vlive_rev_check_ptr(arr[j].closure_code, desc, 1);
+                }
+                break;
+            }
+            case 4: {
+                uintptr_t body_bytes = (hw - 1) * WORDBYTES;
+                int count = (int)(body_bytes / sizeof(CallFrame));
+                CallFrame *arr = (CallFrame *)body;
+                for (int j = 0; j < count; j++) {
+                    snprintf(desc, sizeof(desc), "CFRAME@%p[%d].code", (void *)body, j);
+                    vlive_rev_check_ptr(arr[j].code, desc, 1);
+                    snprintf(desc, sizeof(desc), "CFRAME@%p[%d].env", (void *)body, j);
+                    vlive_rev_check_ptr(arr[j].env, desc, 1);
+                    snprintf(desc, sizeof(desc), "CFRAME@%p[%d].stack.data", (void *)body, j);
+                    vlive_rev_check_ptr(arr[j].stack.data, desc, 1);
+                }
+                break;
+            }
+            default: break;
+            }
+            cp += hw;
+        }
+    }
+    (void)referers;
+}
+
+/* gc_verify_live_fn: walk the pages the collector just processed and check
+ * every pointer field of every object on them.
+ *   post_nursery=1: after collect_nursery's drain (call BEFORE the nursery
+ *     reset) — pages are the queued (scanned) ones; any nursery pointer in
+ *     a scanned object is a miss.
+ *   post_nursery=0: after collect()'s main scavenge (call after the space
+ *     flip / dead-page release) — all current_space pages are live; dead-
+ *     space pointers and FORWARDED-nursery aliases are misses. */
+static void gc_verify_live_fn(const char *when, int post_nursery) {
+    if (!gc_verify_live || (long)gc_collect_seq < gc_verify_live_from) return;
+
+    long pages = 0, objects = 0;
+    vlive_bad = 0;
+    const long max_objects = 40000000;
+
+    for (uintptr_t pg = firstheappage; pg <= lastheappage; pg++) {
+        if (space[pg] != current_space) continue;
+        if (type_page[pg] != OBJECT) continue;          /* tail pages walked via head */
+        if (post_nursery && !page_queued[pg]) continue; /* only scanned pages */
+        pages++;
+
+        uintptr_t *cp = PAGE_to_GCP(pg);
+        if (FORWARDED(*cp)) continue;                   /* stale retained from-space */
+        while (GCP_to_PAGE(cp) == pg && cp != freep && objects < max_objects) {
+            uintptr_t hdr = *cp;
+            int ty = HEADER_TYPE(hdr);
+            if (FORWARDED(hdr) || HEADER_WORDS(hdr) == 0 ||
+                ty < 0 || ty > GC_TYPE_CALLFRAME_ARRAY)
+                break;                                  /* same break as the drain */
+            objects++;
+            vlive_object(cp + 1, ty, HEADER_WORDS(hdr), post_nursery);
+            cp += HEADER_WORDS(hdr);
+        }
+    }
+    if (vlive_bad > 0 && vlive_rev_target1 != 0)
+        vlive_reverse_search(post_nursery);
+    fprintf(GC_LOG, "[GC VERIFY-LIVE #%ld] %s pages=%ld objects=%ld bad=%ld\n",
+            gc_collect_seq, when, pages, objects, vlive_bad);
+    vlive_rev_target1 = 0;   /* fresh attribution next pass */
+}
+
 /* ---- nursery collection (Phase 4b.2 — copying scavenge) ------------- */
 
 /* gc_scan_roots: walk the precise-root shadow stack + typed walkers.
@@ -1314,65 +1689,18 @@ static void collect_nursery(const char *trigger) {
     /* ---- Cheney scavenge ---- */
     /* Under 4b.2 copying scavenge, nursery objects are copied to old-gen
      * and the destination pages are queued via allocatepage.  The drain
-     * processes old-gen pages; nursery pages are never queued. */
+     * processes old-gen pages; nursery pages are never queued.
+     * Shared drain with the deferred-resume catch-up policy (Bug 2 fix —
+     * see cheney_drain): nursery survivors promoted into a promotion page's
+     * bump slack after that page's walk caught up with freep are still
+     * scanned. */
+    cheney_drain();
 
-    while (queue_head != 0) {
-        uintptr_t qpg  = queue_head;
-        uintptr_t *cp  = PAGE_to_GCP(qpg);
-
-        while (GCP_to_PAGE(cp) == qpg && cp != freep) {
-            uintptr_t hw = HEADER_WORDS(*cp);
-            int ty = HEADER_TYPE(*cp);
-
-            /* False-positive guard (same as collect()) */
-            if (hw == 0) break;
-            if (ty < 0 || ty > GC_TYPE_CALLFRAME_ARRAY) break;
-            uintptr_t *body = cp + 1;
-
-            switch (ty) {
-            case 0: /* GC_TYPE_RAW */ break;
-
-            case 1: /* GC_TYPE_VALUE */
-                gc_scan_value((Value *)body);
-                break;
-
-            case 2: { /* GC_TYPE_VALUE_ARRAY */
-                uintptr_t body_bytes = (hw - 1) * WORDBYTES;
-                int count = (int)(body_bytes / sizeof(Value));
-                Value *arr = (Value *)body;
-                for (int j = 0; j < count; j++)
-                    gc_scan_value(&arr[j]);
-                break;
-            }
-
-            case 3: { /* GC_TYPE_INSTR_ARRAY */
-                uintptr_t body_bytes = (hw - 1) * WORDBYTES;
-                int count = (int)(body_bytes / sizeof(Instr));
-                Instr *arr = (Instr *)body;
-                for (int j = 0; j < count; j++)
-                    evac_instr(&arr[j]);
-                break;
-            }
-
-            case 4: { /* GC_TYPE_CALLFRAME_ARRAY */
-                uintptr_t body_bytes = (hw - 1) * WORDBYTES;
-                int count = (int)(body_bytes / sizeof(CallFrame));
-                CallFrame *arr = (CallFrame *)body;
-                for (int j = 0; j < count; j++) {
-                    gc_evacuate((void **)&arr[j].code);
-                    gc_evacuate((void **)&arr[j].env);
-                    gc_evacuate((void **)&arr[j].stack.data);
-                }
-                break;
-            }
-
-            default: break;
-            }
-
-            cp += hw;
-        }
-        queue_head = gc_link[queue_head];
-    }
+    /* ---- opt-in live-pointer verification (--gc-verify-live) ----
+     * Run BEFORE the nursery reset so old nursery contents (and FORWARDED
+     * headers of promoted survivors) are still readable.  Only pages the
+     * drain actually scanned (page_queued) are checked. */
+    gc_verify_live_fn("post-nursery", 1);
 
     /* ---- reset nursery: full reclaim ---- */
     /* Under copying scavenge, survivors have been copied to old-gen.
@@ -1674,6 +2002,17 @@ void *gc_move(void *p) {
     cp   = (uintptr_t *)p;
     page = GCP_to_PAGE(cp);
 
+    /* Opt-in watch on gc_move ENTRY (covers the early-return paths the
+     * gcalloc/move_internal watchers miss: already-to-space + forwarded). */
+    if (gc_watch_alloc && (uintptr_t)p == gc_watch_alloc) {
+        fprintf(GC_LOG, "[GC WATCH-MOVE #%ld] gc_move(%p) page=%lu space=%lu "
+                "current=%lu next=%lu in_scavenge=%d\n",
+                gc_collect_seq, p, (unsigned long)page,
+                (unsigned long)((page >= firstheappage && page <= lastheappage) ? space[page] : 0),
+                (unsigned long)current_space, (unsigned long)next_space, in_scavenge);
+        gc_backtrace(GC_LOG);
+    }
+
     /* Not in heap at all? */
     if (page < firstheappage || page > lastheappage)
         return p;
@@ -1729,9 +2068,19 @@ void gc_init(uintptr_t heap_size) {
     heap_mmap_size = (heap_size * 16 > (4096ULL * 1024 * 1024))
                      ? heap_size * 16 + PAGEBYTES - 1
                      : 4096ULL * 1024 * 1024 + PAGEBYTES - 1;
-    raw_heap_start = mmap(NULL, heap_mmap_size,
+    /* Debug aid (opt-in): pin the heap at a fixed address so addresses are
+     * stable across runs (ASLR defeats address-watch tooling).  Purely
+     * diagnostic; unset in production. */
+    void *hint = NULL;
+    const char *fixed = getenv("GC_FIXED_HEAP_ADDR");
+    if (fixed && *fixed) {
+        unsigned long long a = strtoull(fixed, NULL, 0);
+        if (a) hint = (void *)a;
+    }
+    raw_heap_start = mmap(hint, heap_mmap_size,
                           PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS,
+                          hint ? (MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE)
+                               : (MAP_PRIVATE | MAP_ANONYMOUS),
                           -1, 0);
     if (raw_heap_start == MAP_FAILED) {
         fprintf(stderr, "gc_init: mmap failed for %zu bytes\n",
@@ -1910,8 +2259,19 @@ void *gc_alloc(size_t bytes, int type_tag) {
      * is getting full.  allocatepage() also triggers collect() as a
      * last resort, but pre-emptive collection here improves throughput
      * and keeps the heap from filling to the brink. */
-    if (allocatedpages > 0 && allocatedpages > oldgen_collect_threshold() && !in_scavenge)
+    if (allocatedpages > 0 && allocatedpages > oldgen_collect_threshold() && !in_scavenge) {
         collect("THRESHOLD");
+        /* Anti-thrash: if the LIVE set still sits at/above the threshold
+         * after collecting, the next old-gen allocation would fire another
+         * full collect immediately — collecting forever with no progress
+         * (observed when the live set crosses heappages/4 on a small heap;
+         * the pre-Bug-2 collector dodged this only by silently dropping
+         * live objects).  Grow the heap so the threshold rises above the
+         * live set.  Best effort: if the VAS reservation is exhausted,
+         * keep the old behavior. */
+        if (allocatedpages > oldgen_collect_threshold())
+            grow_heap(1);
+    }
 
     return gcalloc_internal(bytes, type_tag);
 }
@@ -1927,8 +2287,12 @@ void *gc_alloc_oldgen(size_t bytes, int type_tag) {
     /* Force allocation through the old-gen path, bypassing the nursery
      * entirely.  Used for large objects (frame_stack, big arrays) that
      * would never fit in the nursery and would fragment it. */
-    if (allocatedpages > 0 && allocatedpages > oldgen_collect_threshold() && !in_scavenge)
+    if (allocatedpages > 0 && allocatedpages > oldgen_collect_threshold() && !in_scavenge) {
         collect("ALLOC");
+        /* Anti-thrash — same rationale as gc_alloc above. */
+        if (allocatedpages > oldgen_collect_threshold())
+            grow_heap(1);
+    }
 
     return gcalloc_internal(bytes, type_tag);
 }

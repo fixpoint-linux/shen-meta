@@ -25,6 +25,8 @@ observability, no GC correctness/semantics change. Release build and default
 | Root-set dump | `--gc-dump-roots` | Dumps the shadow stack at each collection (now cross-checks each root's pointee page liveness — flags `DEAD-SPACE` roots) |
 | Stale-ref scan | `--gc-stale-scan` | Walks the native C stack after each collection, flagging words that point into the just-abandoned old-gen semi-space or the nursery. `FORWARDED` header = smoking-gun root-miss (object moved, this ref not updated). Prints per-frame attribution so the owning C function can be resolved. |
 | GC log file | `--gc-log <path>` | Routes opt-in GC diagnostics to a file instead of interleaving with Shen `fn`/`run time` stderr noise |
+| Live-heap pointer verifier | `--gc-verify-live` / `--gc-verify-live-from N` | After each collection, walks every object on the pages the collector just scanned/evacuated and checks each GC-managed pointer field: dead-space pointers, unpromoted nursery refs after a scavenge, and un-followed FORWARDED nursery aliases (Phase-0 misses) are flagged WITH owner attribution (object address, GC type, field; CallFrame index for frame arrays) plus a reverse-reference search naming the holder. `--gc-verify-live-from N` enables it only from collect #N onward (it is O(live heap) per collection). This is the tool that cracked Bug 2. |
+| Fixed heap address | `GC_FIXED_HEAP_ADDR=0x...` env | Pins the heap mmap at a fixed address so object addresses are stable across runs (ASLR defeats `--gc-watch-alloc`). Debug aid only. |
 
 ### Where things live
 
@@ -111,7 +113,65 @@ pointer) was not rooted/updated during the deep recursion.
   closure). The `not` fix lets debruijn execute further, but a closure's `.code`
   is still corrupted mid-compile. The specific unrooted C local is not yet found.
 
-### Bug 2 — stale-scan localization (commit `---`)
+### Bug 2 (RESOLVED) — precise-root-miss GC corruption in the defun-compile path
+
+**Root cause (found with the new `--gc-verify-live` heap verifier):** a
+collector-invariant bug in the page-queue Cheney drain shared by all three
+collection passes (`collect()` Phase-0 promotion, `collect()` main scavenge,
+`collect_nursery()`).
+
+A page's object walk terminates early at `cp == freep` when the page still
+has bump-allocation slack.  That early exit is only sound when the Cheney
+queue is empty at that moment — but the queue can still hold OLD pages
+appended later via `gc_move`'s `queue(page)` branch.  The drain moves on to
+those pages; their scans promote/evacuate MORE objects into the slack of the
+already-dequeued page (`freep` stays on it); and the page is never revisited
+(it is already dequeued, and `queue()`'s `page_queued` dedup blocks
+re-queueing).  Those never-scanned objects keep un-evacuated interior
+pointers — e.g. stale nursery pointers whose targets were promoted
+elsewhere — which after the semi-space flip and page recycling alias
+arbitrary live objects.  This is exactly the "[symbol let] arrived as bare
+`let`" corruption that failed stlib.kl form[345]
+(`stlib.initialise-sources`) in the cumulative 22-file compile at 256MB
+(1/1111 fail) but not at 1GB (0/1111) — pure heap-pressure dependence
+because the miss needs the drain/queue interleaving to line up.
+
+**Evidence chain** (all reproducible with the tooling below):
+
+- `--gc-verify-live` flagged, at full collect #2474, live 1-element env
+  arrays whose cons car/cdr still pointed at NURSERY objects with fresh
+  FORWARDED headers — a Phase-0 trace miss with owner attribution;
+- the verifier's built-in reverse-reference search identified the holder:
+  `CFRAME[...][1].env` of a nested `vm_exec_env` frame stack;
+- `--gc-watch-alloc` (+ `GC_FIXED_HEAP_ADDR` for stable addresses) showed
+  the env array was promoted from the nursery during Phase 0 but its
+  promoted copy was never scanned.
+
+**Fix (vm/gc.c):** the three drain loops now share `drain_scan_object` /
+`drain_walk_page` / `cheney_drain`.  When a walk ends at `cp == freep`
+mid-page with pages still queued, the page is **deferred** (only the freep
+page can receive new objects, so at most one page is mid-catch-up at any
+time); its remaining region is walked when a new page catches up (the old
+page is filler-capped by then) or after the queue drains.  Each object is
+scanned at most twice — linear, no re-queueing (a naive re-queue-at-tail
+variant was tried first and degenerated to quadratic re-scanning: 24k
+requeues/collect).
+
+**Companion fix (anti-thrash):** with the drain now correct, the retained
+live set at 256MB sits at/above `oldgen_collect_threshold()` (heappages/4),
+so every old-gen allocation fired another full collect (5.5k+ collects vs
+736 before — the pre-fix collector "avoided" this only by silently dropping
+live objects).  `gc_alloc`/`gc_alloc_oldgen` now grow the heap (best
+effort, existing `grow_heap` path) when a THRESHOLD/ALLOC collect leaves
+the live set still above the threshold.
+
+**Verification:** cumulative 22-file audit at 256MB → **0/1111 fail**
+(46s, no perf regression); same with `--gc-verify-live-from 2000` → 536
+verifier passes, all `bad=0`; 1GB → 0/1111; `make test` 34/34;
+`make test-debug` 39/39; `make run-bundle` green (self-hosting + GC
+stress + retention).
+
+### Bug 2 — stale-scan localization (commit `---`) [historical: the C-stack attribution below was a red herring — the miss was heap-internal, see the RESOLVED section above]
 
 `--gc-stale-scan` now pinpoints the root-miss precisely. On the probe
 (`./zinctest-osload globals.csexp --gc-stale-scan --gc-check-closures --gc-log /tmp/gc.log`):
@@ -160,11 +220,9 @@ call). The stale-scan's frame map turns the root-miss into a nameable C site.
 
 ### Still open / follow-up
 
-- **Bug 2 (the real GC precise-root-miss)** is the blocker to runtime `.kl`
-  loading. The probe wiring is now correct (eval-kl → namespace 2); the failure
-  is purely the compile-path GC corruption. Next: find which C local holding a
-  closure's `.code` pointer is not rooted during `interp-eval → kl->zinc →
-  normalize → debruijn → zinc-c`, using `--gc-verbose`/`--gc-dump-roots`/`--gc-check-closures`.
+- **Bug 2 is RESOLVED** (see the RESOLVED section above).  Runtime `.kl`
+  loading through the metacircular interpreter now compiles all 22 OS files
+  (1111/1111 forms) at the default 256MB heap.
 - The two-namespace split (AGENTS.md): runtime-loaded defuns live in the interp's
   Shen `global-table` (namespace 2), not the C VM native `global_table[]`
   (namespace 1). Drive loaded closures through `eval-kl`/`interp`, not raw

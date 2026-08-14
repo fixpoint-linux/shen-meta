@@ -2966,6 +2966,9 @@ int main(int argc, char **argv) {
             gc_set_watch_alloc(strtoull(argv[++i], NULL, 0));
         if (strcmp(argv[i], "--gc-verify") == 0) gc_set_verify(1);
         if (strcmp(argv[i], "--gc-verify-codechains") == 0) gc_set_verify_codechains(1);
+        if (strcmp(argv[i], "--gc-verify-live") == 0) gc_set_verify_live(1);
+        else if (strcmp(argv[i], "--gc-verify-live-from") == 0 && i + 1 < argc)
+            gc_set_verify_live_from(strtol(argv[++i], NULL, 0));
     }
 
     if (argc > 1) {

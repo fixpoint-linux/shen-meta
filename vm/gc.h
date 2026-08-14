@@ -100,6 +100,8 @@ void gc_set_page_transition_watch(uintptr_t page);
 void gc_set_watch_alloc(uintptr_t addr);
 void gc_set_verify(int on);
 void gc_set_verify_codechains(int on);
+void gc_set_verify_live(int on);
+void gc_set_verify_live_from(long collect_seq);   /* enable from this collect on */
 
 /* Validate a closure value's code/env headers for live-page + correct
  * type-tag.  No-op unless gc_set_check_closures(1) was called.  `where`

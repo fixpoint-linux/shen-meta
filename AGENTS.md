@@ -131,6 +131,15 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
   scan since 4a.6); typed `gc_scan_value`/`gc_evacuate` in `zincvm.c` handle
   interior pointers. Write barrier at `address->` vector writes (site 1,
   required); `global_set` barrier deferred (see `docs/gc.md`).
+  **Drain invariant (Bug 2 fix):** the shared page-queue Cheney drain
+  (`cheney_drain` in `vm/gc.c`) must never treat `cp == freep` as end-of-page
+  while the queue is non-empty — objects allocated into a dequeued page's bump
+  slack would never be scanned (stale interior pointers → heap corruption).
+  Only the freep page can receive new objects, so the drain defers that one
+  page and resumes its walk later. `gc_alloc`/`gc_alloc_oldgen` grow the heap
+  when a collect leaves the live set above `oldgen_collect_threshold()`
+  (anti-thrash; the pre-fix collector only avoided the thrash by dropping
+  live objects).
   A static-analysis verifier (`tools/gc-verify/`, opt-in via
   `make gc-verify`) cross-checks root discipline and write barriers
   against this design: it runs `clang -Xclang -ast-dump=json` over
