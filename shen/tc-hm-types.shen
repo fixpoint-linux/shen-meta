@@ -197,22 +197,56 @@
                          [fail (cn "occurs check: tvar " (cn (str N) " in type"))]
                          [ok [[N T] | Sub]])))))
 
-\* ===== top-type?: true iff T (assumed already walked) is [con klambda].
-   klambda is the sequent-calculus top type per types.shen datatype:
-   "all data is valid klambda".  Such a type unifies with ANYTHING.
-   This generalises the existing tc-unify-con klambda rule to non-con
-   opponents, so a body that returns an [app list A] (a cons-literal)
-   or any other concrete type can unify with a klambda return type, and
-   a bare-symbol reference to a Shen global (typed as klambda because
-   the checker cannot see Shen's value-table) can flow into a primitive
-   that expects a symbol/number/etc.  Intentionally NARROW: only klambda
-   is top.  zinc-value/zinc-code stay opaque-ground (per Stage-5 analysis
-   warning: making zinc-value top would make the checker vacuous). *\
+\* ===== rep-name?: true iff Name is one of the 8 opaque rep names the
+   checker uses internally — type, expr, subst, env, result,
+   infer-result, pat-result, tc-result.  These names denote opaque
+   internal representations the checker never models structurally
+   (exactly analogous to klambda for the value universe); they MUST
+   unify with any type (top-type) so that a parameter declared `type`
+   in a sig can accept the concrete structural type the caller passes
+   (e.g. [arrow A B]), and so [ok X]/[fail X] cons patterns typed
+   against [con result]/[con tc-result] route permissively.  The set
+   is the SINGLE SOURCE OF TRUTH and is shared with tc-opaque-ground?
+   in tc-hm-patterns.shen — keep both call sites on tc-rep-name?; a
+   drift reintroduces regressions.  Do NOT add zinc-value to this set
+   (Stage-5 warning: making zinc-value top would vacate the checker). *\
+
+(define tc-rep-name?
+  { symbol --> boolean }
+  N -> (tc-element? N
+                    [(intern "type")
+                     (intern "expr")
+                     (intern "subst")
+                     (intern "env")
+                     (intern "result")
+                     (intern "infer-result")
+                     (intern "pat-result")
+                     (intern "tc-result")]))
+
+\* ===== top-type?: true iff T (assumed already walked) is a [con X]
+   for X in {klambda} ∪ rep-names.  klambda is the sequent-calculus
+   top type per types.shen datatype ("all data is valid klambda");
+   the 8 rep-names are the checker's own opaque representation names
+   (type/expr/subst/env/result/infer-result/pat-result/tc-result) that
+   parse to [con X] (tc-parse-sig-type fallthrough) but must unify
+   with the actual structural forms ([arrow A B], [app list A], etc.)
+   the checker builds at runtime — e.g. a parameter declared `type`
+   in a sig is passed [arrow DomType0 RetType] at the call site, so
+   [con type] must unify with [arrow ...].  Both are SOUND: these
+   names genuinely denote opaque internal reps the checker never
+   models structurally, analogous to klambda top for the value
+   universe; the Stage-7 anti-goal is honored (correct modeling of
+   opaque reps, NOT arbitrary weakening).  Intentionally NARROW:
+   only klambda + the 8 rep-names are top.  zinc-value/zinc-code stay
+   opaque-ground (per Stage-5 warning: making zinc-value top would
+   make the checker vacuous). *\
 
 (define tc-top-type?
   { type --> boolean }
   T -> (if (and (cons? T) (= (hd T) (intern "con")))
-           (= (tc-con-name T) (intern "klambda"))
+           (if (= (tc-con-name T) (intern "klambda"))
+               true
+               (tc-rep-name? (tc-con-name T)))
            false))
 
 \* ===== unify: the core unification algorithm =====

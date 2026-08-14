@@ -21,13 +21,22 @@
                 \* Not in prim-table — try cross-define sigs *\
                 (let Pair2 (tc-assoc Name (%% value tc-global-sig-table))
                   (if (tc-empty? Pair2)
-                      \* Unknown: return permissive type *\
-                      (let T (tc-fresh-tvar (intern ""))
-                        (tc-fresh-arrow T))
+                      \* Unknown: a fresh tvar is SOUND for genuinely-unknown
+                         functions.  The prior binary arrow was an arbitrary
+                         arity-2 assumption that produced false rejects on
+                         non-2-arg calls (partial-application arrows).  A tvar
+                         unifies with whatever the caller demands. *\
+                      (tc-fresh-tvar (intern ""))
                       (tc-instantiate (hd (tl Pair2)))))
                 (tc-instantiate (hd (tl Pair))))))
 
-\* fresh-arrow: build arrow T -> T -> ... -> T (binary by default) *\
+\* fresh-arrow: build arrow T -> T -> ... -> T (binary by default).
+   NOTE (root-cause-D, commit after 31f4248): now DEAD CODE — the D2 fix
+   replaced tc-prim-lookup's unknown-primitive fallback from this binary
+   arrow to a fresh tvar, so no caller remains.  Retained (harmless)
+   for potential future use and to avoid churn.  Do NOT reintroduce it
+   as the unknown-fn fallback — the binary arrow produced false rejects
+   (partial-application 'arrow vs other') on non-2-arg calls. *\
 
 (define tc-fresh-arrow
   { type --> type }

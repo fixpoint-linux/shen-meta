@@ -361,6 +361,135 @@
          arrow (tc-type-tag Parsed))))
 
 \* ================================================================
+   STAGE 5 TESTS — Root-cause-D fix: opaque rep-name top-type,
+   opaque-ground extension, and fresh-tvar fallback in tc-prim-lookup.
+   These pin the soundness-critical 8-name set the unification core
+   and pattern-typing core both consume.  A drift here reintroduces
+   the 66-FAIL baseline regressions.
+   ================================================================ *\
+
+\* tc-top-type? MUST be true for each of the 8 rep names — they are
+   the checker's opaque internal reps and must unify with any
+   structural form (analogous to klambda top).  One test per name so
+   a future set drift is visible. *\
+
+(define test-top-rep-1-type
+  { --> (list symbol) }
+  -> (tc-assert-equal "top: [con type] is top"
+     true (tc-top-type? [con (intern "type")])))
+
+(define test-top-rep-2-expr
+  { --> (list symbol) }
+  -> (tc-assert-equal "top: [con expr] is top"
+     true (tc-top-type? [con (intern "expr")])))
+
+(define test-top-rep-3-subst
+  { --> (list symbol) }
+  -> (tc-assert-equal "top: [con subst] is top"
+     true (tc-top-type? [con (intern "subst")])))
+
+(define test-top-rep-4-env
+  { --> (list symbol) }
+  -> (tc-assert-equal "top: [con env] is top"
+     true (tc-top-type? [con (intern "env")])))
+
+(define test-top-rep-5-result
+  { --> (list symbol) }
+  -> (tc-assert-equal "top: [con result] is top"
+     true (tc-top-type? [con (intern "result")])))
+
+(define test-top-rep-6-infer-result
+  { --> (list symbol) }
+  -> (tc-assert-equal "top: [con infer-result] is top"
+     true (tc-top-type? [con (intern "infer-result")])))
+
+(define test-top-rep-7-pat-result
+  { --> (list symbol) }
+  -> (tc-assert-equal "top: [con pat-result] is top"
+     true (tc-top-type? [con (intern "pat-result")])))
+
+(define test-top-rep-8-tc-result
+  { --> (list symbol) }
+  -> (tc-assert-equal "top: [con tc-result] is top"
+     true (tc-top-type? [con (intern "tc-result")])))
+
+\* Negative: zinc-value MUST NOT be top (Stage-5 vacuation warning:
+   making zinc-value top would vacate the checker). *\
+
+(define test-top-rep-9-zinc-value-not-top
+  { --> (list symbol) }
+  -> (tc-assert-equal "top: [con zinc-value] is NOT top (opaque-ground only)"
+     false (tc-top-type? [con (intern "zinc-value")])))
+
+\* tc-opaque-ground? MUST be true for each rep name — this routes
+   [ok X]/[fail X] cons patterns typed against [con result] /
+   [con tc-result] to opaque-cons (vars bind to fresh tvars). *\
+
+(define test-opaque-rep-1-type
+  { --> (list symbol) }
+  -> (tc-assert-equal "opaque-ground: [con type] is opaque-ground"
+     true (tc-opaque-ground? [con (intern "type")] [])))
+
+(define test-opaque-rep-2-expr
+  { --> (list symbol) }
+  -> (tc-assert-equal "opaque-ground: [con expr] is opaque-ground"
+     true (tc-opaque-ground? [con (intern "expr")] [])))
+
+(define test-opaque-rep-3-subst
+  { --> (list symbol) }
+  -> (tc-assert-equal "opaque-ground: [con subst] is opaque-ground"
+     true (tc-opaque-ground? [con (intern "subst")] [])))
+
+(define test-opaque-rep-4-env
+  { --> (list symbol) }
+  -> (tc-assert-equal "opaque-ground: [con env] is opaque-ground"
+     true (tc-opaque-ground? [con (intern "env")] [])))
+
+(define test-opaque-rep-5-result
+  { --> (list symbol) }
+  -> (tc-assert-equal "opaque-ground: [con result] is opaque-ground"
+     true (tc-opaque-ground? [con (intern "result")] [])))
+
+(define test-opaque-rep-6-infer-result
+  { --> (list symbol) }
+  -> (tc-assert-equal "opaque-ground: [con infer-result] is opaque-ground"
+     true (tc-opaque-ground? [con (intern "infer-result")] [])))
+
+(define test-opaque-rep-7-pat-result
+  { --> (list symbol) }
+  -> (tc-assert-equal "opaque-ground: [con pat-result] is opaque-ground"
+     true (tc-opaque-ground? [con (intern "pat-result")] [])))
+
+(define test-opaque-rep-8-tc-result
+  { --> (list symbol) }
+  -> (tc-assert-equal "opaque-ground: [con tc-result] is opaque-ground"
+     true (tc-opaque-ground? [con (intern "tc-result")] [])))
+
+\* tc-prim-lookup on an unknown symbol MUST return a tvar, not an
+   arrow.  The prior binary arrow was an arbitrary arity-2
+   assumption that produced false rejects on non-2-arg calls. *\
+
+(define test-prim-lookup-unknown-tvar
+  { --> (list symbol) }
+  -> (tc-assert-equal "prim-lookup: unknown symbol returns tvar (not arrow)"
+     tvar (tc-type-tag (tc-prim-lookup (intern "tc-unknown-prim-xyzzy")))))
+
+\* A 1-arg call to an unknown function MUST infer to a tvar (the
+   fresh-tvar fallback unifies with the demanded arrow, leaving the
+   return type as a fresh tvar).  The binary arrow would have
+   required exactly 2 args. *\
+
+(define test-infer-app-unknown-1arg-tvar
+  { --> (list symbol) }
+  -> (let R (tc-infer [] [(intern "tc-unknown-prim-xyzzy") (number 5)] [])
+       (if (tc-ok? R)
+           (let Pair (tc-ok-subst-type R)
+             (let Type (hd (tl Pair))
+               (tc-assert-equal "infer: 1-arg call to unknown infers to tvar"
+                 tvar (tc-type-tag Type))))
+           (tc-assert-ok "infer: 1-arg call to unknown should succeed" R))))
+
+\* ================================================================
    TEST RUNNER
    ================================================================ *\
 
@@ -417,6 +546,26 @@
          (test-sig-2-polymorphic)
          (test-sig-3-multi-arg)
          (test-sig-4-no-type-vars)
+         \* Stage 5: Root-cause-D fix — rep-name top-type, opaque-ground, prim-lookup fallback *\
+         (test-top-rep-1-type)
+         (test-top-rep-2-expr)
+         (test-top-rep-3-subst)
+         (test-top-rep-4-env)
+         (test-top-rep-5-result)
+         (test-top-rep-6-infer-result)
+         (test-top-rep-7-pat-result)
+         (test-top-rep-8-tc-result)
+         (test-top-rep-9-zinc-value-not-top)
+         (test-opaque-rep-1-type)
+         (test-opaque-rep-2-expr)
+         (test-opaque-rep-3-subst)
+         (test-opaque-rep-4-env)
+         (test-opaque-rep-5-result)
+         (test-opaque-rep-6-infer-result)
+         (test-opaque-rep-7-pat-result)
+         (test-opaque-rep-8-tc-result)
+         (test-prim-lookup-unknown-tvar)
+         (test-infer-app-unknown-1arg-tvar)
          \* Report *\
          (print (cn "\n=== TC-HM Test Results ===\n"))
          (print (cn "Passed: " (cn (str (%% value test-passed)) "\n")))

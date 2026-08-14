@@ -34,14 +34,16 @@
   { type --> subst --> boolean }
   T Sub -> (let W (tc-walk T Sub)
              (if (and (cons? W) (= (hd W) (intern "con")))
-                 (tc-element? (tc-con-name W)
-                              [(intern "zinc-value")
-                               (intern "klambda")
-                               (intern "zinc-code")
-                               (intern "zinc-instruction")
-                               (intern "absvector")
-                               (intern "stream")
-                               (intern "error")])
+                 (if (tc-rep-name? (tc-con-name W))
+                     true
+                     (tc-element? (tc-con-name W)
+                                  [(intern "zinc-value")
+                                   (intern "klambda")
+                                   (intern "zinc-code")
+                                   (intern "zinc-instruction")
+                                   (intern "absvector")
+                                   (intern "stream")
+                                   (intern "error")]))
                  false)))
 
 \* tc-pat-tag: classify a pattern into a dispatch tag.
