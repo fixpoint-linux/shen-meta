@@ -114,7 +114,7 @@
    own 4 params at small correct indices.  See handoff-shenos-init-glm. *\
 (define interp-trap-body
   { zinc-code --> (list zinc-value) --> (list zinc-value) --> (list zinc-value) --> zinc-value }
-  C1 E1 S R -> (trap-error (interp C1 [lambda C1 E1] E1 S R)
+  C1 E1 S R -> (trap-error (interp C1 [lambda C1 E1] [cons | E1] S R)
                            (/. Err [error Err])))
 
 (define interp { zinc-code --> zinc-value --> (list zinc-value) --> (list zinc-value) --> (list zinc-value) --> zinc-value }
