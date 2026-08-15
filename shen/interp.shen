@@ -131,7 +131,7 @@
           (let A (zinc-arity C1)
             (let N (count-args Args 0)
               (if (= N A)
-                  (interp C1 [lambda C1 E1] (append (reverse Args) E1) [] [[C E Rest] | R])
+                  (interp C1 [lambda C1 E1] (append (reverse Args) E1) [] [[C E [[cons] | Rest]] | R])
                   (if (< N A)
                       (interp C [lambda (drop-grabs N C1) (append (reverse Args) E1)] E Rest R)
                       (simple-error "apply: too many args"))))))))
@@ -145,7 +145,7 @@
               (let A (zinc-arity C1)
                 (let N (count-args Args 0)
                   (if (= N A)
-                      (interp C1 [lambda C1 E1] (append (reverse Args) E1) [] [[C_call E_call Rest] | R])
+                      (interp C1 [lambda C1 E1] (append (reverse Args) E1) [] [[C_call E_call [[cons] | Rest]] | R])
                       (if (< N A)
                           (interp C_call [lambda (drop-grabs N C1) (append (reverse Args) E1)] E_call Rest R)
                           (simple-error "appterm: too many args")))))))))
@@ -190,12 +190,15 @@
   [prim boolean? | C] A E S R                                   -> (interp C [boolean false] E S R)
   [prim stream? | C] [stream in _] E S R                        -> (interp C [boolean true] E S R)
   [prim stream? | C] [stream out _] E S R                       -> (interp C [boolean true] E S R)
+  [prim stream? | C] A E S R                                    -> (interp C [boolean true] E S R) where (stream? A)
   [prim stream? | C] A E S R                                    -> (interp C [boolean false] E S R)
   [prim get-time | C] [symbol A] E S R                          -> (interp C [number (get-time A)] E S R)
   [prim eval-kl | C] A E S R                                    -> (interp C (toplevel-interp (kl->zinc (extract-kl A))) E S R)
   [prim close | C] [stream in A] E S R                          -> (interp C (do (close A) [cons]) E S R)
   [prim close | C] [stream out A] E S R                         -> (interp C (do (close A) [cons]) E S R)
+  [prim close | C] A E S R                                      -> (interp C (do (close A) [cons]) E S R) where (stream? A)
   [prim read-byte | C] [stream in A] E S R                      -> (interp C [number (read-byte A)] E S R)
+  [prim read-byte | C] A E S R                                  -> (interp C [number (read-byte A)] E S R) where (stream? A)
   [prim tl | C] [cons _ A] E S R                                -> (interp C A E S R)
   [prim hd | C] [cons A _] E S R                                -> (interp C A E S R)
   [prim cons? | C] [cons _ _] E S R                             -> (interp C [boolean true] E S R)
@@ -231,6 +234,7 @@
   [prim open | C] [string A] E [[symbol in] | S] R              -> (interp C [stream in (open A in)] E S R)
   [prim open | C] [string A] E [[symbol out] | S] R             -> (interp C [stream out (open A out)] E S R)
   [prim write-byte | C] [number A] E [[stream out A1] | S] R    -> (interp C [number (write-byte A A1)] E S R)
+  [prim write-byte | C] [number A] E [A1 | S] R                 -> (interp C [number (write-byte A A1)] E S R) where (stream? A1)
   [prim cons | C] A E [A1 | S] R                                -> (interp C [cons A A1] E S R)
   [prim @p | C] A E [A1 | S] R                                  -> (interp C [cons A A1] E S R)
   [prim fst | C] [cons A _] E S R                               -> (interp C A E S R)
@@ -265,11 +269,14 @@
   X -> (interp X [cons] [] [] []))
 
 (define kl->zinc { klambda --> zinc-code }
-  \* Primitive call: zinc-c handles primitive? check directly.
-     Bypass normalize/debruijn to avoid CPS closure capture bugs
-     in the self-compiled normalize-term chain. *\
-  [F | Args] -> (zinc-c [F | Args]) where (primitive? F)
-  \* General case: full normalize/debruijn pipeline.  The two complex
+  \* Single path: full normalize/debruijn pipeline for EVERY form.
+     The old primitive fast-path (zinc-c [F | Args] where (primitive? F))
+     passed RAW args to zinc-c, which cannot compile a bare symbol arg
+     (e.g. (value *version*)) or a nested call arg (e.g. (read-byte (stinput)))
+     — zinc-c needs the debruijn-normalized [symbol X] / [function X] forms.
+     The CPS closure-capture bugs that once motivated the fast-path are fixed
+     (dedupe-globals / shen-kl-expr / compile-pattern / zinc-t if-branches).
+     General case: full normalize/debruijn pipeline.  The two complex
      sub-expressions (kmacros / normalize-term) are explicitly let-bound
      so the host Shen compiler emits proper 2-arg applies (not curried
      partial applications) when it compiles THIS closure into the bundle.
