@@ -115,19 +115,46 @@
    own 4 params at small correct indices.  See handoff-shenos-init-glm. *\
 (define interp-apply-handler
   { zinc-value --> zinc-value --> zinc-value }
-  [lambda HC HE] Err -> (interp HC [lambda HC HE] [Err | HE] [] []))
+  \* The C trap-error primitive passes the caught error to the handler as a
+     RAW C error value (VAL_ERROR).  The interp represents errors as the
+     tagged form [error X], which is what [prim error-to-string] / [prim error?]
+     pattern-match on.  Without this wrap, error-to-string falls through to
+     the "interp: unknown prim" catch-all and the REPL prints a bogus error
+     instead of the real message. *\
+  [lambda HC HE] Err -> (interp HC [lambda HC HE] [[error Err] | HE] [] []))
 
 (define interp-trap-body
   { zinc-code --> (list zinc-value) --> (list zinc-value) --> (list zinc-value) --> zinc-value }
   C1 E1 S R -> (let H (hd S)
-                (trap-error (interp C1 [lambda C1 E1] [cons | E1] S R)
+                \* The thunk body is a cur'd lambda whose code ends with a
+                   trailing `return` (zinc-c-tail appends [return] to every
+                   non-tail lambda).  Run it with a FRESH return stack [] —
+                   passing the live R would let that trailing return pop the
+                   ENCLOSING call's frame, replaying the caller's continuation
+                   (the value was computed twice: e.g. shen.app's
+                   (cn (shen.arg->str X Z) Y) ran prim cn twice -> "foo::").
+                   Matches the C VM, whose trap-error primitive executes the
+                   thunk via a fresh vm_exec_env frame stack.  H is captured
+                   BEFORE, and R is unused by the body — it is kept in the
+                   signature for the [prim trap-error] rule's shape. *\
+                (trap-error (interp C1 [lambda C1 E1] [cons | E1] S [])
                             (lambda Err (interp-apply-handler H Err)))))
 
 (define interp { zinc-code --> zinc-value --> (list zinc-value) --> (list zinc-value) --> (list zinc-value) --> zinc-value }
   [access N | C] A E S R                                        -> (interp C (lookup N E) E [A | S] R)
   [global G | C] A E S R                                        -> (interp C (lookup-global G) E [A | S] R)
-  [jmpf L | C] [boolean false] E S R                            -> (interp (interp-jmp C L) [boolean false] E S R)
-  [jmpf L | C] A E S R                                          -> (interp C A E S R)
+  \* jmpf consumes the branch condition (in A) without producing a new value.
+     Under push-OLD-acc the next value op would re-push that stale condition
+     onto the stack, corrupting the enclosing call's arg list (lands as a cn
+     right arg -> 'true'/'false' garbage -> infinite recursion in shen.app).
+     The C VM pops the condition (zincvm.c OP_JMPF).  Mirror that: pop the
+     enclosing pending value V (stack top, pushed by the condition's first
+     value op) back into acc, consuming the condition.  [boolean false] rules
+     MUST precede the general A rules so false jumps. *\
+  [jmpf L | C] [boolean false] E [V | S] R                       -> (interp (interp-jmp C L) V E S R)
+  [jmpf L | C] A E [V | S] R                                     -> (interp C V E S R)
+  [jmpf L | C] [boolean false] E [] R                            -> (interp (interp-jmp C L) [cons] E [] R)
+  [jmpf L | C] A E [] R                                          -> (interp C [cons] E [] R)
   [jmp L | C] A E S R                                           -> (interp (interp-jmp C L) A E S R)
   [label L | C] A E S R                                         -> (interp C A E S R)
   [apply | C] [lambda C1 E1] E S R ->
@@ -141,20 +168,29 @@
                   (if (< N A)
                       (interp C [lambda (drop-grabs N C1) (append (reverse Args) E1)] E Rest R)
                       (simple-error "apply: too many args"))))))))
-  \* Appterm — tail call with return frame: collect all args up to mark *\
-  [appterm | C] [lambda C1 E1] E S [[C_call E_call _] | R] ->
+  \* Appterm — tail call with return frame: collect all args up to mark.
+     A tail call is the LAST expression of the caller's body: its result
+     returns to the CALLER'S CALLER (C_call/E_call) with the ORIGINAL saved
+     stack S_saved.  The current leftover (Rest above the mark) belongs to
+     the dying frame — it must be DISCARDED, not swapped into the frame.
+     Swapping it in (the old behaviour) replaced the caller's real pending
+     values with the dead push-OLD-acc artifact (the entry closure), so the
+     caller's continuation popped a [lambda ...] closure where it expected
+     its own argument — e.g. shen.app's (cn (shen.arg->str X Z) Y) got the
+     arg->str closure as cn's right arg instead of Y.  Matches the C VM's
+     OP_APPTERM, which reuses the frame and keeps the caller's saved stack. *\
+  [appterm | C] [lambda C1 E1] E S [[C_call E_call S_saved] | R] ->
     (let Collected (collect-apply-args S 0)
       (let Args (hd Collected)
         (if (empty? Args)
             (simple-error "appterm zero args")
-            (let Rest (hd (tl Collected))
-              (let A (zinc-arity C1)
-                (let N (count-args Args 0)
-                  (if (= N A)
-                      (interp C1 [lambda C1 E1] (append (reverse Args) E1) [] [[C_call E_call Rest] | R])
-                      (if (< N A)
-                          (interp C_call [lambda (drop-grabs N C1) (append (reverse Args) E1)] E_call Rest R)
-                          (simple-error "appterm: too many args")))))))))
+            (let A (zinc-arity C1)
+              (let N (count-args Args 0)
+                (if (= N A)
+                    (interp C1 [lambda C1 E1] (append (reverse Args) E1) [] [[C_call E_call S_saved] | R])
+                    (if (< N A)
+                        (interp C_call [lambda (drop-grabs N C1) (append (reverse Args) E1)] E_call S_saved R)
+                        (simple-error "appterm: too many args"))))))))
   \* Appterm — tail call at top level: collect all args up to mark *\
   [appterm | C] [lambda C1 E1] E S [] ->
     (let Collected (collect-apply-args S 0)
@@ -179,7 +215,13 @@
     (interp C_caller A E_caller S_saved R)
   \* Return at top level: just return the accumulator *\
   [return | C] A E S [] -> A
-  [let | C] A E S R                                             -> (interp C A [A | E] S R)
+  \* let binds the let-value A (old acc) into env but, like jmpf, consumes A
+     without producing a new value; under push-OLD-acc the next value op would
+     re-push the let-value onto the stack, corrupting the enclosing call's arg
+     list (zinc.shen:43 emits non-tail let, so let CAN be a call argument).
+     Pop the enclosing pending value V (stack top) back into acc. *\
+  [let | C] A E [V | S] R                                         -> (interp C V [A | E] S R)
+  [let | C] A E [] R                                              -> (interp C [cons] [A | E] [] R)
   [endlet | C] A [V | E] S R                                    -> (interp C A E S R)
   [number N | C] A E S R                                        -> (interp C [number N] E [A | S] R)
   [string Ss | C] A E S R                                       -> (interp C [string Ss] E [A | S] R)
