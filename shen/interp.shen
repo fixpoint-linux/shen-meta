@@ -63,9 +63,10 @@
 
 
 (define collect-apply-args { (list zinc-value) --> number --> (list zinc-value) }
-  \* Hit A0 before mark: A0 is the spurious old-acc from pre-pushmark.
-     Second element is the literal symbol mark — skip both, return saved stack. *\
-  [V1 V2 | S] N -> [[] S] where (= V2 mark)
+  \* Hit V1 before mark: V1 is the enclosing context's pending value (the
+     accumulator at pushmark time under RTL arg evaluation).  Preserve it into
+     the saved stack — discarding it loses the enclosing call's in-flight arg. *\
+  [V1 V2 | S] N -> [[] [V1 | S]] where (= V2 mark)
   \* At A0 position but N > 64: too many args pushed before mark *\
   [V1 V2 | S] N -> (simple-error "too many args (>64)") where (> N 64)
   \* Collect V1 as an arg, recurse with incremented counter *\
@@ -131,7 +132,7 @@
           (let A (zinc-arity C1)
             (let N (count-args Args 0)
               (if (= N A)
-                  (interp C1 [lambda C1 E1] (append (reverse Args) E1) [] [[C E [[cons] | Rest]] | R])
+                  (interp C1 [lambda C1 E1] (append (reverse Args) E1) [] [[C E Rest] | R])
                   (if (< N A)
                       (interp C [lambda (drop-grabs N C1) (append (reverse Args) E1)] E Rest R)
                       (simple-error "apply: too many args"))))))))
@@ -145,7 +146,7 @@
               (let A (zinc-arity C1)
                 (let N (count-args Args 0)
                   (if (= N A)
-                      (interp C1 [lambda C1 E1] (append (reverse Args) E1) [] [[C_call E_call [[cons] | Rest]] | R])
+                      (interp C1 [lambda C1 E1] (append (reverse Args) E1) [] [[C_call E_call Rest] | R])
                       (if (< N A)
                           (interp C_call [lambda (drop-grabs N C1) (append (reverse Args) E1)] E_call Rest R)
                           (simple-error "appterm: too many args")))))))))
