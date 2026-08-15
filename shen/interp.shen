@@ -113,10 +113,15 @@
    the first interpreted (put ...) call during shen.initialise-environment.
    A top-level helper has no rule-chain nesting, so its thunk captures its
    own 4 params at small correct indices.  See handoff-shenos-init-glm. *\
+(define interp-apply-handler
+  { zinc-value --> zinc-value --> zinc-value }
+  [lambda HC HE] Err -> (interp HC [lambda HC HE] [Err | HE] [] []))
+
 (define interp-trap-body
   { zinc-code --> (list zinc-value) --> (list zinc-value) --> (list zinc-value) --> zinc-value }
-  C1 E1 S R -> (trap-error (interp C1 [lambda C1 E1] [cons | E1] S R)
-                           (/. Err [error Err])))
+  C1 E1 S R -> (let H (hd S)
+                (trap-error (interp C1 [lambda C1 E1] [cons | E1] S R)
+                            (lambda Err (interp-apply-handler H Err)))))
 
 (define interp { zinc-code --> zinc-value --> (list zinc-value) --> (list zinc-value) --> (list zinc-value) --> zinc-value }
   [access N | C] A E S R                                        -> (interp C (lookup N E) E [A | S] R)
@@ -406,6 +411,7 @@
 (set-toplevel element?-h element?-h)
 (set-toplevel drop-grabs drop-grabs)
 (set-toplevel interp-trap-body interp-trap-body)
+(set-toplevel interp-apply-handler interp-apply-handler)
 (set-toplevel interp interp)
 (tc +)
 
