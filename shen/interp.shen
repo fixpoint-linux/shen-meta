@@ -226,6 +226,14 @@
   [prim number? | C] [number _] E S R                           -> (interp C [boolean true] E S R)
   [prim number? | C] A E S R                                    -> (interp C [boolean false] E S R)
   [prim value | C] [symbol A] E S R                             -> (interp C (value A) E S R)
+  \* intern of "true"/"false" must return the BOOLEAN value, not a symbol —
+     matching safe.intern (primitives.shen) and the host shen-scheme intern
+     (which returns booleans for "true"/"false").  The bundled readers
+     (parse-atom / shen-parse-atom) now return true/false literals directly;
+     this rule is defense-in-depth for interpreted OS closures (e.g. the Shen
+     reader shen.read) that intern "true"/"false" through [prim intern]. *\
+  [prim intern | C] [string "true"] E S R                        -> (interp C [boolean true] E S R)
+  [prim intern | C] [string "false"] E S R                       -> (interp C [boolean false] E S R)
   [prim intern | C] [string A] E S R                            -> (interp C [symbol (intern A)] E S R)
   [prim error-to-string | C] [error A] E S R                    -> (interp C [string (error-to-string A)] E S R)
   [prim simple-error | C] [string A] E S R                      -> (simple-error A)

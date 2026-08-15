@@ -535,7 +535,11 @@
                            (= (pos Token 0) "-")
                            (digit-ch? (pos Token 1))))
                   [(parse-num-str Token) FinalPos]
-                  [(intern Token) FinalPos])))))))
+                  (if (= Token "true")
+                      [true FinalPos]
+                      (if (= Token "false")
+                          [false FinalPos]
+                          [(intern Token) FinalPos])))))))))
 
 \* shen-parse-list-tail: continue parsing a list after its first element.
    Close is the closing char for the enclosing opener. Dotted is true only

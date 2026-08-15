@@ -158,7 +158,11 @@
                        (= (char-code Token 0) 45)   \* '-' *\
                        (digit-int? (char-code Token 1))))
               [(parse-num-str Token) End]
-              [(intern Token) End])))))
+              (if (= Token "true")
+                  [true End]
+                  (if (= Token "false")
+                      [false End]
+                      [(intern Token) End])))))))
 
 (define parse-list-tail
   Str Pos Len ->
