@@ -101,6 +101,22 @@
   N [grab | C] -> (drop-grabs (- N 1) C)
   N _ -> (simple-error "drop-grabs: not enough grabs"))
 
+\* interp-trap-body: the [prim trap-error] rule's protected-body evaluation,
+   extracted into a shallow top-level defun.  The trap-error body is wrapped
+   by kmacros (normalize.shen) into a native thunk [lambda (newvar) (kmacros B)]
+   capturing B's free variables by absolute env index.  Inside interp's
+   97-rule cond chain those indices are computed from the STATIC nesting
+   depth (~72), but the flat jumped code interp's rule compiles to has a
+   runtime env of only 5 slots (the params C A E S R) — the thunk then reads
+   env[68..71] out of bounds (lookup_env's number-0 sentinel) and crashes
+   the first interpreted (put ...) call during shen.initialise-environment.
+   A top-level helper has no rule-chain nesting, so its thunk captures its
+   own 4 params at small correct indices.  See handoff-shenos-init-glm. *\
+(define interp-trap-body
+  { zinc-code --> (list zinc-value) --> (list zinc-value) --> (list zinc-value) --> zinc-value }
+  C1 E1 S R -> (trap-error (interp C1 [lambda C1 E1] E1 S R)
+                           (/. Err [error Err])))
+
 (define interp { zinc-code --> zinc-value --> (list zinc-value) --> (list zinc-value) --> (list zinc-value) --> zinc-value }
   [access N | C] A E S R                                        -> (interp C (lookup N E) E [A | S] R)
   [global G | C] A E S R                                        -> (interp C (lookup-global G) E [A | S] R)
@@ -210,7 +226,7 @@
   [prim intern | C] [string A] E S R                            -> (interp C [symbol (intern A)] E S R)
   [prim error-to-string | C] [error A] E S R                    -> (interp C [string (error-to-string A)] E S R)
   [prim simple-error | C] [string A] E S R                      -> (simple-error A)
-  [prim trap-error | C] [lambda C1 E1] E S R                 -> (interp C (trap-error (interp C1 [lambda C1 E1] E1 S R) (/. Err [error Err])) E S R)
+  [prim trap-error | C] [lambda C1 E1] E S R                 -> (interp C (interp-trap-body C1 E1 S R) E S R)
   [prim = | C] A E [A1 | S] R                                   -> (interp C [boolean (= A A1)] E S R)
   [prim open | C] [string A] E [[symbol in] | S] R              -> (interp C [stream in (open A in)] E S R)
   [prim open | C] [string A] E [[symbol out] | S] R             -> (interp C [stream out (open A out)] E S R)
@@ -373,6 +389,7 @@
 (set-toplevel count-args count-args)
 (set-toplevel element?-h element?-h)
 (set-toplevel drop-grabs drop-grabs)
+(set-toplevel interp-trap-body interp-trap-body)
 (set-toplevel interp interp)
 (tc +)
 
