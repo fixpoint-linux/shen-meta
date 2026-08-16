@@ -1,8 +1,21 @@
 (define id { A --> A }
   X -> X)
 
+\* fresh-var: fresh symbol with prefix P, matching sys.kl gensym semantics —
+   (gensym Y) -> Y1, Y2, ... sharing the shen.*gensym* counter via [prim set].
+   MUST NOT compile to [prim gensym]: the C gensym primitive ignores its
+   prefix and returns lowercase shen.gensym_N — not a variable — which makes
+   debruijn (normalize.shen:145) (fail) on body references to gensym'd
+   lambda/let params (breaks shen.lambda-function's curried wrappers and
+   hence read-from-string of define forms).  Counter defaults to 0 when
+   shen.*gensym* is unbound (pre-shen.initialise). *\
+(define fresh-var { symbol --> symbol }
+  P -> (let N (trap-error (value shen.*gensym*) (/. E 0))
+         (let M (set shen.*gensym* (+ N 1))
+           (intern (cn (str P) (str M))))))
+
 (define newvar { --> symbol }
-  -> (gensym (protect V)))
+  -> (fresh-var (intern "V")))
 
 (define index_h { A --> (list A) --> number --> number }
   X [H | Rest] C -> C where (= X H)

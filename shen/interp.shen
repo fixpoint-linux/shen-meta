@@ -305,7 +305,7 @@
   [prim @p | C] A E [A1 | S] R                                  -> (interp C [cons A A1] E S R)
   [prim fst | C] [cons A _] E S R                               -> (interp C A E S R)
   [prim snd | C] [cons _ A] E S R                               -> (interp C A E S R)
-  [prim gensym | C] [symbol A] E S R                            -> (interp C [symbol (gensym A)] E S R)
+  [prim gensym | C] [symbol A] E S R                            -> (interp C [symbol (fresh-var A)] E S R)
   [prim variable? | C] [symbol A] E S R                         -> (interp C [boolean (variable? A)] E S R)
   [prim variable? | C] A E S R                                  -> (interp C [boolean false] E S R)
   [prim <-address | C] [absvector A] E [[number A1] | S] R      -> (interp C (<-address A A1) E S R)

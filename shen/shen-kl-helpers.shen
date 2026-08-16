@@ -43,13 +43,16 @@
   Var Expr [H | T] -> [(beta-substitute Var Expr H) | (beta-substitute-list Var Expr T)]
   Var Expr X -> (beta-substitute Var Expr X))
 
-\* alpha-convert: rename lambda/let bound variables to fresh gensyms. *\
+\* alpha-convert: rename lambda/let bound variables to fresh gensyms.
+   fresh-var (not [prim gensym]) — the C gensym primitive returns lowercase
+   shen.gensym_N, which is not a variable and breaks debruijn on the
+   renamed body references. *\
 
 (define alpha-convert
-  [lambda Arg Body] -> (let New (gensym (protect Z))
+  [lambda Arg Body] -> (let New (fresh-var (intern "Z"))
                           (let NewBody (beta-substitute Arg New Body)
                             [lambda New (alpha-convert NewBody)]))
-  [let V E B] -> (let New (gensym (protect W))
+  [let V E B] -> (let New (fresh-var (intern "W"))
                    (let NewBody (beta-substitute V New B)
                      [let New (alpha-convert E) (alpha-convert NewBody)]))
   [H | T] -> [(alpha-convert H) | (alpha-convert T)]
@@ -65,7 +68,7 @@
 
 (define generate-params
   0 -> []
-  N -> [(gensym (protect V)) | (generate-params (- N 1))])
+  N -> [(fresh-var (intern "V")) | (generate-params (- N 1))])
 
 \* ===== Pattern Compiler ===== *\
 
