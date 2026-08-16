@@ -65,6 +65,9 @@ PRIM("n->string",1)
 PRIM("c-strlen",1)   /* non-standard parser-hot-path extra */
 PRIM("char-code",2)  /* non-standard parser-hot-path extra */
 PRIM("substring",3)  /* non-standard parser-hot-path extra */
+/* reader.kl read-from-string hot conversions (OS uses the shen. prefix) */
+PRIM("shen.str->bytes",1)
+PRIM("shen.bytes->string",1)
 
 /* ---- vectors / addresses ---- */
 PRIM("absvector",1)

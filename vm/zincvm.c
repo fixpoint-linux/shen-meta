@@ -1553,6 +1553,51 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             gc_root_pop();
             *acc = r; return 0;
         }
+        /* shen.str->bytes: string -> list of int byte codes (reader.kl:31).
+           "" -> (); string -> cons(string->n(hdstr V), str->bytes(tlstr V));
+           non-string -> shen.f-error (ALWAYS-ON throw, OS-defined semantics).
+           Builds the list in forward byte order (byte[0] at the head).  The
+           string arg is rooted across the val_cons allocs. */
+        if (strcmp(name, "shen.str->bytes") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_STRING)
+                vm_throw("attempt to convert a non-string with str->bytes");
+            gc_root_push_value(&a);
+            long n = a.str.len;
+            Value out = val_nil();
+            gc_root_push_value(&out);
+            for (long i = n - 1; i >= 0; i--)
+                out = val_cons(val_number((unsigned char)a.str.data[i]), out);
+            *acc = out;
+            gc_root_pop(); gc_root_pop();
+            return 0;
+        }
+        /* shen.bytes->string: list of int byte codes -> string (reader.kl:45).
+           () -> ""; (cons? V) -> cn(n->string(hd V), bytes->string(tl V));
+           non-list -> shen.f-error (ALWAYS-ON throw, OS-defined semantics).
+           Each element is a byte code; n->string turns it into a 1-char
+           string, so the result is a concatenation of those chars in list
+           order.  The list arg is rooted across the GC_STR alloc. */
+        if (strcmp(name, "shen.bytes->string") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_NIL && a.tag != VAL_CONS)
+                vm_throw("attempt to convert a non-list with bytes->string");
+            gc_root_push_value(&a);
+            long n = 0;
+            Value cur = a;
+            while (cur.tag == VAL_CONS) { n++; cur = *cur.cons.cdr; }
+            char *buf = GC_STR(n);
+            long i = 0;
+            cur = a;
+            while (cur.tag == VAL_CONS) {
+                buf[i++] = (char)cur.cons.car->number;
+                cur = *cur.cons.cdr;
+            }
+            gc_root_pop();
+            Value result; memset(&result, 0, sizeof(result));
+            result.tag = VAL_STRING; result.str.data = buf; result.str.len = n;
+            *acc = result; return 0;
+        }
         break;
 
     /* ---- 't': tl, trap-error, tlstr ---- */
