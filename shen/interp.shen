@@ -88,14 +88,19 @@
   [] Acc -> Acc
   [_ | Args] Acc -> (count-args Args (+ 1 Acc)))
 
-\* element?-h: deep list membership used by the [prim element?] interp rule.
-   Compares the needle against each list element with =.  The elements are
-   interpreted zinc-values (raw cons/symbol/number/...), so extract-kl to
-   canonical form then compare. *\
+\* element?-h: list membership for the [prim element?] interp rule, matching
+   the C primitive's semantics (deep_equal against TOP-LEVEL elements).
+   The interp's values are TAGGED: a list (H1 H2 ...) is [cons H1 [cons H2
+   [cons]]] — the `cons` tag symbol occupies position 0 of every cell.  The
+   old flat walk (X [H | T]) iterated the tag symbols and the SUBLISTS as if
+   they were elements, so membership only matched by accident on 1-element
+   lists — e.g. shen.misc? (element? on a 19-element literal chain) always
+   returned false, breaking shen.alpha? and the whole symbol parser.  Walk
+   the tagged pairs instead: head H, recurse on tail Tl. *\
 (define element?-h { zinc-value --> (list zinc-value) --> boolean }
-  _ [] -> false
-  X [H | T] -> true where (= X H)
-  X [H | T] -> (element?-h X T))
+  X [cons H Tl] -> true where (= X H)
+  X [cons H Tl] -> (element?-h X Tl)
+  _ _           -> false)
 
 (define drop-grabs { number --> (list zinc-instruction) --> (list zinc-instruction) }
   N C -> C where (= N 0)
@@ -250,7 +255,12 @@
   [prim tl | C] [cons _ A] E S R                                -> (interp C A E S R)
   [prim hd | C] [cons A _] E S R                                -> (interp C A E S R)
   [prim cons? | C] [cons _ _] E S R                             -> (interp C [boolean true] E S R)
-  [prim cons? | C] [cons] E S R                                 -> (interp C [boolean true] E S R)
+  \* [cons] is the TAGGED EMPTY LIST ().  KLambda (cons? ()) is false — the
+     OS parsers guard every (hd V)/(head V) with (cons? V), so answering true
+     here sends them head/tl of () ("interp: unknown prim - hd" during
+     shen.<digit> — the read-from-string parse failure).  A real 1-element
+     semantic list (a) is [cons a [cons]] — 2 elements — matched by the rule
+     above.  Only the empty list is the 1-element [cons]. *\
   [prim cons? | C] A E S R                                      -> (interp C [boolean false] E S R)
   \* element?: deep_equal list membership (matches C primitive).  Leftmost arg
      (needle) is the accumulator, rightmost (list) is on the stack. *\
