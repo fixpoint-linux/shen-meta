@@ -2611,6 +2611,12 @@ void init_globals(void) {
         "eval-kl","element?","absvector","<-address","address->",
         "n->string","string->n","str","tlstr","hdstr","pos",
         "intern","value","open","close","read-byte","write-byte",
+        /* NOTE: c-strlen / char-code / substring are NON-STANDARD extras added
+         * for the load.shen parser hot path — NOT part of the KLambda primitive
+         * set, NOT called by the OS .kl files. Kept deliberately for the O(1)
+         * strlen / alloc-free char-code / O(k) substring the pure-Shen fallbacks
+         * in shen/load.shen lack; removing them makes the (already slow) OS-load
+         * noticeably slower. The pure-Shen fallbacks are the canonical semantics. */
         "c-strlen","char-code","substring",
         "set","get-time","read-file-as-string",
         "@p","fst","snd","gensym","variable?","newvar",

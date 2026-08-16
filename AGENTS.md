@@ -367,6 +367,19 @@ The old `./zincvm globals.csexp -d <name>` flag still works for quick inspection
 - `gensym` — fresh symbol generation
 - `variable?` — predicate for KLambda variable symbols
 
+### Non-standard C extras (NOT part of KLambda; kept deliberately)
+
+- `c-strlen`, `char-code`, `substring` — added to the C VM (`prims[]`, `exec_primitive`)
+  for the `shen/load.shen` parser hot path only. They are **not** part of the
+  standard KLambda primitive set and are **not** called by the OS `.kl` files.
+  Kept (not removed) for the O(1) `strlen` / alloc-free `char-code` / O(k)
+  `substring` the pure-Shen fallbacks in `shen/load.shen` lack; removing them
+  makes the (already slow) OS-load noticeably slower. The pure-Shen fallbacks in
+  `shen/load.shen` are the canonical semantics. `read-file-as-string` and
+  `shen.fail!` are also non-standard names, but those are **required** by the OS
+  it loads (`reader.kl`/`init.kl` call `read-file-as-string`; `sys.kl:230` defines
+  `(defun fail () shen.fail!)`).
+
 ## Shen pitfalls
 
 - `let` DOES work with `tc -` (verified), just types in `define` aren't checked
