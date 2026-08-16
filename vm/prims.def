@@ -1,0 +1,102 @@
+/* prims.def — single source of truth for the C VM primitive set (X-macro).
+ *
+ * One PRIM("name", arity) per primitive.  Consumers:
+ *   (a) vm/zincvm.c: #define PRIM(n,a) n, + #include "prims.def" builds
+ *       prim_names[] — the generated name list shared by exec_primitive_valid
+ *       and init_globals (kills the two hand-maintained, drifting lists).
+ *   (b) Makefile `gen-prims` (awk) emits shen/prims-generated.shen:
+ *       (set primitive?-names [ ... ]) — the Shen primitive? predicate
+ *       (util.shen + types.shen) reads this list.
+ *   (c) vm_load_bundle value_set's primitive?-names from prim_names[] so the
+ *       bundled primitive? predicate works at C-VM runtime.
+ *
+ * Order is HOT-FIRST for the generated Shen list: element? short-circuits on
+ * early matches, so the most-referenced prim heads (cons/hd/tl/=, arithmetic,
+ * the list ops used by the interp's own bundled bytecode) come first.
+ *
+ * c-strlen/char-code/substring are NON-STANDARD extras (load.shen parser hot
+ * path only).  absvector? fixes a latent desync: it always had a dispatch
+ * case + interp rule + primitive? entry but was missing from both C name
+ * lists.  assoc/empty?/length/nth/reverse/append are the hot list ops.
+ */
+
+/* ---- hot list ops + the interp-internal hot prims ---- */
+PRIM("assoc",2)
+PRIM("cons",2)
+PRIM("hd",1)
+PRIM("tl",1)
+PRIM("=",2)
+PRIM("empty?",1)
+PRIM("length",1)
+PRIM("nth",2)
+PRIM("reverse",1)
+PRIM("append",2)
+
+/* ---- arithmetic + comparison ---- */
+PRIM("+",2)
+PRIM("/",2)
+PRIM("*",2)
+PRIM("-",2)
+PRIM(">",2)
+PRIM("<",2)
+PRIM(">=",2)
+PRIM("<=",2)
+
+/* ---- predicates ---- */
+PRIM("number?",1)
+PRIM("string?",1)
+PRIM("symbol?",1)
+PRIM("boolean?",1)
+PRIM("cons?",1)
+PRIM("absvector?",1)   /* was dispatched + in primitive? + interp, missing from C lists */
+PRIM("function?",1)
+PRIM("error?",1)
+PRIM("stream?",1)
+PRIM("variable?",1)
+
+/* ---- strings + chars ---- */
+PRIM("pos",2)
+PRIM("tlstr",1)
+PRIM("hdstr",1)
+PRIM("cn",2)
+PRIM("str",1)
+PRIM("string->n",1)
+PRIM("n->string",1)
+PRIM("c-strlen",1)   /* non-standard parser-hot-path extra */
+PRIM("char-code",2)  /* non-standard parser-hot-path extra */
+PRIM("substring",3)  /* non-standard parser-hot-path extra */
+
+/* ---- vectors / addresses ---- */
+PRIM("absvector",1)
+PRIM("address->",3)
+PRIM("<-address",2)
+PRIM("emptylist",1)
+
+/* ---- I/O ---- */
+PRIM("write-byte",2)
+PRIM("read-byte",1)
+PRIM("read-file-as-string",1)
+PRIM("open",2)
+PRIM("close",1)
+PRIM("stinput",0)
+PRIM("stoutput",0)
+
+/* ---- control / eval ---- */
+PRIM("trap-error",2)
+PRIM("simple-error",1)
+PRIM("error-to-string",1)
+PRIM("eval-kl",1)
+PRIM("get-time",1)
+PRIM("intern",1)
+PRIM("set",2)
+PRIM("value",1)
+
+/* ---- tuples / symbols / misc ---- */
+PRIM("@p",2)
+PRIM("fst",1)
+PRIM("snd",1)
+PRIM("gensym",1)
+PRIM("newvar",0)
+PRIM("element?",2)
+PRIM("fail",1)
+PRIM("shen.fail!",1)

@@ -1,4 +1,7 @@
 (tc -)
+\* Load the generated primitive?-names list (from vm/prims.def
+   via `make gen-prims`); see serialize-reduced.shen. *\
+(load "shen/prims-generated.shen")
 \* FULL Shen OS bundle (type-unsafe; requires a guards-enabled build to run).
    The guard-free release C VM CANNOT run this — shen.initialise segfaults
    (see AGENTS.md).  The canonical guard-free bundle is built by

@@ -1,4 +1,4 @@
-.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests
+.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -84,7 +84,19 @@ gate: test test-debug test-asan
 asan: zinctest-asan
 	./zinctest-asan globals.csexp
 
-bundle: shen/serialize-reduced.shen
+# gen-prims: generate the Shen primitive?-names list from the single source
+# vm/prims.def (X-macro).  Emits shen/prims-generated.shen:
+#   (set primitive?-names [ name1 name2 ... ])
+# Loaded at bundle-build time (serialize-reduced.shen / serialize.shen) and
+# mirrored into the C VM's value table by vm_load_bundle, so the C primitive
+# set (prim_names[], built from the same prims.def) and Shen's primitive?
+# predicate stay in sync automatically.
+gen-prims: vm/prims.def
+	@printf '(set primitive?-names [' > shen/prims-generated.shen
+	@awk '/^[ \t]*PRIM\(/ { match($$0, /PRIM\("[^"]*"/); printf " %s", substr($$0, RSTART+6, RLENGTH-7) }' vm/prims.def >> shen/prims-generated.shen
+	@printf '])\n' >> shen/prims-generated.shen
+
+bundle: gen-prims shen/serialize-reduced.shen
 	$(SHEN) script shen/serialize-reduced.shen 2>/dev/null
 	@echo "Bundle written to globals.csexp ($$(wc -c < globals.csexp) bytes)"
 
@@ -92,7 +104,7 @@ bundle: shen/serialize-reduced.shen
 # Written to globals-full.csexp for testing the complete OS.  The release
 # C VM compiles out primitive type guards and CANNOT run this
 # (shen.initialise segfaults); use ./zincvm-debug globals-full.csexp.
-bundle-full: shen/serialize.shen
+bundle-full: gen-prims shen/serialize.shen
 	$(SHEN) script shen/serialize.shen 2>/dev/null
 	@echo "Full bundle written to globals-full.csexp ($$(wc -c < globals-full.csexp) bytes)"
 

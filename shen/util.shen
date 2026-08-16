@@ -64,20 +64,11 @@
                          [[N V] | (dedupe-globals-h R [N | Seen])]))
 
 (define primitive? { symbol --> boolean }
-  \* Reordered: hot prims first so element? short-circuits on early matches.
-     cons/hd/tl are the heads of ~70K recorded-source cons cells; = and the
-     arithmetic + comparison prims dominate the recorded bodies.  Order is
-     semantically irrelevant (pure membership) but hugely affects compile cost.
-     MUST stay in sync with types.shen. *\
-  X -> (element? X [cons hd tl = + / * - number? > < >= <=
-                    string? symbol? boolean? cons? absvector?
-                    pos tlstr hdstr cn str string->n n->string
-                    absvector address-> <-address emptylist
-                    write-byte read-byte read-file-as-string open close function?
-                    trap-error simple-error error-to-string intern
-                    set value eval-kl get-time error? stream?
-                    @p fst snd gensym variable? newvar
-                    c-strlen char-code substring element?]))
+  \* Single source: the generated primitive?-names list (from vm/prims.def via
+     the Makefile gen-prims target) — set at C-VM runtime by vm_load_bundle and
+     at bundle-build time by shen/prims-generated.shen.  MUST match types.shen.
+     Hot prims first in prims.def so element? short-circuits on early matches. *\
+  X -> (element? X (value primitive?-names)))
 
 \* Zinc instruction keywords used as list constructors in zinc-c/zinc-t RHS.
    These must NOT be wrapped with [function ...] by debruijn. *\

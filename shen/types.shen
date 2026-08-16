@@ -1,15 +1,7 @@
 (define primitive? { symbol --> boolean }
-  \* MUST stay in sync with util.shen (reordered: hot prims first for element?
-     short-circuit). *\
-  X -> (element? X [cons hd tl = + / * - number? > < >= <=
-                    string? symbol? boolean? cons? absvector?
-                    pos tlstr hdstr cn str string->n n->string
-                    absvector address-> <-address emptylist
-                    write-byte read-byte read-file-as-string open close function?
-                    trap-error simple-error error-to-string intern
-                    set value eval-kl get-time error? stream?
-                    @p fst snd gensym variable? newvar
-                    c-strlen char-code substring element?]))
+  \* Single source: the generated primitive?-names list (from vm/prims.def
+     via the Makefile gen-prims target).  MUST match util.shen. *\
+  X -> (element? X (value primitive?-names)))
 
 (datatype primitive
   X : primitive >> T : Y;

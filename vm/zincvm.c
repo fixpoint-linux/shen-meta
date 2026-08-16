@@ -898,27 +898,22 @@ static void str_value(Value v, char *buf, int *pos, int bufsize, int depth) {
     }
 }
 
+/* Single source of truth for C primitive names (X-macro over vm/prims.def).
+ * Shared by exec_primitive_valid, init_globals, and vm_load_bundle (which
+ * builds the Shen primitive?-names list from it).  prims.def also drives the
+ * generated shen/prims-generated.shen via the Makefile gen-prims target, so
+ * the C name set and the Shen primitive? predicate stay in sync. */
+#define PRIM(n, a) n,
+static const char *const prim_names[] = {
+#include "prims.def"
+    NULL
+};
+#undef PRIM
+
 /* Returns true if `name` is a known C primitive. */
 static int exec_primitive_valid(const char *name) {
-    static const char *prims[] = {
-        "symbol?","boolean?","number?","string?","cons?",
-        "error?","function?","stream?",
-        "+","-","*","/","=","<",">","<=",">=",
-        "cons","hd","tl","cn","emptylist",
-        "simple-error","trap-error","error-to-string",
-        "eval-kl","element?","absvector","<-address","address->",
-        "n->string","string->n","str","tlstr","hdstr","pos",
-        "intern","value","open","close","read-byte","write-byte",
-        "c-strlen","char-code","substring",
-        "set","get-time","read-file-as-string",
-        "@p","fst","snd","gensym","variable?","newvar",
-        "shen.fail!","fail",
-        "stinput","stoutput",
-        /* YACC terminals (yacc.kl) — not C prims but must resolve as symbols */
-        NULL
-    };
-    for (int i = 0; prims[i]; i++)
-        if (strcmp(name, prims[i]) == 0) return 1;
+    for (int i = 0; prim_names[i]; i++)
+        if (strcmp(name, prim_names[i]) == 0) return 1;
     return 0;
 }
 
@@ -958,6 +953,61 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
                 gc_dirty_vectors_add(vec.vector.data);
             }
             *acc = vec; return 0;
+        }
+        /* assoc: search an alist for a key.  Returns () on not-found, the
+           matching pair on found (key matched via = / deep_equal), and
+           throws an ALWAYS-ON error on a non-list alist (sys.kl:83:
+           "attempt to search a non-list with assoc").  Non-pair elements
+           are skipped (the OS recurses on tl when the head isn't a cons). */
+        if (strcmp(name, "assoc") == 0) {
+            Value key = va_pop(stack), l = va_pop(stack);
+            gc_root_push_value(&key);
+            gc_root_push_value(&l);
+            int found = 0;
+            Value result = val_nil();
+            while (l.tag == VAL_CONS) {
+                Value *car = l.cons.car;
+                if (car->tag == VAL_CONS && deep_equal(key, *car->cons.car)) {
+                    result = *car; found = 1; break;
+                }
+                l = *l.cons.cdr;
+            }
+            if (!found && l.tag != VAL_NIL) {
+                gc_root_pop(); gc_root_pop();
+                vm_throw("attempt to search a non-list with assoc");
+            }
+            *acc = found ? result : val_nil();
+            gc_root_pop(); gc_root_pop();
+            return 0;
+        }
+        /* append: cons-copy a1 prefix with tail a2 (sys.kl:67).  NIL a1 ->
+           a2; cons a1 -> copy; non-list a1 -> ALWAYS-ON error.  Both args
+           rooted across the val_cons allocs in the copy. */
+        if (strcmp(name, "append") == 0) {
+            Value a1 = va_pop(stack), a2 = va_pop(stack);
+            if (a1.tag != VAL_NIL && a1.tag != VAL_CONS)
+                vm_throw("attempt to append a non-list");
+            gc_root_push_value(&a1);
+            gc_root_push_value(&a2);
+            if (a1.tag == VAL_NIL) {
+                gc_root_pop(); gc_root_pop();
+                *acc = a2; return 0;
+            }
+            Value rev = val_nil();
+            gc_root_push_value(&rev);
+            while (a1.tag == VAL_CONS) {
+                rev = val_cons(*a1.cons.car, rev);
+                a1 = *a1.cons.cdr;
+            }
+            Value out = a2;
+            gc_root_push_value(&out);
+            while (rev.tag == VAL_CONS) {
+                out = val_cons(*rev.cons.car, out);
+                rev = *rev.cons.cdr;
+            }
+            *acc = out;
+            gc_root_pop(); gc_root_pop(); gc_root_pop(); gc_root_pop();
+            return 0;
         }
         break;
 
@@ -1171,6 +1221,11 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             if (a.tag == VAL_NUMBER && a.number == 0) { *acc = val_nil(); return 0; }
             if (a.tag != VAL_NUMBER || a.number != 0) PRIM_TYPE_ERROR("emptylist on non-zero");
         }
+        /* empty?: () <-> VAL_NIL.  Any non-nil value is not empty. */
+        if (strcmp(name, "empty?") == 0) {
+            Value a = va_pop(stack);
+            *acc = val_boolean(a.tag == VAL_NIL); return 0;
+        }
         break;
 
     /* ---- 'f': fst, function?, fail ---- */
@@ -1242,6 +1297,19 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         }
         break;
 
+    /* ---- 'l': length ---- */
+    case 'l':
+        /* length: count cons cells to the NIL terminator (sys.kl:172,
+           shen.length-h).  A non-NIL, non-CONS tail is an ALWAYS-ON error. */
+        if (strcmp(name, "length") == 0) {
+            Value a = va_pop(stack);
+            long n = 0;
+            while (a.tag == VAL_CONS) { n++; a = *a.cons.cdr; }
+            if (a.tag != VAL_NIL) vm_throw("length: non-list");
+            *acc = val_number(n); return 0;
+        }
+        break;
+
     /* ---- 'n': n->string, number?, newvar ---- */
     case 'n':
         if (strcmp(name, "n->string") == 0) {
@@ -1259,6 +1327,16 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             if (stack->len > 0) va_pop(stack);
             snprintf(buf, sizeof(buf), "V_%d", newvar_counter++);
             *acc = val_symbol(buf); return 0;
+        }
+        /* nth: 1-BASED element access (sys.kl:178).  Walk k-1 cdrs, then
+           return car if the kth cell is a cons; otherwise ALWAYS-ON error. */
+        if (strcmp(name, "nth") == 0) {
+            Value n = va_pop(stack), l = va_pop(stack);
+            long k = (long)n.number;
+            while (k > 1 && l.tag == VAL_CONS) { k--; l = *l.cons.cdr; }
+            if (k == 1 && l.tag == VAL_CONS) *acc = *l.cons.car;
+            else vm_throw("nth applied to a non-list or out-of-range index");
+            return 0;
         }
         break;
 
@@ -1367,6 +1445,22 @@ static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             buf[n] = '\0';
             *acc = val_string(buf, n);
             free(buf);
+            return 0;
+        }
+        /* reverse: acc-built reversal (sys.kl:143 = shen.reverse-help L ()). */
+        if (strcmp(name, "reverse") == 0) {
+            Value a = va_pop(stack);
+            if (a.tag != VAL_NIL && a.tag != VAL_CONS)
+                vm_throw("attempt to reverse a non-list");
+            gc_root_push_value(&a);
+            Value out = val_nil();
+            gc_root_push_value(&out);
+            while (a.tag == VAL_CONS) {
+                out = val_cons(*a.cons.car, out);
+                a = *a.cons.cdr;
+            }
+            *acc = out;
+            gc_root_pop(); gc_root_pop();
             return 0;
         }
         break;
@@ -2602,28 +2696,11 @@ char *read_file_or_stdin(const char *path) {
  * force_nursery_scavenge, gc_nursery_tests) moved to zinctest.c */
 
 void init_globals(void) {
-    const char *prims[] = {
-        "+","-","*","/","=","<",">","<=",">=",
-        "cons","hd","tl","cn","emptylist",
-        "symbol?","boolean?","number?","string?","cons?",
-        "error?","function?","stream?",
-        "simple-error","trap-error","error-to-string",
-        "eval-kl","element?","absvector","<-address","address->",
-        "n->string","string->n","str","tlstr","hdstr","pos",
-        "intern","value","open","close","read-byte","write-byte",
-        /* NOTE: c-strlen / char-code / substring are NON-STANDARD extras added
-         * for the load.shen parser hot path — NOT part of the KLambda primitive
-         * set, NOT called by the OS .kl files. Kept deliberately for the O(1)
-         * strlen / alloc-free char-code / O(k) substring the pure-Shen fallbacks
-         * in shen/load.shen lack; removing them makes the (already slow) OS-load
-         * noticeably slower. The pure-Shen fallbacks are the canonical semantics. */
-        "c-strlen","char-code","substring",
-        "set","get-time","read-file-as-string",
-        "@p","fst","snd","gensym","variable?","newvar",
-        "shen.fail!","fail",
-        "stinput","stoutput", NULL
-    };
-    for (int i = 0; prims[i]; i++) defun_set(prims[i], val_prim(prims[i]));
+    /* Register all C primitives as VAL_PRIM globals so [global X] falls back
+       to them.  c-strlen / char-code / substring are NON-STANDARD extras kept
+       for the load.shen parser hot path (see prims.def); the name list is the
+       generated prim_names[] (single source: vm/prims.def). */
+    for (int i = 0; prim_names[i]; i++) defun_set(prim_names[i], val_prim(prim_names[i]));
 }
 
 /* ------------------------------------------------------------------ */
@@ -2948,6 +3025,20 @@ int vm_load_bundle(const char *buf) {
        as a separate values assoc list (namespace 2); it must start as an
        empty alist so a not-found assoc returns [] (not the bare symbol). */
     value_set("value-table", val_nil());
+
+    /* Initialize primitive?-names for the bundled primitive? predicate
+       (util.shen + types.shen read (value primitive?-names)).  Built from
+       the single-source prim_names[] (vm/prims.def) so the C primitive set
+       and Shen's primitive? stay in sync.  pn is rooted across the val_cons
+       allocs below. */
+    {
+        Value pn = val_nil();
+        gc_root_push_value(&pn);
+        for (int i = 0; prim_names[i]; i++)
+            pn = val_cons(val_symbol(prim_names[i]), pn);
+        value_set("primitive?-names", pn);
+        gc_root_pop();
+    }
 
     /* Freeze point: the full key set (primitives + bundle closures +
        keywords) is now known.  Build the minimal perfect hash once. */

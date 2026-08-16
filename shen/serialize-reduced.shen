@@ -1,4 +1,9 @@
 (tc -)
+\* Load the generated primitive?-names list (from vm/prims.def via `make
+   gen-prims`).  Our compiler's primitive? predicate (util.shen/types.shen)
+   reads (value primitive?-names), so it must be set on the host before any
+   shen-load below compiles source. *\
+(load "shen/prims-generated.shen")
 (load "shen/interp.shen")
 (tc -)
 (load "shen/compile.shen")
