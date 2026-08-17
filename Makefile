@@ -1,4 +1,4 @@
-.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims qbe-tool qberun qbe-smoke qbe-gen qbe-gen-prims qbe-test
+.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims qbe-tool qberun qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -202,6 +202,14 @@ qberun: qbe-tool qbe-gen vm/qberun.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_
 
 # qbe-test: build + run the 4 differential tests (Tests 1-4 vs zincvm).
 qbe-test: qberun
+	./qberun
+
+# diff-test: Slice-4 differential harness — builds qberun (QBE native closures
+# linked against the C runtime), ensures globals.csexp is present (the bundled
+# closures the reference runs), then runs the driver: each of the 5 tests is
+# evaluated BOTH natively (clo_*) and as the C VM interpreter reference
+# (interp_ref -> defun_get + vm_exec_env with the same args), asserting MATCH.
+diff-test: qberun globals.csexp
 	./qberun
 
 # qbe-smoke: Slice-2 (+ 1 2) -> 3 gate (hand-written vm/add12.qbe).

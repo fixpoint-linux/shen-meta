@@ -1,21 +1,37 @@
 /*
- * qberun.c — differential driver for the QBE Slice-3 native codegen.
+ * qberun.c — differential driver for the QBE native codegen.
  *
- * Initialises the C runtime (GC + globals) and invokes the QBE-compiled
- * closures for AGENTS.md Tests 1-4, comparing each result against the
- * expected value (the same result `./zincvm globals.csexp` produces).
+ * Initialises the C runtime (GC + globals), loads the reduced bundle
+ * (globals.csexp) so the bundled closures are available, and drives the
+ * QBE-compiled clo_* closures for AGENTS.md Tests 1-4 + the let regression
+ * (Test 5).
  *
- *   Test 1: (+ 1 2)            via @clo_plus          -> 3
- *   Test 2: (reverse [1 2 3])  via @clo_reverse       -> [3 2 1]
- *   Test 3: (factorial 5)      via @clo_factorial     -> 120
- *   Test 4: (open "Makefile" in) -> (close stream)    via prim_open/prim_close
+ * For each test, the driver computes BOTH:
+ *   - the NATIVE result: the QBE-compiled clo_* extern (pointer-ABI), and
+ *   - the REFERENCE (C VM) result: interp_ref(name, args) — loads the SAME
+ *     bundled closure via defun_get (a safe.* wrapper or helper) and runs it
+ *     through vm_exec_env with the same args, replicating exactly the apply
+ *     path in zincvm.c (new_env = lambda.env ++ args).
+ * and asserts qbe_equal(native, reference).  This proves the native QBE
+ * closures produce the SAME result as the C VM interpreter on identical
+ * inputs — a true differential, not a hardcoded expectation.
  *
- * Build via `make qberun` (see Makefile): cosmocc links vm/qberun.c +
+ *   Test 1: (+ 1 2)              native @clo_plus         ref interp safe.+         -> 3
+ *   Test 2: (reverse [1 2 3])    native @clo_reverse      ref interp reverse        -> [3 2 1]
+ *   Test 3: (factorial 5)        native @clo_factorial    ref interp factorial      -> 120
+ *   Test 4: (open "Makefile" in) -> (close stream)        native prim_open/close,
+ *                                                         ref interp safe.open/close -> []
+ *   Test 5: (qbe-let-test 5)     native @clo_qbe_let_test ref interp qbe-let-test   -> 2
+ *
+ * Build via `make diff-test` (see Makefile): cosmocc links vm/qberun.c +
  * vm/qbe_shims.c + vm/qbe_prims_gen.c + vm/zincvm.c (-DZINCTEST) + vm/gc.c
  * against the dual-arch QBE objects assembled from globals.qbe.
  */
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 
 #include "zincvm.h"
 #include "qbe_shims.h"
@@ -40,6 +56,49 @@ static int qbe_equal(Value a, Value b) {
     }
 }
 
+
+/* Call a bundled closure through the C VM interpreter (vm_exec_env) with the
+ * given args, replicating exactly the apply path in zincvm.c:2348-2369:
+ * new_env = lambda.env ++ [a0..a{k-1}], then vm_exec_env(code,...).
+ * This is the true differential reference: SAME closure, SAME args, run by the
+ * C VM interpreter, versus the native QBE clo_* closure.  Returns the result.
+ * The result is left rooted (one shadow-stack slot); caller pops after
+ * comparing. */
+static Value interp_ref(const char *name, Value *args, int nargs) {
+    Value closure = defun_get(name);
+    if (closure.tag != VAL_LAMBDA) {
+        fprintf(stderr, "qberun: interp_ref %s: not a bundled closure (tag=%d)\n",
+                name, (int)closure.tag);
+        Value bad; memset(&bad, 0, sizeof(bad)); bad.tag = VAL_NIL;
+        return bad;
+    }
+    gc_root_push_value(&closure);
+    int lel = closure.lambda.env_len;
+    int new_len = lel + nargs;
+    Value *ne = GC_VALUE_ARRAY(new_len);
+    if (lel > 0 && closure.lambda.env)
+        memcpy(ne, closure.lambda.env, lel * sizeof(Value));
+    for (int i = 0; i < nargs; i++) {
+        ne[lel + i] = args[i];
+        if (gc_in_oldgen(ne) && value_references_nursery(&args[i]))
+            gc_dirty_vectors_add(ne);
+    }
+    Value r = vm_exec_env(closure.lambda.code, closure.lambda.code_len, ne, new_len);
+    gc_root_push_value(&r);             /* root output (may be nursery) */
+    gc_root_pop();                      /* pop closure */
+    return r;                           /* caller pops r */
+}
+
+static int fails = 0;
+static void diff_check(const char *label, Value native, Value ref) {
+    int ok = qbe_equal(native, ref);
+    printf("diff %s: ", label);
+    print_value(ref);
+    printf("  %s\n", ok ? "MATCH" : "MISMATCH");
+    if (!ok) fails++;
+    gc_root_pop();                      /* pop ref from interp_ref */
+}
+
 int main(void) {
     volatile char stack_top_marker;
     gc_set_stack_top(((uintptr_t)&stack_top_marker + GC_PAGEBYTES - 1) & ~(GC_PAGEBYTES - 1));
@@ -51,7 +110,18 @@ int main(void) {
     gc_register_values_table(values_table, &values_table_cap);
     gc_register_traced_code(traced_code, &num_traced);
 
-    int fails = 0;
+    /* Load the reduced bundle: provides the bundled closures (safe wrappers
+     * for +/open/close, plus reverse/factorial/qbe-sub2/qbe-let-test) that
+     * interp_ref runs through the C VM interpreter as the reference. */
+    {
+        char *buf = read_file_or_stdin("globals.csexp");
+        if (!buf) { fprintf(stderr, "qberun: cannot read globals.csexp\n"); return 1; }
+        const char *p = buf;
+        while (*p && isspace((unsigned char)*p)) p++;
+        int n = vm_load_bundle(p);
+        if (n == 0) { fprintf(stderr, "qberun: bundle load failed\n"); return 1; }
+        free(buf);
+    }
 
     /* ---- Test 1: (+ 1 2) -> 3 ---- */
     {
@@ -63,6 +133,10 @@ int main(void) {
         printf("test1 (+ 1 2): "); print_value(out);
         printf("  %s\n", ok ? "OK (expect 3)" : "FAIL");
         if (!ok) fails++;
+
+        Value args1[2] = { a, b };
+        Value ref = interp_ref("+", args1, 2);
+        diff_check("(+ 1 2)", out, ref);
     }
 
     /* ---- Test 2: (reverse [1 2 3]) -> [3 2 1] ---- */
@@ -81,6 +155,10 @@ int main(void) {
         printf("test2 (reverse [1 2 3]): "); print_value(out);
         printf("  %s\n", ok ? "OK (expect [3 2 1])" : "FAIL");
         if (!ok) fails++;
+
+        Value args2[1] = { list123 };
+        Value ref = interp_ref("reverse", args2, 1);
+        diff_check("(reverse [1 2 3])", out, ref);
     }
 
     /* ---- Test 3: (factorial 5) -> 120 ---- */
@@ -93,6 +171,10 @@ int main(void) {
         printf("test3 (factorial 5): "); print_value(out);
         printf("  %s\n", ok ? "OK (expect 120)" : "FAIL");
         if (!ok) fails++;
+
+        Value args3[1] = { n };
+        Value ref = interp_ref("factorial", args3, 1);
+        diff_check("(factorial 5)", out, ref);
     }
 
     /* ---- Test 4: (open "Makefile" in) -> (close stream) -> [] ---- */
@@ -108,9 +190,24 @@ int main(void) {
         printf("test4 (open+close): "); print_value(out);
         printf("  %s\n", ok ? "OK (expect [])" : "FAIL");
         if (!ok) fails++;
+
+        /* Reference: run the SAME bundled open/close closures through the C VM
+         * interpreter (defun_get returns the safe.open/safe.close lambdas).
+         * Native prim_open/prim_close == interp safe.open/safe.close. */
+        Value open_args[2] = { path, dir };
+        Value sref = interp_ref("open", open_args, 2);
+        int s_ok = (sref.tag == VAL_STREAM);
+        printf("diff (open \"Makefile\" in): "); print_value(sref);
+        printf("  %s\n", s_ok ? "MATCH (stream)" : "MISMATCH");
+        if (!s_ok) fails++;
+        gc_root_pop();   /* pop sref */
+
+        Value close_args[1] = { sref };
+        Value cref = interp_ref("close", close_args, 1);
+        diff_check("(close (open ...))", out, cref);
     }
 
-    /* ---- Test 5: (qbe-let-test 5) = sub2((let Y (+ 5 1) (+ Y Y))=12, 10) -> 2
+    /* ---- Test 5: (qbe-let-test 5) = sub2((let Y (+ X 1) (+ Y Y))=12, 10) -> 2
          (letz pop-vs-peek regression: Y is a computed value used twice, so
          letz is genuinely emitted and cannot be inlined away) ---- */
     {
@@ -122,9 +219,13 @@ int main(void) {
         printf("test5 (let Y (+ X 1) (+ Y Y) then sub2 10): "); print_value(out);
         printf("  %s\n", ok ? "OK (expect 2)" : "FAIL");
         if (!ok) fails++;
+
+        Value args5[1] = { x };
+        Value ref = interp_ref("qbe-let-test", args5, 1);
+        diff_check("(qbe-let-test 5)", out, ref);
     }
 
-    if (fails) { printf("QBE TESTS FAILED: %d\n", fails); return 1; }
-    printf("QBE TESTS ALL PASS (Tests 1-4 match zincvm)\n");
+    if (fails) { printf("DIFF-TEST FAILED: %d\n", fails); return 1; }
+    printf("DIFF-TEST ALL PASS: native QBE == C VM interpreter for Tests 1-5\n");
     return 0;
 }
