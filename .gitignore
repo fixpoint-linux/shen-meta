@@ -4,6 +4,8 @@ zincvm
 zincdec
 zinctest
 qberun
+qbesmoke
+globals.qbe
 *.csexp
 /tmp/
 core.*

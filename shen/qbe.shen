@@ -1,0 +1,500 @@
+(tc -)
+\* =============================================================================
+   qbe.shen - QBE backend for the resolved ZINC bytecode (Slice 3).
+
+   lower : symbol --> klambda --> (list symbol) --> string
+     Name  Body  ClosureSet
+
+   Body is the RESOLVED closure body (compile-zinc output, a flat list of
+   instructions with ABSOLUTE jmp/jmpf targets and labels stripped).  It is
+   the C1 inside the `[cur C1]` wrapper that nat->csexp serialises.
+
+   The lowering is a stack->SSA transform over the pointer-ABI runtime
+   (vm/qbe_shims.c): every ZINC temp is a `l` = Value* into a per-frame
+   `alloc8 40` slot.  `access`/`let`/`endlet`/`grab` are pure compile-time
+   Env-list manipulations (no QBE emitted); only literals, prims, calls,
+   branches and phi emit instructions.
+
+   CFG recovery: leaders = {0} + jmp/jmpf targets + post-terminator/fall-through.
+   Blocks are processed in increasing start order (all ZINC jumps are forward -
+   loops are recursion, `if`/`cond` produce forward jumps only).  At a join the
+   compile-time (Stk, Env) slots are reconciled with QBE phi nodes.
+
+   Env de Bruijn convention (matches lookup_env, zincvm.c): Env list head =
+   index 0 = the NEWEST binding.  A k-arg closure's entry Env is
+   [%a{k-1} ... %a0] (access 0 = rightmost arg), because apply builds
+   env = captured ++ [leftmost .. rightmost] and lookup_env(n)=env[len-1-n].
+   ============================================================================= *\
+
+\* -------------------------- mutable lowering state -------------------------- *\
+(set qbe-temp-count 0)   \* next %tN index (Value* temps, `l`) *\
+(set qbe-wcount 0)       \* next %cN index (word temps, `w`) *\
+(set qbe-data-count 0)   \* next $dN data literal index *\
+(set qbe-datas [])       \* [ [name content] ... ] collected data defs *\
+(set qbe-lines [])       \* current block's emitted lines (reversed) *\
+(set qbe-block-lines []) \* [ [start lines-reversed] ... ] (reversed) *\
+(set qbe-allocs [])
+(set qbe-preds [])       \* [ [target pred state] ... ] CFG edges *\
+
+\* Shen does NOT interpret \\n/\\\" escapes in string literals (they are
+   literal 2-char sequences), so real newline / double-quote chars must be
+   built from ASCII codes via n->string. *\
+(set qbe-nl (n->string 10))   \* newline *\
+(set qbe-dq (n->string 34))   \* double-quote *\
+
+\* -------------------------- tiny string/list helpers -------------------------- *\
+
+(define qbe-join { (list string) --> string }
+  [] -> ""
+  [S] -> S
+  [S | R] -> (cn S (qbe-join R)))
+
+(define qbe-strlen { string --> number }
+  "" -> 0
+  S -> (+ 1 (qbe-strlen (tlstr S))))
+
+(define qbe-nth0 { number --> (list A) --> A }
+  0 [H | _] -> H
+  N [_ | T] -> (qbe-nth0 (- N 1) T)
+  N L -> (simple-error (cn (cn "qbe: list index out of range: " (str N)) (cn " in " (str L)))))
+
+(define qbe-env-ref { number --> (list A) --> A }
+  N Env -> (qbe-nth0 N Env))
+
+\* -------------------------- name mangling -------------------------- *\
+
+\* Map a symbol's printed name to a valid C identifier (shared char mapping
+   with vm/qbe-prims.list).  Exact special-case table for the arithmetic ops,
+   then a char scan handling ->, <-, ?, ., @, !, -. *\
+(define qbe-ident { string --> string }
+  "+" -> "plus"   "-" -> "minus"  "*" -> "mul"  "/" -> "div"
+  "=" -> "eq"     ">" -> "gt"     "<" -> "lt"   ">=" -> "ge"  "<=" -> "le"
+  S -> (qbe-ident-h S ""))
+
+(define qbe-ident-h { string --> string --> string }
+  "" Acc -> Acc
+  S Acc -> (qbe-ident-h (tlstr (tlstr S)) (cn Acc "_to_")) where (and (> (qbe-strlen S) 1) (= "->" (cn (hdstr S) (hdstr (tlstr S)))))
+  S Acc -> (qbe-ident-h (tlstr (tlstr S)) (cn Acc "_from_")) where (and (> (qbe-strlen S) 1) (= "<-" (cn (hdstr S) (hdstr (tlstr S)))))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "p")) where (= "?" (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "_")) where (= "." (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "at")) where (= "@" (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "bang")) where (= "!" (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "_")) where (= "-" (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc (hdstr S))))
+
+(define qbe-clo-name { symbol --> string }
+  Name -> (cn "clo_" (qbe-ident (str Name))))
+
+\* -------------------------- flat->nested conversion -------------------------- *\
+
+\* The resolved klambda (compile-zinc output) is a FLAT atom stream: each
+   opcode is a symbol, and operand opcodes (access/global/jmpf/jmp/number/
+   string/symbol/boolean/prim) are immediately followed by their operand atom.
+   qbe-nest converts it to the nested [op operand] form the rest of the lowerer
+   consumes.  `cur` (deferred to Slice 5) is rejected. *\
+(define qbe-nest { klambda --> (list zinc-code) }
+  [] -> []
+  [grab | C] -> [grab | (qbe-nest C)]
+  [pushmark | C] -> [pushmark | (qbe-nest C)]
+  [apply | C] -> [apply | (qbe-nest C)]
+  [appterm | C] -> [appterm | (qbe-nest C)]
+  [return | C] -> [return | (qbe-nest C)]
+  [letz | C] -> [letz | (qbe-nest C)]
+  [endlet | C] -> [endlet | (qbe-nest C)]
+  [access N | C] -> [[access N] | (qbe-nest C)]
+  [global G | C] -> [[global G] | (qbe-nest C)]
+  [jmpf L | C] -> [[jmpf L] | (qbe-nest C)]
+  [jmp L | C] -> [[jmp L] | (qbe-nest C)]
+  [number N | C] -> [[number N] | (qbe-nest C)]
+  [string S | C] -> [[string S] | (qbe-nest C)]
+  [symbol S | C] -> [[symbol S] | (qbe-nest C)]
+  [boolean B | C] -> [[boolean B] | (qbe-nest C)]
+  [prim P | C] -> [[prim P] | (qbe-nest C)]
+  [cur _ | _] -> (simple-error "qbe: cur not supported (deferred to Slice 5)")
+  [X | _] -> (simple-error (cn "qbe-nest: unknown op " (str X))))
+
+\* -------------------------- prim info -------------------------- *\
+
+(define qbe-prim? { symbol --> boolean }
+  P -> (not (empty? (assoc P (value qbe-prim-info)))))
+
+(define qbe-prim-mangled { symbol --> string }
+  P -> (str (hd (tl (assoc P (value qbe-prim-info))))))
+
+(define qbe-prim-arity { symbol --> number }
+  P -> (hd (tl (tl (assoc P (value qbe-prim-info))))))
+
+\* -------------------------- emit machinery -------------------------- *\
+
+(define qbe-emit { string --> string }
+  Line -> (do (set qbe-lines (cons Line (value qbe-lines))) Line))
+
+(define qbe-fresh { --> string }
+  -> (let N (value qbe-temp-count)
+       (do (set qbe-temp-count (+ N 1))
+           (cn "%t" (str N)))))
+
+(define qbe-c-fresh { --> string }
+  -> (let N (value qbe-wcount)
+       (do (set qbe-wcount (+ N 1))
+           (cn "%c" (str N)))))
+
+\* Allocate a 40-byte Value slot, return its temp name. *\
+(define qbe-slot { --> string }
+  -> (let T (qbe-fresh)
+       (do (set qbe-allocs (cons (qbe-join [T " =l alloc8 40"]) (value qbe-allocs)))
+           T)))
+
+\* Register a string/symbol data literal, return its $dN label. *\
+(define qbe-data { string --> string }
+  Content -> (let N (value qbe-data-count)
+               (do (set qbe-data-count (+ N 1))
+                   (set qbe-datas (cons [(cn "$d" (str N)) Content] (value qbe-datas)))
+                   (cn "$d" (str N)))))
+
+(define qbe-string-lit { string --> string }
+  S -> (qbe-data S))
+
+(define qbe-symbol-lit { string --> string }
+  S -> (qbe-data S))
+
+\* Join already-typed call arguments ("l %t", "w 1", "l 42", ...) with ", ". *\
+(define qbe-args-str { (list string) --> string }
+  [] -> ""
+  [A] -> A
+  [A | R] -> (qbe-join [A ", " (qbe-args-str R)]))
+
+\* Wrap bare Value* temp names as `l %t` call args. *\
+(define qbe-l-args { (list string) --> (list string) }
+  [] -> []
+  [T | R] -> [(cn "l " T) | (qbe-l-args R)])
+
+(define qbe-call { string --> (list string) --> string }
+  F Args -> (qbe-join ["call $" F "(" (qbe-args-str Args) ")"]))
+
+\* -------------------------- CFG recovery -------------------------- *\
+
+(define qbe-index { klambda --> number --> (list (list number zinc-code)) }
+  [] _ -> []
+  [I | C] N -> [[N I] | (qbe-index C (+ N 1))])
+
+(define qbe-terminator? { zinc-code --> boolean }
+  [jmp _] -> true
+  [jmpf _] -> true
+  return -> true
+  appterm -> true
+  _ -> false)
+
+(define qbe-leaders { (list (list number zinc-code)) --> (list number) }
+  Indexed -> (qbe-sort-unique (qbe-leaders-h Indexed [0])))
+
+(define qbe-leaders-h { (list (list number zinc-code)) --> (list number) --> (list number) }
+  [] Acc -> Acc
+  [[N [jmp L]] | R] Acc -> (qbe-leaders-h R (cons (+ N 1) (cons L Acc)))
+  [[N [jmpf L]] | R] Acc -> (qbe-leaders-h R (cons (+ N 1) (cons L Acc)))
+  [[N return] | R] Acc -> (qbe-leaders-h R (cons (+ N 1) Acc))
+  [[N appterm] | R] Acc -> (qbe-leaders-h R (cons (+ N 1) Acc))
+  [[_ _] | R] Acc -> (qbe-leaders-h R Acc))
+
+(define qbe-insert-num { number --> (list number) --> (list number) }
+  N [] -> [N]
+  N [H | T] -> [N H | T] where (< N H)
+  N [H | T] -> [H | (qbe-insert-num N T)] where (> N H)
+  N L -> L)
+
+(define qbe-sort-unique { (list number) --> (list number) }
+  [] -> []
+  [H | T] -> (qbe-insert-num H (qbe-sort-unique T)))
+
+(define qbe-slice { (list (list number zinc-code)) --> number --> number --> (list (list number zinc-code)) }
+  Indexed Start End -> (qbe-slice-h Indexed Start End []))
+
+(define qbe-slice-h { (list (list number zinc-code)) --> number --> number --> (list (list number zinc-code)) --> (list (list number zinc-code)) }
+  [] _ _ Acc -> (reverse Acc)
+  [[N I] | R] Start End Acc -> (qbe-slice-h R Start End (cons [N I] Acc)) where (and (>= N Start) (< N End))
+  [_ | R] Start End Acc -> (qbe-slice-h R Start End Acc))
+
+(define qbe-make-blocks { (list (list number zinc-code)) --> (list number) --> number --> (list (list number (list (list number zinc-code)))) }
+  Indexed [L1 L2 | R] Total -> (cons [L1 (qbe-slice Indexed L1 L2)] (qbe-make-blocks Indexed [L2 | R] Total))
+  Indexed [L] Total -> (if (< L Total) [[L (qbe-slice Indexed L Total)]] [])
+  _ [] _ -> [])
+
+(define qbe-last-instr { (list (list number zinc-code)) --> zinc-code }
+  [[_ I]] -> I
+  [[_ _] | R] -> (qbe-last-instr R))
+
+(define qbe-block-end { (list (list number zinc-code)) --> number }
+  [[N _]] -> (+ N 1)
+  [[_ _] | R] -> (qbe-block-end R))
+
+\* -------------------------- arity / entry env -------------------------- *\
+
+\* Arity = leading grabs + 1 (matches interp's zinc-arity). *\
+(define qbe-arity { klambda --> number }
+  [grab | C] -> (+ 1 (qbe-arity C))
+  _ -> 1)
+
+(define qbe-arg-temps { number --> (list string) }
+  N -> (qbe-arg-temps-h N []))
+
+(define qbe-arg-temps-h { number --> (list string) --> (list string) }
+  N Acc -> (qbe-arg-temps-h (- N 1) (cons (cn "%a" (str (- N 1))) Acc)) where (> N 0)
+  _ Acc -> Acc)
+
+\* Entry Env: [%a{k-1} ... %a0] - access 0 = rightmost arg. *\
+(define qbe-env0 { (list string) --> (list string) }
+  Args -> (reverse Args))
+
+\* -------------------------- stack helpers -------------------------- *\
+
+(define qbe-pop { (list A) --> (list A) }
+  [H | T] -> [H T]
+  _ -> (simple-error "qbe: pop empty stack"))
+
+\* Pop K entries (top-first), return [args remaining]. *\
+(define qbe-pop-k { number --> (list A) --> (list (list A)) }
+  0 Stk -> [[] Stk]
+  K [H | T] -> (let R (qbe-pop-k (- K 1) T)
+                 [[H | (hd R)] | (tl R)])
+  _ _ -> (simple-error "qbe: stack underflow"))
+
+\* -------------------------- state accessors -------------------------- *\
+
+(define qbe-stk { (list zinc-value) --> (list zinc-value) } S -> (hd S))
+(define qbe-env { (list zinc-value) --> (list zinc-value) } S -> (hd (tl S)))
+(define qbe-marks { (list zinc-value) --> (list number) } S -> (hd (tl (tl S))))
+
+\* -------------------------- per-opcode step -------------------------- *\
+
+(define qbe-step { number --> zinc-code --> (list zinc-value) --> (list symbol) --> (list zinc-value) }
+  _ grab [Stk Env Marks] _ -> [Stk Env Marks]
+  _ letz [Stk Env Marks] _ -> [(tl Stk) [(hd Stk) | Env] Marks]
+  _ endlet [Stk Env Marks] _ -> [Stk (tl Env) Marks]
+  _ [access N] [Stk Env Marks] _ -> [[(qbe-env-ref N Env) | Stk] Env Marks]
+  _ [number N] [Stk Env Marks] _ ->
+    (let Out (qbe-slot)
+      (do (qbe-emit (qbe-call "val_number_into" [(cn "l " Out) (cn "l " (str N))]))
+          [[Out | Stk] Env Marks]))
+  _ [string S] [Stk Env Marks] _ ->
+    (let Out (qbe-slot)
+      (let D (qbe-string-lit S)
+        (do (qbe-emit (qbe-call "val_string_into" [(cn "l " Out) (cn "l " D) (cn "l " (str (qbe-strlen S)))]))
+            [[Out | Stk] Env Marks])))
+  _ [symbol S] [Stk Env Marks] _ ->
+    (let Out (qbe-slot)
+      (let D (qbe-symbol-lit S)
+        (do (qbe-emit (qbe-call "val_symbol_into" [(cn "l " Out) (cn "l " D)]))
+            [[Out | Stk] Env Marks])))
+  _ [boolean B] [Stk Env Marks] _ ->
+    (let Out (qbe-slot)
+      (do (qbe-emit (qbe-call "val_boolean_into" [(cn "l " Out) (cn "w " (if (= B true) "1" "0"))]))
+          [[Out | Stk] Env Marks]))
+  _ [prim P] [Stk Env Marks] _ ->
+    (let K (qbe-prim-arity P)
+      (let R (qbe-pop-k K Stk)
+        (let Out (qbe-slot)
+          (do (qbe-emit (qbe-call (cn "prim_" (qbe-prim-mangled P)) (cons (cn "l " Out) (qbe-l-args (hd R)))))
+              [[Out | (hd (tl R))] Env Marks]))))
+  _ [global G] [Stk Env Marks] ClosureSet ->
+    (if (qbe-prim? G)
+        [[[prim G] | Stk] Env Marks]
+        (if (element? G ClosureSet)
+            [[[clo G] | Stk] Env Marks]
+            (let Out (qbe-slot)
+              (let D (qbe-symbol-lit (str G))
+                (do (qbe-emit (qbe-call "global_get_into" [(cn "l " Out) (cn "l " D)]))
+                    [[Out | Stk] Env Marks])))))
+  _ pushmark [Stk Env Marks] _ -> [Stk Env [(length Stk) | Marks]]
+  _ apply [Stk Env Marks] ClosureSet ->
+    (let R (qbe-pop-k (- (length (tl Stk)) (hd Marks)) (tl Stk))
+      (let Out (qbe-slot)
+        (do (qbe-emit (qbe-do-call (hd Stk) Out (hd R) ClosureSet))
+            [[Out | (hd (tl R))] Env (tl Marks)])))
+  _ appterm [Stk Env Marks] ClosureSet ->
+    (let R (qbe-pop-k (- (length (tl Stk)) (hd Marks)) (tl Stk))
+      (do (qbe-emit (qbe-do-tail (hd Stk) (hd R) ClosureSet))
+          (qbe-emit "ret")
+          [(hd (tl R)) Env (tl Marks)]))
+  _ return [Stk Env Marks] _ ->
+    (do (qbe-emit (qbe-call "copy_value" ["l %out" (cn "l " (hd Stk))]))
+        (qbe-emit "ret")
+        [Stk Env Marks])
+  _ [jmp L] State _ ->
+    (do (qbe-emit (qbe-join ["jmp @b" (str L)]))
+        State)
+  N [jmpf L] [Stk Env Marks] _ ->
+    (let Cond (hd Stk)
+      (let C (qbe-c-fresh)
+        (do (qbe-emit (qbe-join [C " =w call $is_false(" (cn "l " Cond) ")"]))
+            (qbe-emit (qbe-join ["jnz " C ", @b" (str L) ", @b" (str (+ N 1))]))
+            [(tl Stk) Env Marks])))
+  _ [Op | _] _ _ -> (simple-error (cn "qbe: unsupported op " (str Op)))
+  _ X _ _ -> (simple-error (cn "qbe: unknown instruction " (str X))))
+
+\* Direct-call for apply (non-tail): result into fresh %out slot. *\
+(define qbe-do-call { zinc-value --> string --> (list zinc-value) --> (list symbol) --> string }
+  [clo G] Out Args _ -> (qbe-call (qbe-clo-name G) (cons (cn "l " Out) (qbe-l-args Args)))
+  [prim P] Out Args _ -> (qbe-call (cn "prim_" (qbe-prim-mangled P)) (cons (cn "l " Out) (qbe-l-args Args)))
+  _ _ _ _ -> (simple-error "qbe: dynamic apply not supported"))
+
+\* Tail-call for appterm: result goes to the current function's %out. *\
+(define qbe-do-tail { zinc-value --> (list zinc-value) --> (list symbol) --> string }
+  [clo G] Args _ -> (qbe-call (qbe-clo-name G) (cons "l %out" (qbe-l-args Args)))
+  [prim P] Args _ -> (qbe-call (cn "prim_" (qbe-prim-mangled P)) (cons "l %out" (qbe-l-args Args)))
+  _ _ _ -> (simple-error "qbe: dynamic appterm not supported"))
+
+\* -------------------------- CFG edge recording -------------------------- *\
+
+(define qbe-record-pred { number --> number --> (list zinc-value) --> symbol }
+  Target Pred State -> (set qbe-preds (cons [Target Pred State] (value qbe-preds))))
+
+(define qbe-record-succs { number --> (list (list number zinc-code)) --> (list zinc-value) --> symbol }
+  Start Instrs Out ->
+    (let Last (qbe-last-instr Instrs)
+      (qbe-record-succs2 Start Instrs Out Last)))
+
+(define qbe-record-succs2 { number --> (list (list number zinc-code)) --> (list zinc-value) --> zinc-code --> symbol }
+  _ _ _ return -> skip
+  _ _ _ appterm -> skip
+  Start _ Out [jmp L] -> (qbe-record-pred L Start Out)
+  Start Instrs Out [jmpf L] -> (do (qbe-record-pred L Start Out)
+                                   (qbe-record-pred (qbe-block-end Instrs) Start Out))
+  Start Instrs Out _ -> (qbe-record-pred (qbe-block-end Instrs) Start Out))
+
+\* -------------------------- phi reconciliation -------------------------- *\
+
+(define qbe-preds-of { number --> (list (list number (list zinc-value))) }
+  L -> (qbe-preds-of-h L (value qbe-preds) []))
+
+(define qbe-preds-of-h { number --> (list (list number (list zinc-value))) --> (list (list number (list zinc-value))) --> (list (list number (list zinc-value))) }
+  _ [] Acc -> Acc
+  L [[T P S] | R] Acc -> (qbe-preds-of-h L R (cons [P S] Acc)) where (= L T)
+  L [_ | R] Acc -> (qbe-preds-of-h L R Acc))
+
+(define qbe-pred-starts { (list (list number (list zinc-value))) --> (list number) }
+  [] -> []
+  [[P _] | R] -> [P | (qbe-pred-starts R)])
+
+(define qbe-pred-stks { (list (list number (list zinc-value))) --> (list (list zinc-value)) }
+  [] -> []
+  [[_ S] | R] -> [(qbe-stk S) | (qbe-pred-stks R)])
+
+(define qbe-pred-envs { (list (list number (list zinc-value))) --> (list (list zinc-value)) }
+  [] -> []
+  [[_ S] | R] -> [(qbe-env S) | (qbe-pred-envs R)])
+
+(define qbe-merge { (list (list number (list zinc-value))) --> (list zinc-value) }
+  Preds -> (let Starts (qbe-pred-starts Preds)
+             (let Stk (qbe-reconcile (qbe-pred-stks Preds) Starts)
+               (let Env (qbe-reconcile (qbe-pred-envs Preds) Starts)
+                 (let Marks (qbe-marks (hd (tl (hd Preds))))
+                   [Stk Env Marks])))))
+
+(define qbe-reconcile { (list (list zinc-value)) --> (list number) --> (list zinc-value) }
+  Slots Starts -> (qbe-reconcile-h Slots Starts 0 (length (hd Slots))))
+
+(define qbe-reconcile-h { (list (list zinc-value)) --> (list number) --> number --> number --> (list zinc-value) }
+  Slots Starts J Max -> [] where (= J Max)
+  Slots Starts J Max -> [(qbe-slot-phi Slots Starts J) | (qbe-reconcile-h Slots Starts (+ J 1) Max)])
+
+(define qbe-col { (list (list zinc-value)) --> number --> (list zinc-value) }
+  [] _ -> []
+  [S | R] J -> [(qbe-nth0 J S) | (qbe-col R J)])
+
+(define qbe-all-eq { (list zinc-value) --> boolean }
+  [] -> true
+  [_] -> true
+  [X Y | R] -> (and (= X Y) (qbe-all-eq [Y | R])))
+
+(define qbe-slot-phi { (list (list zinc-value)) --> (list number) --> number --> zinc-value }
+  Slots Starts J -> (let Temps (qbe-col Slots J)
+                      (if (qbe-all-eq Temps)
+                          (hd Temps)
+                          (let T (qbe-fresh)
+                            (do (qbe-emit (qbe-join [T " =l phi " (qbe-phi-inputs Starts Temps)]))
+                                T)))))
+
+(define qbe-phi-inputs { (list number) --> (list zinc-value) --> string }
+  [P] [T] -> (qbe-join ["@b" (str P) " " T])
+  [P | PR] [T | TR] -> (qbe-join ["@b" (str P) " " T ", " (qbe-phi-inputs PR TR)]))
+
+\* -------------------------- block execution -------------------------- *\
+
+(define qbe-exec { (list (list number zinc-code)) --> (list zinc-value) --> (list symbol) --> (list zinc-value) }
+  [] State _ -> State
+  [[N I] | R] State ClosureSet -> (qbe-exec R (qbe-step N I State ClosureSet) ClosureSet))
+
+(define qbe-lower-blocks { (list (list number (list (list number zinc-code)))) --> (list zinc-value) --> (list symbol) --> symbol }
+  [] _ _ -> done
+  [[Start Instrs] | Rest] Entry0 ClosureSet ->
+    (do
+      (let Preds (qbe-preds-of Start)
+        (if (or (= Start 0) (not (empty? Preds)))
+            (do
+              (set qbe-lines [])
+              (let Entry (if (empty? Preds) Entry0 (qbe-merge Preds))
+                (let Out (qbe-exec Instrs Entry ClosureSet)
+                  (do (qbe-record-succs Start Instrs Out)
+                      (set qbe-block-lines (cons [Start (value qbe-lines)] (value qbe-block-lines)))))))
+            skip))
+      (qbe-lower-blocks Rest Entry0 ClosureSet)))
+
+\* -------------------------- assembly -------------------------- *\
+
+(define qbe-lines-str { (list string) --> string }
+  [] -> ""
+  [L] -> L
+  [L | R] -> (cn (cn L (value qbe-nl)) (qbe-lines-str R)))
+
+(define qbe-block-str { (list number (list string)) --> string }
+  [Start Lines] -> (cn (cn "@b" (str Start)) (if (empty? Lines) "" (cn (value qbe-nl) (qbe-lines-str (reverse Lines))))))
+
+(define qbe-blocks-str { (list (list number (list string))) --> string }
+  [] -> ""
+  [B] -> (qbe-block-str B)
+  [B | R] -> (cn (cn (qbe-block-str B) (value qbe-nl)) (qbe-blocks-str R)))
+
+(define qbe-fn-header { symbol --> number --> string }
+  Name Arity ->
+    (qbe-join ["export" (value qbe-nl) "function $" (qbe-clo-name Name) "("
+               (qbe-args-str (qbe-l-args (cons "%out" (qbe-arg-temps Arity))))
+               ") {" (value qbe-nl)]))
+
+(define qbe-inject-allocs { (list (list number (list string))) --> (list (list number (list string))) }
+  [] -> []
+  [[0 Lines] | R] -> [[0 (append Lines (value qbe-allocs))] | R]
+  [B | R] -> [B | (qbe-inject-allocs R)])
+
+(define qbe-fn-string { symbol --> number --> string }
+  Name Arity ->
+    (qbe-join [(qbe-fn-header Name Arity)
+               (qbe-blocks-str (qbe-inject-allocs (reverse (value qbe-block-lines))))
+               (value qbe-nl) "}" (value qbe-nl)]))
+
+\* Render the accumulated data literals as QBE `data` definitions. *\
+(define qbe-datas-str { (list (list string string)) --> string }
+  [] -> ""
+  [[N Content] | R] -> (qbe-join ["data " N " = { b " (value qbe-dq) Content (value qbe-dq) ", b 0 }" (value qbe-nl) (qbe-datas-str R)]))
+
+\* -------------------------- top-level lower -------------------------- *\
+
+(define lower { symbol --> klambda --> (list symbol) --> string }
+  Name Body ClosureSet ->
+    (do
+      (set qbe-temp-count 0)
+      (set qbe-wcount 0)
+      \* qbe-data-count is GLOBAL (unique $dN labels across all closures);
+         only the per-closure qbe-datas list is reset here. *\
+      (set qbe-datas [])
+      (set qbe-preds [])
+      (set qbe-allocs [])
+      (set qbe-block-lines [])
+      (set qbe-lines [])
+      (let Arity (qbe-arity Body)
+        (let Nested (qbe-nest Body)
+          (let Env0 (qbe-env0 (qbe-arg-temps Arity))
+            (let Indexed (qbe-index Nested 0)
+              (let Total (length Indexed)
+                (let Blocks (qbe-make-blocks Indexed (qbe-leaders Indexed) Total)
+                  (do (qbe-lower-blocks Blocks [[] Env0 []] ClosureSet)
+                      (qbe-fn-string Name Arity))))))))))

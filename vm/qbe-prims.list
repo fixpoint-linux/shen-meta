@@ -1,0 +1,82 @@
+# qbe-prims.list — single source of truth for the QBE prim_<F> shim names.
+#
+# One line per primitive:  <original-name> <mangled-C-identifier> <arity>
+#
+# The mangled identifier is a valid C function name derived from the primitive's
+# string name (special chars mapped deterministically).  It is consumed by:
+#   (a) tools/qbe-gen-prims.awk  -> vm/qbe_prims_gen.{h,c}  (C wrappers around
+#       the REAL exec_primitive, RTL-push arg convention)
+#   (b) tools/qbe-gen-prims.awk  -> shen/qbe-prim-info.shen (the Shen table the
+#       Slice-3 lowerer reads to emit `call $prim_<mangled>(...)`)
+# Keeping both generated from THIS file guarantees the lowerer and the C shim
+# agree on every function name.
+#
+# Order mirrors vm/prims.def (hot-first).
+
+assoc       assoc       2
+cons        cons        2
+hd          hd          1
+tl          tl          1
+=           eq          2
+empty?      empty_p     1
+length      length      1
+nth         nth         2
+reverse     reverse     1
+append      append      2
++           plus        2
+/           div         2
+*           mul         2
+-           minus       2
+>           gt          2
+<           lt          2
+>=          ge          2
+<=          le          2
+number?     number_p    1
+string?     string_p    1
+symbol?     symbol_p    1
+boolean?    boolean_p   1
+cons?       cons_p      1
+absvector?  absvector_p 1
+function?   function_p  1
+error?      error_p     1
+stream?     stream_p    1
+variable?   variable_p  1
+pos         pos         2
+tlstr       tlstr       1
+hdstr       hdstr       1
+cn          cn          2
+str         str         1
+string->n   string_to_n 1
+n->string   n_to_string 1
+c-strlen    c_strlen    1
+char-code   char_code   2
+substring   substring   3
+shen.str->bytes   shen_str_to_bytes    1
+shen.bytes->string shen_bytes_to_string 1
+absvector   absvector   1
+address->   address_to  3
+<-address   from_address 2
+emptylist   emptylist   1
+write-byte  write_byte  2
+read-byte   read_byte   1
+read-file-as-string read_file_as_string 1
+open        open        2
+close       close       1
+stinput     stinput     0
+stoutput    stoutput    0
+trap-error  trap_error  2
+simple-error simple_error 1
+error-to-string error_to_string 1
+eval-kl     eval_kl     1
+get-time    get_time    1
+intern      intern      1
+set         set         2
+value       value       1
+@p          atp         2
+fst         fst         1
+snd         snd         1
+gensym      gensym      1
+newvar      newvar      0
+element?    element_p   2
+fail        fail        1
+shen.fail!  shen_fail_bang 1

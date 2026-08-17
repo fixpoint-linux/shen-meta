@@ -1,4 +1,4 @@
-.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims qbe-tool qberun qbe-smoke
+.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims qbe-tool qberun qbe-smoke qbe-gen qbe-gen-prims qbe-test
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -164,18 +164,49 @@ qbe-tool:
 # targets).  cosmocc may be on PATH or under ~/.local/cosmo or /usr/local/cosmo
 # (sandbox vs host layouts differ); resolve its dir dynamically so the
 # x86_64-/aarch64-linux-cosmo-as companions are found wherever it lives.
-COSMOCC  := $(shell command -v cosmocc || echo /home/arch/.local/cosmo/bin/cosmocc)
-COSMOAS  := $(dir $(COSMOCC))
+COSMOCC  := $(shell command -v cosmocc || echo /usr/local/cosmo/bin/cosmocc)
+# The cosmo cross-assemblers (x86_64-/aarch64-linux-cosmo-as) live in the
+# toolchain's own bin dir (/usr/local/cosmo/bin).  cosmocc itself may be a
+# thin wrapper in /usr/local/bin (or on PATH), so resolve the assembler dir
+# from the real toolchain location, falling back to cosmocc's dir.
+COSMOAS  := $(shell if [ -x /usr/local/cosmo/bin/x86_64-linux-cosmo-as ]; then echo /usr/local/cosmo/bin/; else echo $(dir $(COSMOCC)); fi)
 
-# qberun: build the pointer-ABI smoke binary.  Hand-written vm/add12.qbe is
-# compiled by QBE to BOTH architectures (amd64_sysv, arm64), assembled with
-# the cosmo assemblers, then linked into a fat APE by cosmocc.  cosmocc needs
-# the .aarch64/<obj> companion next to the x86_64 <obj>, so both arch objects
-# live under a staging dir with a .aarch64/ subdir.  vm/zincvm.c is compiled
-# with -DZINCTEST to suppress its own `main`.  Only the native x86_64 ELF
-# (.com.dbg) is copied out as the final binary.
-qberun: qbe-tool vm/qberun.c vm/qbe_shims.c vm/qbe_shims.h vm/zincvm.c vm/gc.c vm/add12.qbe
+# qbe-gen-prims: generate the C prim_<F> shims (vm/qbe_prims_gen.{h,c}) and the
+# Shen prim-name table (shen/qbe-prim-info.shen) from the single source of
+# truth vm/qbe-prims.list.  Keeps the lowerer and the C shims in agreement.
+qbe-gen-prims: tools/qbe-gen-prims.awk vm/qbe-prims.list
+	awk -f tools/qbe-gen-prims.awk vm/qbe-prims.list
+
+# qbe-gen: run the Slice-3 lowerer over the reduced bundle's global-table,
+# emitting QBE IR for the Test 1-4 closures into globals.qbe.
+qbe-gen: gen-prims qbe-gen-prims shen/serialize-qbe.shen shen/qbe.shen shen/qbe-subset.shen shen/os-helpers.shen
+	$(SHEN) script shen/serialize-qbe.shen
+	@echo "QBE IR written to globals.qbe ($$(wc -c < globals.qbe) bytes)"
+
+# qberun: assemble+link the generated globals.qbe (4 closures) against the C
+# runtime (qberun.c + qbe_shims.c + qbe_prims_gen.c + zincvm.c + gc.c) into a
+# fat APE, then the native x86_64 ELF is copied out.  Runs the 4 differential
+# tests (see vm/qberun.c).
+qberun: qbe-tool qbe-gen vm/qberun.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c globals.qbe
 	@T=$$(mktemp -d /tmp/qberun.build.XXXXXX) && \
+	mkdir -p $$T/.aarch64 && \
+	vendor/qbe/obj/qbe -t amd64_sysv -o $$T/globals.s globals.qbe && \
+	vendor/qbe/obj/qbe -t arm64     -o $$T/.aarch64/globals.s globals.qbe && \
+	$(COSMOAS)/x86_64-linux-cosmo-as  -o $$T/globals.o $$T/globals.s && \
+	$(COSMOAS)/aarch64-linux-cosmo-as -o $$T/.aarch64/globals.o $$T/.aarch64/globals.s && \
+	$(COSMOCC) -Wall -Wextra -O2 -I vm -DZINCTEST \
+		-o $$T/out.ape \
+		vm/qberun.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c $$T/globals.o && \
+	cp $$T/out.ape.com.dbg qberun && chmod 755 qberun; \
+	st=$$?; rm -rf $$T; exit $$st
+
+# qbe-test: build + run the 4 differential tests (Tests 1-4 vs zincvm).
+qbe-test: qberun
+	./qberun
+
+# qbe-smoke: Slice-2 (+ 1 2) -> 3 gate (hand-written vm/add12.qbe).
+qbe-smoke: qbe-tool qbe-gen-prims vm/qbesmoke.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c vm/add12.qbe
+	@T=$$(mktemp -d /tmp/qbesmoke.build.XXXXXX) && \
 	mkdir -p $$T/.aarch64 && \
 	vendor/qbe/obj/qbe -t amd64_sysv -o $$T/add12.s vm/add12.qbe && \
 	vendor/qbe/obj/qbe -t arm64     -o $$T/.aarch64/add12.s vm/add12.qbe && \
@@ -183,14 +214,11 @@ qberun: qbe-tool vm/qberun.c vm/qbe_shims.c vm/qbe_shims.h vm/zincvm.c vm/gc.c v
 	$(COSMOAS)/aarch64-linux-cosmo-as -o $$T/.aarch64/add12.o $$T/.aarch64/add12.s && \
 	$(COSMOCC) -Wall -Wextra -O2 -I vm -DZINCTEST \
 		-o $$T/out.ape \
-		vm/qberun.c vm/qbe_shims.c vm/zincvm.c vm/gc.c $$T/add12.o && \
-	cp $$T/out.ape.com.dbg qberun && chmod 755 qberun; \
+		vm/qbesmoke.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c $$T/add12.o && \
+	cp $$T/out.ape.com.dbg qbesmoke && chmod 755 qbesmoke; \
 	st=$$?; rm -rf $$T; exit $$st
-
-# qbe-smoke: build + run the (+ 1 2) -> 3 gate.
-qbe-smoke: qberun
 	@echo "=== QBE slice 2 smoke: (+ 1 2) -> 3 ==="
-	./qberun
+	./qbesmoke
 	@echo "OK: (+ 1 2) => 3"
 
 setup:
