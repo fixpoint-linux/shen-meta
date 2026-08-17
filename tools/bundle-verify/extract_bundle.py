@@ -104,6 +104,7 @@ ALLOWED_PRIMS = {
     "set", "value", "eval-kl", "get-time", "error?", "stream?",
     "@p", "fst", "snd", "gensym", "variable?", "newvar",
     "c-strlen", "char-code", "substring", "element?",
+    "append", "empty?", "reverse", "assoc", "length", "nth",
     "fail",
 }
 
