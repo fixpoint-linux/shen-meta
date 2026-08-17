@@ -1,4 +1,4 @@
-.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims
+.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims qbe-tool
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -153,6 +153,12 @@ bundle-verify:
 	else \
 		$(MAKE) -C tools/bundle-verify run; \
 	fi
+
+# Build the vendored QBE backend (pinned in vendor/qbe). QBE has its own
+# Makefile/CFLAGS (not -Werror-clean) — do not use the project CFLAGS here.
+# Produces vendor/qbe/obj/qbe, the .qbe -> asm assembler. Used by qberun.
+qbe-tool:
+	$(MAKE) -C vendor/qbe
 
 setup:
 	@if [ ! -d ../shen-scheme ]; then \
