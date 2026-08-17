@@ -1,4 +1,4 @@
-.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims qbe-tool
+.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims qbe-tool qberun qbe-smoke
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -159,6 +159,39 @@ bundle-verify:
 # Produces vendor/qbe/obj/qbe, the .qbe -> asm assembler. Used by qberun.
 qbe-tool:
 	$(MAKE) -C vendor/qbe
+
+# Cosmo cross-assemblers + linker driver (used by the qberun / qbe-smoke
+# targets).  cosmocc may be on PATH or under ~/.local/cosmo or /usr/local/cosmo
+# (sandbox vs host layouts differ); resolve its dir dynamically so the
+# x86_64-/aarch64-linux-cosmo-as companions are found wherever it lives.
+COSMOCC  := $(shell command -v cosmocc || echo /home/arch/.local/cosmo/bin/cosmocc)
+COSMOAS  := $(dir $(COSMOCC))
+
+# qberun: build the pointer-ABI smoke binary.  Hand-written vm/add12.qbe is
+# compiled by QBE to BOTH architectures (amd64_sysv, arm64), assembled with
+# the cosmo assemblers, then linked into a fat APE by cosmocc.  cosmocc needs
+# the .aarch64/<obj> companion next to the x86_64 <obj>, so both arch objects
+# live under a staging dir with a .aarch64/ subdir.  vm/zincvm.c is compiled
+# with -DZINCTEST to suppress its own `main`.  Only the native x86_64 ELF
+# (.com.dbg) is copied out as the final binary.
+qberun: qbe-tool vm/qberun.c vm/qbe_shims.c vm/qbe_shims.h vm/zincvm.c vm/gc.c vm/add12.qbe
+	@T=$$(mktemp -d /tmp/qberun.build.XXXXXX) && \
+	mkdir -p $$T/.aarch64 && \
+	vendor/qbe/obj/qbe -t amd64_sysv -o $$T/add12.s vm/add12.qbe && \
+	vendor/qbe/obj/qbe -t arm64     -o $$T/.aarch64/add12.s vm/add12.qbe && \
+	$(COSMOAS)/x86_64-linux-cosmo-as  -o $$T/add12.o $$T/add12.s && \
+	$(COSMOAS)/aarch64-linux-cosmo-as -o $$T/.aarch64/add12.o $$T/.aarch64/add12.s && \
+	$(COSMOCC) -Wall -Wextra -O2 -I vm -DZINCTEST \
+		-o $$T/out.ape \
+		vm/qberun.c vm/qbe_shims.c vm/zincvm.c vm/gc.c $$T/add12.o && \
+	cp $$T/out.ape.com.dbg qberun && chmod 755 qberun; \
+	st=$$?; rm -rf $$T; exit $$st
+
+# qbe-smoke: build + run the (+ 1 2) -> 3 gate.
+qbe-smoke: qberun
+	@echo "=== QBE slice 2 smoke: (+ 1 2) -> 3 ==="
+	./qberun
+	@echo "OK: (+ 1 2) => 3"
 
 setup:
 	@if [ ! -d ../shen-scheme ]; then \

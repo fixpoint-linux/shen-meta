@@ -355,7 +355,7 @@ static void va_init(ValueArray *a) {
     a->data = GC_VALUE_ARRAY(STACK_INIT_CAP);
     a->len = 0; a->cap = STACK_INIT_CAP;
 }
-static void va_push(ValueArray *a, Value v) {
+void va_push(ValueArray *a, Value v) {
     if (a->len >= a->cap) {
         int new_cap = a->cap * 2;
         /* Root v across GC_VALUE_ARRAY — v may carry interior pointers
@@ -371,7 +371,7 @@ static void va_push(ValueArray *a, Value v) {
     if (gc_in_oldgen(a->data) && value_references_nursery(&v))
         gc_dirty_vectors_add(a->data);
 }
-static Value va_pop(ValueArray *a) {
+Value va_pop(ValueArray *a) {
     if (a->len <= 0) { fprintf(stderr, "fatal: pop from empty stack\n"); exit(1); }
     return a->data[--a->len];
 }
@@ -927,7 +927,7 @@ static int exec_primitive_valid(const char *name) {
  * pointer will be dangling under precise-only roots (no conservative stack
  * scan to accidentally keep it alive).  Search for gc_root_push_value in
  * this function to confirm coverage of all such popped-Value→alloc pairs. */
-static int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
+int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
     if (!name[0]) goto unknown;
     switch (name[0]) {
 

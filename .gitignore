@@ -3,9 +3,12 @@
 zincvm
 zincdec
 zinctest
+qberun
 *.csexp
 /tmp/
 core.*
+.ape-*
+a.out
 zincvm-debug
 zinctest-debug
 zinctest-asan
