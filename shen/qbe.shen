@@ -64,6 +64,18 @@
 (define qbe-env-ref { number --> (list A) --> A }
   N Env -> (qbe-nth0 N Env))
 
+\* access N: resolve the enclosing env's slot N (de Bruijn, 0 = newest), OR —
+   if N is past the env's end — emit a fresh number-0 slot and return its temp.
+   This mirrors lookup_env (zincvm.c:2150), which returns a VAL_NUMBER 0 sentinel
+   for out-of-bounds access instead of erroring; many bundled closures rely on
+   that sentinel (pattern-matching / cond code reads past its bindings). *\
+(define qbe-env-access { number --> (list string) --> string }
+  N Env -> (if (>= N (length Env))
+               (let Z (qbe-slot)
+                 (do (qbe-emit (qbe-call "val_number_into" [(cn "l " Z) "l 0"]))
+                     Z))
+               (qbe-env-ref N Env)))
+
 \* -------------------------- name mangling -------------------------- *\
 
 \* Map a symbol's printed name to a valid C identifier (shared char mapping
@@ -369,7 +381,7 @@
   _ grab [Stk Env Marks] _ -> [Stk Env Marks]
   _ letz [Stk Env Marks] _ -> [(tl Stk) [(hd Stk) | Env] Marks]
   _ endlet [Stk Env Marks] _ -> [Stk (tl Env) Marks]
-  _ [access N] [Stk Env Marks] _ -> [[(qbe-env-ref N Env) | Stk] Env Marks]
+  _ [access N] [Stk Env Marks] _ -> [[(qbe-env-access N Env) | Stk] Env Marks]
   _ [number N] [Stk Env Marks] _ ->
     (let Out (qbe-slot)
       (do (qbe-emit (qbe-call "val_number_into" [(cn "l " Out) (cn "l " (str N))]))
@@ -693,11 +705,7 @@
 \* cap_j for the shim call: the enclosing closure's access j, or a fresh 0 slot
    if j is past the enclosing env (mirrors lookup_env's OOB number-0 sentinel). *\
 (define qbe-trap-cap { number --> (list string) --> string }
-  J Env -> (if (>= J (length Env))
-               (let Z (qbe-slot)
-                 (do (qbe-emit (qbe-call "val_number_into" [(cn "l " Z) "l 0"]))
-                     Z))
-               (qbe-env-ref J Env)))
+  J Env -> (qbe-env-access J Env))
 
 (define qbe-trap-caps { number --> (list string) --> (list string) }
   N Env -> (qbe-trap-caps-h N 0 Env))
