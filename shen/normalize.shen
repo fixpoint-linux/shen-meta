@@ -70,49 +70,58 @@
   X  -> true where (variable? X)
   _  -> false)
 
-(define normalize-term { klambda --> klambda } Exp -> (normalize Exp (function id)))
+\* normalize-term seeds the normalization.  normalize/normalize-name/
+   normalize-names are now DIRECT-STYLE (no K : (klambda --> klambda)
+   continuation threaded through /. lambdas) — each sub-normalization result
+   is bound to a name and threaded directly.  This is SEMANTICALLY-EQUIVALENT
+   to the prior CPS form (verified by the QBE differential + self-hosting):
+   both compile to correct, equal code.  Note it is NOT byte-identical for
+   nested lets — CPS hoisted inner lets to left-nested form, the direct style
+   preserves right-nested source order; both evaluate identically.  The
+   benefit: no closure-allocating continuations, so the whole front-end is
+   first-order and the QBE lowerer can compile it statically. *\
+(define normalize-term { klambda --> klambda } Exp -> (normalize Exp))
 
 (define flatten-%%app { klambda --> (list klambda) --> klambda }
   T Ts -> (if (and (cons? T) (= (hd T) %%))
               [%% | (append (tl T) Ts)]
               [T | Ts]))
 
-(define normalize { klambda --> (klambda --> klambda) --> klambda }
+(define normalize { klambda --> klambda }
   \* Shen 41.2: [[fn %%] X] -> bare %% call (no args) *\
-  [[fn %%] X] K          -> (K [%% X]) where (symbol? X)
+  [[fn %%] X]          -> [%% X] where (symbol? X)
   \* Shen 41.2: [[[fn %%] X] | Args] -> %% call with args. 
      Must be BEFORE [F | E] to intercept the full expression before it's split *\
-  [[[fn %%] X] | Args] K -> (normalize-names Args (/. A (K [%% X | A]))) where (symbol? X)
+  [[[fn %%] X] | Args] -> [%% X | (normalize-names Args)] where (symbol? X)
   \* Shen 41.2: [fn X] -> function reference *\
-  [fn X] K               -> (K [function X]) where (symbol? X)
-  [lambda Param Body] K -> (K [lambda Param (normalize-term Body)])
-  [let V X Y] K         -> (normalize X (/. Aexp
-                             [let V Aexp (normalize Y K)]))
-  [if X Y Z] K          -> (normalize-name X (/. T
-                             (K [if T (normalize-term Y) (normalize-term Z)])))
-  [set S E] K           -> (normalize-name E (/. T
-                             [let (newvar) [%% set S T] (K T)]))
+  [fn X]               -> [function X] where (symbol? X)
+  [lambda Param Body]  -> [lambda Param (normalize-term Body)]
+  [let V X Y]          -> [let V (normalize X) (normalize Y)]
+  [if X Y Z]           -> [if (normalize-name X) (normalize-term Y) (normalize-term Z)]
+  [set S E]            -> (let T (normalize-name E)
+                             [let (newvar) [%% set S T] T])
   \* Bare primitive (Shen 41.2 ps strips %% from unary primitives) *\
-  [F | E] K -> (normalize-names E (/. Ts (K [%% F | Ts]))) where (primitive? F)
-  [F | E] K             -> (normalize-name F (/. T
-                             (normalize-names E (/. Ts
-                               (K (flatten-%%app T Ts))))))
-  X K                   -> (K X) where (atomic? X))
+  [F | E]              -> [%% F | (normalize-names E)] where (primitive? F)
+  [F | E]              -> (let T (normalize-name F)
+                             (let Ts (normalize-names E)
+                               (flatten-%%app T Ts)))
+  X                    -> X where (atomic? X))
 
-(define normalize-name { klambda --> (klambda --> klambda) --> klambda }
-  E K -> (normalize E (/. Aexp
-           (if (atomic? Aexp) (K Aexp)
+(define normalize-name { klambda --> klambda }
+  E -> (let Aexp (normalize E)
+         (if (atomic? Aexp)
+             Aexp
              (if (and (cons? Aexp) (symbol? (hd Aexp)))
-                 (K Aexp)
+                 Aexp
                  (let T (newvar)
-                   [let T Aexp (K T)]))))))
+                   [let T Aexp T])))))
 
-(define normalize-names { klambda --> (klambda --> klambda) --> klambda }
-  Exps K -> (if (empty? Exps)
-              (K [])
-              (normalize-name (hd Exps) (/. T
-                (normalize-names (tl Exps) (/. Ts
-                  (K [T | Ts])))))))
+(define normalize-names { klambda --> (list klambda) }
+  Exps -> (if (empty? Exps)
+              []
+              (let T (normalize-name (hd Exps))
+                (let Ts (normalize-names (tl Exps))
+                  [T | Ts]))))
 
 (define map-debruijn { (list symbol) --> (list klambda) --> (list klambda) }
   Scope []      -> []

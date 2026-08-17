@@ -117,6 +117,9 @@ map-kmacros
 map-zinc-c
 my-length
 nat->csexp
+normalize
+normalize-name
+normalize-names
 normalize-term
 parse-atom
 parse-clauses
@@ -188,6 +191,7 @@ shen.csexp-atom
 shen.csexp-body
 shen.csexp-list
 shen.csexp-str
+shen.debruijn
 shen.dedupe-globals
 shen.dedupe-globals-h
 shen.defun->lambda
@@ -214,6 +218,7 @@ shen.interp-jmp
 shen.interp-load
 shen.interp-load-raw
 shen.intersperse
+shen.kl->zinc
 shen.kl-drop
 shen.kl-take
 shen.kmacros
@@ -226,6 +231,9 @@ shen.map-zinc-c
 shen.my-length
 shen.nat->csexp
 shen.newvar
+shen.normalize
+shen.normalize-name
+shen.normalize-names
 shen.normalize-term
 shen.open
 shen.parse-atom
@@ -479,7 +487,9 @@ shen.zinc->native
 shen.zinc-arity
 shen.zinc-c
 shen.zinc-c-args
+shen.zinc-c-tail
 shen.zinc-t
+shen.zinc-t-tail
 skip-comment
 skip-ws
 split-at-top-arrow

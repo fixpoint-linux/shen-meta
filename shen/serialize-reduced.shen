@@ -146,6 +146,18 @@
         (set global-table (cons [(intern (cn "shen." (str Name))) Closure]
                                 (value global-table))))
     (shen.add-prefix-aliases Rest)))
+
+\* dedupe-globals keeps the FIRST (front = newest = shen-load'd) occurrence of
+   each name.  This MUST run before add-prefix-aliases: otherwise the aliases
+   step creates a shen.Name alias for BOTH the static (front, our shen->kl
+   compiler) AND the host-compiled (back, host `load` at line 7) bare copies of
+   normalize/debruijn/zinc-c-tail/zinc-t-tail/kl->zinc, and — because aliases
+   are PREPENDED while the walk proceeds front->back — the host copy's alias
+   lands ON TOP.  The final dedupe then keeps that top (host) shen.X, so the
+   bundle resolves shen.debruijn etc. to the higher-order host closure instead
+   of our static full-arity one.  Dedupe first so each bare name survives
+   exactly once (the static copy), and its shen. alias maps to it. *\
+(set global-table (dedupe-globals (value global-table)))
 (shen.add-prefix-aliases (value global-table))
 
 (define entry-str

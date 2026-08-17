@@ -1,3 +1,1 @@
 caller,call_idx,callee,expected,supplied
-shen.debruijn.14.15.16.17,65,idx,2,1
-shen.kl->zinc,14,debruijn,2,1
