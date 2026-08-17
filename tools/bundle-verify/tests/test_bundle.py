@@ -172,8 +172,10 @@ class TestWireFormat(unittest.TestCase):
             self.assertEqual(n, 1)
 
             closures, _ = read_csv(Path(d) / "closure.csv")
-            # mkfn has arity 1 (0 grabs + 1), sub-closure has arity 2 (1 grab + 1)
+            # mkfn is the ONLY real closure; the nested cur is a cur_body, not a closure.
             self.assertIn(("mkfn", "1"), closures)
+            self.assertEqual(len(closures), 1,
+                             "closure() must contain only real top-level closures")
 
             cur_lits, _ = read_csv(Path(d) / "cur_lit.csv")
             self.assertEqual(len(cur_lits), 1)
@@ -181,8 +183,13 @@ class TestWireFormat(unittest.TestCase):
             self.assertEqual(cur_lits[0][1], "0")  # idx 0
             sub_id = cur_lits[0][2]
 
-            # Sub-closure should have its own instr + closure facts
-            self.assertIn((sub_id, "2"), closures)
+            # Nested cur body must NOT be emitted as a phantom closure() row.
+            self.assertNotIn((sub_id, "2"), closures,
+                             "nested cur body must not appear in closure()")
+
+            # Nested cur body IS emitted as a cur_body row with its arity.
+            cur_bodies, _ = read_csv(Path(d) / "cur_body.csv")
+            self.assertIn((sub_id, "2"), cur_bodies)  # sub: 1 grab → arity 2
 
             instrs, _ = read_csv(Path(d) / "instr.csv")
             # mkfn: c at 0, v at 1
@@ -379,6 +386,11 @@ class MiniSolver:
         for name, idx, sub_id in self.all_of("cur_lit"):
             cur_lits[(name, int(idx))] = sub_id
 
+        # Nested cur bodies live in cur_body (Part-1 fix), not closure.
+        cur_bodies = {}  # sub_id -> arity
+        for sub_id, arity in self.all_of("cur_body"):
+            cur_bodies[sub_id] = int(arity)
+
         # Read supplied_args from extractor (stack simulation output)
         supplied = {}  # (name, cs_idx) -> n
         for name, cs_idx, n in self.all_of("supplied_args"):
@@ -397,8 +409,8 @@ class MiniSolver:
                         result.append((name, str(cs_idx), target, str(expected), str(n_supplied)))
             elif callee_op == 'c':
                 sub_id = cur_lits.get((name, callee_idx))
-                if sub_id and sub_id in closures:
-                    expected = closures[sub_id]
+                if sub_id and sub_id in cur_bodies:
+                    expected = cur_bodies[sub_id]
                     if expected != n_supplied:
                         result.append((name, str(cs_idx), sub_id, str(expected), str(n_supplied)))
             # prim calls: trusted, no arity check here
@@ -628,17 +640,22 @@ class TestDatalogRules(unittest.TestCase):
         self.assertEqual(mismatches, [])
 
     def test_arity_cur_lit_callee(self):
-        """Callee is an inline cur (lambda literal)."""
+        """Callee is an inline cur (lambda literal) — arity checked via cur_body.
+
+        Nested cur bodies are emitted as `cur_body` rows (Part-1 fix).  The
+        Datalog's expected_arity cur-lit branch resolves via `cur_body(sub_id,
+        arity)`, so a cur-lit callee IS arity-checked.
+        """
         solver = self._parse_and_solve(
             "(([4:s]test (c(mn[1:n]0c(rra[1:n]0a[1:n]1P[1:s]+v)pv))))"
         )
         # pushmark at 0, number 0 at 1, cur at 2 (sub: r r a a P v, 2 grabs → arity 3), apply at 3
         # Stack sim: m[M], n0[M,V], c[M,V,V], p: V's above M=2, excl callee=1 → supplied=1
-        # Expected: cur sub-closure has arity 3 → mismatch
+        # cur_body arity = 3 (leading grabs 2 + 1) → expected 3 vs supplied 1 → mismatch.
         mismatches = solver.arity_mismatch()
         self.assertEqual(len(mismatches), 1)
-        self.assertEqual(mismatches[0][3], "3")  # expected 3
-        self.assertEqual(mismatches[0][4], "1")  # supplied 1
+        self.assertEqual(mismatches[0][4], "1")   # supplied
+        self.assertEqual(mismatches[0][3], "3")   # expected
 
     # ── unresolved_call ─────────────────────────────────────────────
 
@@ -912,7 +929,26 @@ class TestRealBundle(unittest.TestCase):
 
             # Verify key facts exist
             closures, _ = read_csv(Path(d) / "closure.csv")
-            self.assertGreater(len(closures), n)  # includes sub-closures
+            # closure() now holds ONLY the n top-level closures (no phantom
+            # nested-cur sub-ids).  Nested cur bodies live in cur_body.csv.
+            self.assertEqual(len(closures), n,
+                             "closure() must contain exactly the top-level closures")
+
+            # No closure row may be a fabricated nested-cur sub-id (parent.N.M...).
+            import re
+            for cname, arity in closures:
+                self.assertNotRegex(
+                    cname, r"\.\d+$",
+                    f"closure() contains phantom nested-cur name '{cname}'")
+
+            # Every nested cur body from cur_lit must be present in cur_body.
+            cur_lits, _ = read_csv(Path(d) / "cur_lit.csv")
+            cur_bodies, _ = read_csv(Path(d) / "cur_body.csv")
+            cur_body_names = {r[0] for r in cur_bodies}
+            self.assertGreater(len(cur_lits), 0, "bundle should have nested cur bodies")
+            for _n, _idx, sub in cur_lits:
+                self.assertIn(sub, cur_body_names,
+                              f"cur_lit sub-id '{sub}' missing from cur_body")
 
             instrs, _ = read_csv(Path(d) / "instr.csv")
             self.assertGreater(len(instrs), 1000)

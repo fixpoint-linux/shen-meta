@@ -165,10 +165,10 @@ unresolved_call(name, cs_idx) :-
 expected_arity(name, cs_idx, target, arity) :-
     callee_is_global(name, cs_idx, target),
     closure(target, arity).
-// cur_lit → sub-closure arity
+// cur_lit → cur_body arity (nested cur bodies live in cur_body, not closure)
 expected_arity(name, cs_idx, sub_id, arity) :-
     callee_is_cur(name, cs_idx, sub_id),
-    closure(sub_id, arity).
+    cur_body(sub_id, arity).
 
 .decl arity_mismatch(caller:symbol, call_idx:number, callee:symbol, expected:number, supplied:number)
 arity_mismatch(caller, call_idx, callee, expected, supplied) :-
@@ -177,6 +177,85 @@ arity_mismatch(caller, call_idx, callee, expected, supplied) :-
     expected != supplied.
 
 .output arity_mismatch(IO=file, delimiter=",", headers=true, filename="out/arity_mismatch.csv")
+
+// ── Check 6: FIRST-ORDER PARTITION ─────────────────────────────────
+//
+// A closure is FIRST-ORDER if it has NO unresolved_call (no `[access N]`
+// higher-order callee site).  The partition covers every CODE UNIT:
+// a top-level closure (closure relation, name-only after Part 1) OR a
+// nested `cur` body (cur_body relation, Part 1).  Nested cur bodies must
+// be first-order too, because lowering a top-level closure to native QBE
+// also lowers (inlines) its nested `cur` literals into the same frame.
+//
+// `first_order` is the code-unit-level partition; `top_first_order` is the
+// TRANSITIVE roll-up over top-level closures (a top-level closure is only
+// first-order if IT and all its transitively-nested cur bodies are).
+
+// Nested cur-literal bodies (Part 1: emitted instead of a phantom closure())
+.decl cur_body(name:symbol, arity:number)
+.input cur_body(IO=file, delimiter=",", headers=true, filename="facts/cur_body.csv")
+
+// Union of top-level closures and nested cur bodies.
+.decl code_unit(id:symbol, arity:number)
+code_unit(id, arity) :- closure(id, arity).
+code_unit(id, arity) :- cur_body(id, arity).
+
+// First-order code unit: no higher-order (access-N) callee site.
+.decl first_order(id:symbol)
+first_order(id) :-
+    code_unit(id, _),
+    !unresolved_call(id, _).
+
+// Top-level closure with at least one nested cur body that is not first-order.
+.decl bad_sub(id:symbol)
+bad_sub(id) :-
+    code_unit(id, _),
+    cur_lit(id, _, sub),
+    !first_order(sub).
+// Transitive roll-up: a code unit whose nested cur body is itself bad.
+// Rolls up over code_unit (closure ∪ cur_body) so the recursion propagates
+// through cur_body ids at ANY nesting depth — over closure alone the
+// recursive case is dead (sub from cur_lit is always a cur_body id).
+bad_sub(id) :-
+    code_unit(id, _),
+    cur_lit(id, _, sub),
+    bad_sub(sub).
+
+// A top-level closure is in the QBE first-order partition iff it is
+// first-order AND none of its transitively-nested cur bodies is bad.
+.decl top_first_order(name:symbol)
+top_first_order(name) :-
+    closure(name, _),
+    first_order(name),
+    !bad_sub(name).
+
+// The QBE first-order partition: top-level closures that are first-order AND
+// have no transitively-bad nested cur body.  THIS is what shen/qbe.shen
+// consumes as its QBE-compilable set (NOT bare `first_order`, which lacks the
+// nested-body roll-up and would wrongly admit e.g. normalize-name).
+.decl first_order_top(name:symbol)
+first_order_top(name) :-
+    top_first_order(name).
+
+.output first_order_top(IO=file, delimiter=",", headers=true, filename="out/first_order.csv")
+.output top_first_order(IO=file, delimiter=",", headers=true, filename="out/top_first_order.csv")
+
+// ── Check 6a: FIRST-ORDER GATE over the target subset ──────────────
+//
+// The QBE target subset is the reduced self-contained bundle (the closures
+// compiled from the 12 reduced-bundle source files in serialize-reduced.shen,
+// plus the safe-wrapper aliases).  Every top-level closure in the bundle
+// must be top_first_order for the QBE lowerer to translate it to native
+// code; anything NOT is a higher-order closure that must route through the
+// dynamic fallback.  This gate lists exactly those misses so the partition
+// is auditable and the QBE lowerer's allowlist can be cross-checked.
+
+.decl not_first_order_in_target(name:symbol)
+not_first_order_in_target(name) :-
+    closure(name, _),
+    !top_first_order(name).
+
+.output not_first_order_in_target(IO=file, delimiter=",", headers=true, filename="out/not_first_order_in_target.csv")
 
 // ── Check A2: source-level safe-subset checks ─────────────────────
 //

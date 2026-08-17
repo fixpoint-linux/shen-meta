@@ -38,6 +38,9 @@ snapshot:
 	cp out/curried_call.csv expected/curried_call.csv
 	cp out/arity_mismatch.csv expected/arity_mismatch.csv
 	cp out/unresolved_call.csv expected/unresolved_call.csv
+	cp out/first_order.csv expected/first_order.csv
+	cp out/top_first_order.csv expected/top_first_order.csv
+	cp out/not_first_order_in_target.csv expected/not_first_order_in_target.csv
 	cp out/source_file.csv expected/source_file.csv
 	cp out/unsafe_construct.csv expected/unsafe_construct.csv
 	cp out/nonlinear_pattern.csv expected/nonlinear_pattern.csv

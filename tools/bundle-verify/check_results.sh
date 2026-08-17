@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DL="$HERE/bundle_safety.dl"
 BUNDLE="$HERE/../../globals.csexp"
 EXPECTED="$HERE/expected"
-RELATIONS="bad_opcode dangling_global unknown_prim curried_call arity_mismatch unresolved_call source_file unsafe_construct nonlinear_pattern tuple_pattern"
+RELATIONS="bad_opcode dangling_global unknown_prim curried_call arity_mismatch unresolved_call first_order top_first_order not_first_order_in_target source_file unsafe_construct nonlinear_pattern tuple_pattern"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

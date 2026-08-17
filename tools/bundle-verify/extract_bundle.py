@@ -128,6 +128,7 @@ CSV_SCHEMAS = {
     "prim_ref":      ["name", "idx", "prim"],
     "call_site":     ["name", "idx", "kind"],
     "cur_lit":       ["name", "idx", "sub_code_id"],
+    "cur_body":      ["name", "arity"],
     "pushmark":      ["name", "idx"],
     "supplied_args": ["name", "cs_idx", "n"],
     # Static tables (emitted once, not per-closure)
@@ -353,8 +354,8 @@ class BundleParser:
         for prim, arity in sorted(PRIM_ARITY.items()):
             self.writer.write("prim_arity", [prim, arity])
 
-    def _parse_body(self, name):
-        """Parse a flat instruction stream for closure `name`.
+    def _parse_body(self, name, emit_closure=True):
+        """Parse a flat instruction stream for code-unit `name`.
 
         Reads instructions until ')' or end of data.
         Each instruction is either:
@@ -364,6 +365,17 @@ class BundleParser:
 
         Collects instructions for a second-pass forward-dataflow stack
         simulation that emits supplied_args facts.
+
+        `emit_closure` distinguishes the two kinds of code unit:
+          - True  → `name` is a TOP-LEVEL bundle closure → emit `closure(name, arity)`.
+          - False → `name` is a NESTED cur body (a fabricated `parent.N...` sub-id)
+                    → emit `cur_body(name, arity)` instead.  Nested cur bodies are
+                    NOT real bundle closures, so emitting a `closure()` row for
+                    them would pollute dangling_global / arity_mismatch /
+                    unresolved_call with phantom names that never match a real
+                    closure in globals.csexp.  `cur_body` keeps their arity
+                    available for the first-order partition (Part 2) while the
+                    enclosing top-level `closure()` stays name-only/real.
         """
         idx = 0
         grab_count = 0
@@ -410,8 +422,10 @@ class BundleParser:
                 self.sub_id_counter += 1
                 self.writer.write("cur_lit", [name, idx, sub_id])
 
-                # Parse the sub-closure body (recursive)
-                self._parse_body(sub_id)
+                # Parse the sub-closure body (recursive).  Nested cur bodies are
+                # NOT real bundle closures → emit_closure=False so the recursive
+                # call writes a `cur_body` row, not a phantom `closure()` row.
+                self._parse_body(sub_id, emit_closure=False)
 
                 # Expect ')' to close sub-closure body
                 self.skip_ws()
@@ -449,9 +463,16 @@ class BundleParser:
             instructions.append((idx, c, op_kind, op_value))
             idx += 1
 
-        # Emit closure arity: leading_grab_count + 1
+        # Emit arity: leading_grab_count + 1.
+        # Top-level closures get a `closure` row; nested cur bodies get a
+        # `cur_body` row (they are NOT real bundle closures — emitting a
+        # `closure()` row would fabricate phantom names like `parent.N.M...`
+        # that have 0 matches in globals.csexp and pollute the Datalog facts).
         arity = grab_count + 1
-        self.writer.write("closure", [name, arity])
+        if emit_closure:
+            self.writer.write("closure", [name, arity])
+        else:
+            self.writer.write("cur_body", [name, arity])
 
         # Run forward-dataflow stack simulation → supplied_args
         self._simulate_stack(name, instructions)
@@ -634,9 +655,12 @@ def self_test(out_dir):
     # A simple bundle with two closures
     # Closure 'id': (c(r a[1:n]0 v)) — 1 leading grab → arity 2
     # Closure 'apply-id': (c(m a[1:n]0 g[2:s]id p v)) — 0 grabs → arity 1
+    # Closure 'outer': (c(r c(a[1:n]0 v) v)) — 1 grab → arity 2, plus a nested
+    #   cur body whose sub-id is the fabricated "outer.0" (NOT a real closure).
     synthetic = (
         "(([2:s]id (c(ra[1:n]0v)))"
-        "([8:s]apply-id (c(ma[1:n]0g[2:s]idpv))))"
+        "([8:s]apply-id (c(ma[1:n]0g[2:s]idpv)))"
+        "([5:s]outer (c(rc(a[1:n]0v)v))))"
     )
 
     writer = FactWriter(out_dir)
@@ -657,6 +681,33 @@ def self_test(out_dir):
 
     assert ("id", "2") in closure_rows, f"id missing from closures: {closure_rows}"
     assert ("apply-id", "1") in closure_rows, f"apply-id missing from closures: {closure_rows}"
+    assert ("outer", "2") in closure_rows, f"outer missing from closures: {closure_rows}"
+    # Nested cur bodies must NOT be emitted as phantom closure() rows.
+    assert len(closure_rows) == 3, f"expected only 3 real closures, got: {closure_rows}"
+    assert ("outer.0", "1") not in closure_rows, \
+        f"nested cur body 'outer.0' must NOT appear as a closure row: {closure_rows}"
+
+    # Nested cur bodies ARE emitted as cur_body rows with their arity.
+    cur_body_rows = set()
+    with open(Path(out_dir) / "cur_body.csv") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        assert header == ["name", "arity"], f"Bad cur_body header: {header}"
+        for row in reader:
+            cur_body_rows.add(tuple(row))
+    assert ("outer.0", "1") in cur_body_rows, \
+        f"nested cur body 'outer.0' missing from cur_body: {cur_body_rows}"
+
+    # cur_lit links the enclosing top-level closure to its nested cur body.
+    cur_lit_rows = set()
+    with open(Path(out_dir) / "cur_lit.csv") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        assert header == ["name", "idx", "sub_code_id"], f"Bad cur_lit header: {header}"
+        for row in reader:
+            cur_lit_rows.add(tuple(row))
+    assert ("outer", "1", "outer.0") in cur_lit_rows, \
+        f"cur_lit (outer,1,outer.0) missing: {cur_lit_rows}"
 
     # Check instr facts
     instr_rows = set()
