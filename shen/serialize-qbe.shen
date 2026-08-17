@@ -147,11 +147,15 @@
    (value qbe-datas) at entry, so accumulate each closure's data literals into
    a shared list. *\
 (set qbe-all-datas [])
+(set qbe-all-extra-fns [])
+(set qbe-all-trap-shims [])
 
 (define qbe-lower-try { symbol --> klambda --> string }
   N Code -> (trap-error
               (let Fn (lower N Code (value qbe-all-names))
                 (do (set qbe-all-datas (append (value qbe-datas) (value qbe-all-datas)))
+                    (set qbe-all-extra-fns (append (value qbe-extra-fns) (value qbe-all-extra-fns)))
+                    (set qbe-all-trap-shims (append (value qbe-trap-shims) (value qbe-all-trap-shims)))
                     Fn))
               (lambda E "")))
 
@@ -187,6 +191,9 @@
   [symbol _ | R]   -> (qbe-callees R)
   [boolean _ | R]  -> (qbe-callees R)
   [prim _ | R]     -> (qbe-callees R)
+  \* Recurse into cur bodies: the defunctionalized body's `[global G]` resolves
+     to a $clo_G call, so G is a link dependency of the enclosing closure. *\
+  [cur C1 | R]     -> (append (qbe-callees C1) (qbe-callees R))
   [_ | R] -> (qbe-callees R))
 
 (define qbe-has-skipped-callee { klambda --> (list symbol) --> boolean }
@@ -236,9 +243,22 @@
 (set qbe-skipped (qbe-prune (value qbe-cands) (qbe-skipped0 (value qbe-cands))))
 (set qbe-fns (qbe-emit-list (value qbe-cands) (value qbe-skipped)))
 
+\* Render the defunctionalized trap-shim registrations as "T1 T2 Ncap" lines,
+   consumed by tools/qbe-gen-traps.awk -> globals_trap.c. *\
+(define qbe-trap-list-str { (list (list number number number)) --> string }
+  [] -> ""
+  [[T1 T2 Ncap] | R] ->
+    (cn (cn (cn (str T1) " ") (cn (str T2) (cn " " (str Ncap))))
+        (cn (value qbe-nl) (qbe-trap-list-str R))))
+
 (set *qbe* (cn (qbe-datas-str (value qbe-all-datas))
-               (value qbe-fns)))
+               (cn (value qbe-fns) (qbe-join (value qbe-all-extra-fns)))))
 
 (set *out* (open "globals.qbe" out))
 (pr (value *qbe*) (value *out*))
 (close (value *out*))
+
+(set *trap-list* (qbe-trap-list-str (value qbe-all-trap-shims)))
+(set *tout* (open "globals_trap.list" out))
+(pr (value *trap-list*) (value *tout*))
+(close (value *tout*))

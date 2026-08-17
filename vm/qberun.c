@@ -41,6 +41,9 @@ extern void clo_plus(Value *out, Value *a0, Value *a1);
 extern void clo_reverse(Value *out, Value *a0);
 extern void clo_factorial(Value *out, Value *a0);
 extern void clo_qbe_let_test(Value *out, Value *a0);
+/* Defunctionalized-cur closures (Slice 5): native trap-error == C VM. */
+extern void clo_strlen_acc(Value *out, Value *a0, Value *a1);
+extern void clo_fresh_var(Value *out, Value *a0);
 
 /* Minimal deep equality for numbers/nil/booleans/cons (the test values). */
 static int qbe_equal(Value a, Value b) {
@@ -49,6 +52,9 @@ static int qbe_equal(Value a, Value b) {
     case VAL_NUMBER:  return a.number == b.number;
     case VAL_NIL:     return 1;
     case VAL_BOOLEAN: return a.boolean == b.boolean;
+    case VAL_SYMBOL:  return strcmp(a.sym.name, b.sym.name) == 0;
+    case VAL_STRING:  return a.str.len == b.str.len &&
+                              memcmp(a.str.data, b.str.data, a.str.len) == 0;
     case VAL_CONS:
         return qbe_equal(*a.cons.car, *b.cons.car) &&
                qbe_equal(*a.cons.cdr, *b.cons.cdr);
@@ -225,7 +231,49 @@ int main(void) {
         diff_check("(qbe-let-test 5)", out, ref);
     }
 
+    /* ---- Test 6: (strlen-acc "abc" 0) -> 3.
+         Exercises the defunctionalized trap-error: the cur body `(pos Str N)`
+         throws "pos out of bounds" on the terminating call (handler -> 0), and
+         the env mapping (body access 1,2 == enclosing access 0,1). ---- */
+    {
+        Value str6 = val_string("abc", 3);
+        Value n6 = val_number(0);
+        Value out6;
+        gc_root_push_value(&str6); gc_root_push_value(&n6);
+        clo_strlen_acc(&out6, &str6, &n6);
+        gc_root_pop(); gc_root_pop();
+        int ok = (out6.tag == VAL_NUMBER && out6.number == 3);
+        printf("test6 (strlen-acc \"abc\" 0): "); print_value(out6);
+        printf("  %s\n", ok ? "OK (expect 3)" : "FAIL");
+        if (!ok) fails++;
+
+        Value args6[2] = { str6, n6 };
+        Value ref6 = interp_ref("strlen-acc", args6, 2);
+        diff_check("(strlen-acc \"abc\" 0)", out6, ref6);
+    }
+
+    /* ---- Test 7: (fresh-var (intern "X")) -> X1 (counter reset each side).
+         Exercises the non-throwing trap path (body succeeds, handler unused)
+         plus the gensym-counter value table round-trip. ---- */
+    {
+        Value p7 = val_symbol("X");
+        Value out7;
+        value_set("shen.*gensym*", val_number(0));
+        gc_root_push_value(&p7);
+        clo_fresh_var(&out7, &p7);
+        gc_root_pop();
+        int ok = (out7.tag == VAL_SYMBOL && strcmp(out7.sym.name, "X1") == 0);
+        printf("test7 (fresh-var X): "); print_value(out7);
+        printf("  %s\n", ok ? "OK (expect X1)" : "FAIL");
+        if (!ok) fails++;
+
+        value_set("shen.*gensym*", val_number(0));
+        Value args7[1] = { p7 };
+        Value ref7 = interp_ref("fresh-var", args7, 1);
+        diff_check("(fresh-var X)", out7, ref7);
+    }
+
     if (fails) { printf("DIFF-TEST FAILED: %d\n", fails); return 1; }
-    printf("DIFF-TEST ALL PASS: native QBE == C VM interpreter for Tests 1-5\n");
+    printf("DIFF-TEST ALL PASS: native QBE == C VM interpreter for Tests 1-7\n");
     return 0;
 }

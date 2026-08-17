@@ -203,9 +203,11 @@ qbe-gen-prims: tools/qbe-gen-prims.awk vm/qbe-prims.list
 # qbe-gen: run the Slice-3 lowerer over the reduced bundle's global-table,
 # emitting QBE IR for the first-order static closures (from the authoritative
 # first_order.csv partition) into globals.qbe.
-qbe-gen: gen-prims gen-qbe-subset qbe-gen-prims shen/serialize-qbe.shen shen/qbe.shen shen/qbe-subset.shen shen/qbe-first-order.shen shen/os-helpers.shen
+qbe-gen: gen-prims gen-qbe-subset qbe-gen-prims shen/serialize-qbe.shen shen/qbe.shen shen/qbe-subset.shen shen/qbe-first-order.shen shen/os-helpers.shen tools/qbe-gen-traps.awk
 	$(SHEN) script shen/serialize-qbe.shen
+	awk -f tools/qbe-gen-traps.awk globals_trap.list > globals_trap.c
 	@echo "QBE IR written to globals.qbe ($$(wc -c < globals.qbe) bytes)"
+	@echo "Trap shims written to globals_trap.c ($$(wc -l < globals_trap.c) lines)"
 
 # qberun: assemble+link the generated globals.qbe (the linkable-closed subset
 # of the first-order partition) against the C runtime (qberun.c + qbe_shims.c
@@ -222,12 +224,12 @@ qbe-gen: gen-prims gen-qbe-subset qbe-gen-prims shen/serialize-qbe.shen shen/qbe
 # QBE output is deferred (needs QBE arm64 large-frame support or lowerer
 # frame-size reduction).  qbe-smoke still builds the dual-arch fat APE (its
 # small add12.qbe has no large frames).
-qberun: qbe-tool qbe-gen vm/qberun.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c globals.qbe
+qberun: qbe-tool qbe-gen vm/qberun.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c globals.qbe globals_trap.c
 	@T=$$(mktemp -d /tmp/qberun.build.XXXXXX) && \
 	vendor/qbe/obj/qbe -t amd64_sysv -o $$T/globals.s globals.qbe && \
 	$(COSMOAS)/x86_64-linux-cosmo-as  -o $$T/globals.o $$T/globals.s && \
 	$(COSMO_CC) -Wall -Wextra -O2 -I vm -DZINCTEST -o $$T/qberun \
-		vm/qberun.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c $$T/globals.o -lm && \
+		vm/qberun.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c globals_trap.c $$T/globals.o -lm && \
 	cp $$T/qberun qberun && chmod 755 qberun; \
 	st=$$?; rm -rf $$T; exit $$st
 

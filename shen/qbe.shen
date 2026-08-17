@@ -35,6 +35,9 @@
 (set qbe-block-lines []) \* [ [start lines-reversed] ... ] (reversed) *\
 (set qbe-allocs [])
 (set qbe-preds [])       \* [ [target pred state] ... ] CFG edges *\
+(set qbe-cur-tag-count 0) \* next cur-body tag (GLOBAL, monotonic) *\
+(set qbe-extra-fns [])     \* cur-body fn strings (per closure) *\
+(set qbe-trap-shims [])    \* [[BodyTag HandlerTag Ncap] ...] trap shim registrations *\
 
 \* Shen does NOT interpret \\n/\\\" escapes in string literals (they are
    literal 2-char sequences), so real newline / double-quote chars must be
@@ -159,8 +162,54 @@
   [symbol S | C] -> [[symbol S] | (qbe-nest C)]
   [boolean B | C] -> [[boolean B] | (qbe-nest C)]
   [prim P | C] -> [[prim P] | (qbe-nest C)]
-  [cur _ | _] -> (simple-error "qbe: cur not supported (deferred to Slice 5)")
+  [cur C1 | C] -> [[cur (qbe-nest C1)] | (qbe-nest C)]
   [X | _] -> (simple-error (cn "qbe-nest: unknown op " (str X))))
+
+\* ----------------------------------------------------------------------------
+   Defunctionalized trap-error peephole.
+
+   Every `cur` site in the reduced bundle is an adjacent
+   `[cur C1] [cur C2] [prim trap-error]` triple (handler+body).  We rewrite it
+   to a single `[trap C1 C2]` instruction, which qbe-step compiles to a direct
+   native call into a generated per-pair C shim (setjmp/longjmp) that runs the
+   two cur bodies natively as `$b_<tag>` functions.  A `cur` NOT immediately
+   followed by `cur` + `trap-error` is a dynamic closure use we cannot compile
+   (defensive simple-error; the reduced bundle has none).  Recurses into nested
+   cur bodies / trap pairs so nested trap-error lowers too.
+   ---------------------------------------------------------------------------- *\
+(define qbe-pair-traps { (list zinc-code) --> (list zinc-code) }
+  [] -> []
+  [[cur C1] [cur C2] [prim trap-error] | R] ->
+    [[trap (qbe-pair-traps C1) (qbe-pair-traps C2)] | (qbe-pair-traps R)]
+  [[cur _] | _] -> (simple-error "qbe: cur not in a cur/cur/trap-error pair")
+  [I | R] -> [I | (qbe-pair-traps R)])
+
+\* Collapsing a cur/cur/trap-error triple (3 flat instructions) into one
+   [trap] instruction shifts every later absolute jmpf/jmp target by -2.
+   qbe-renumber rebuilds the old->new instruction index map and rewrites the
+   targets.  Recurses into nested [trap C1 C2] so nested cur bodies renumber
+   at their own level (identity for the bundle's cur bodies, which have no
+   nested cur). *\
+(define qbe-renumber { (list zinc-code) --> (list zinc-code) }
+  Code -> (qbe-renumber-h Code (qbe-renumber-map Code 0 0)))
+
+(define qbe-renumber-map { (list zinc-code) --> number --> number --> (list (list number number)) }
+  [] _ _ -> []
+  [[trap _ _] | R] J K -> [[J K] [(+ J 1) K] [(+ J 2) K] | (qbe-renumber-map R (+ J 3) (+ K 1))]
+  [_ | R] J K -> [[J K] | (qbe-renumber-map R (+ J 1) (+ K 1))])
+
+(define qbe-renumber-h { (list zinc-code) --> (list (list number number)) --> (list zinc-code) }
+  [] _ -> []
+  [[trap C1 C2] | R] Map -> [[trap (qbe-renumber C1) (qbe-renumber C2)] | (qbe-renumber-h R Map)]
+  [[jmpf L] | R] Map -> [[jmpf (qbe-renum-lookup L Map)] | (qbe-renumber-h R Map)]
+  [[jmp L] | R] Map -> [[jmp (qbe-renum-lookup L Map)] | (qbe-renumber-h R Map)]
+  [I | R] Map -> [I | (qbe-renumber-h R Map)])
+
+(define qbe-renum-lookup { number --> (list (list number number)) --> number }
+  L Map -> (let P (assoc L Map)
+             (if (empty? P)
+                 (simple-error (cn "qbe: renumber: jump target out of range " (str L)))
+                 (hd (tl P)))))
 
 \* -------------------------- prim info -------------------------- *\
 
@@ -270,7 +319,8 @@
 
 (define qbe-last-instr { (list (list number zinc-code)) --> zinc-code }
   [[_ I]] -> I
-  [[_ _] | R] -> (qbe-last-instr R))
+  [[_ _] | R] -> (qbe-last-instr R)
+  [] -> (simple-error (cn "qbe: empty block in " (str (value qbe-cur-name)))))
 
 (define qbe-block-end { (list (list number zinc-code)) --> number }
   [[N _]] -> (+ N 1)
@@ -377,6 +427,24 @@
         (do (qbe-emit (qbe-join [C " =w call $is_false(" (cn "l " Cond) ")"]))
             (qbe-emit (qbe-join ["jnz " C ", @b" (str L) ", @b" (str (+ N 1))]))
             [(tl Stk) Env Marks])))
+  _ [trap C1 C2] [Stk Env Marks] ClosureSet ->
+    \* C1 = HANDLER (first cur), C2 = BODY (second cur): trap-error pops the
+       body first (top = second cur) and the handler below (first cur). *\
+    (let Ncap (qbe-max2 (qbe-max-access C1) (qbe-max-access C2))
+      (let TB (qbe-fresh-tag)
+        (let TH (qbe-fresh-tag)
+          (let Caps (qbe-trap-caps Ncap Env)
+            (let FnH (qbe-lower-cur TH C1 Ncap ClosureSet)
+              (let FnB (qbe-lower-cur TB C2 Ncap ClosureSet)
+                (let Out (qbe-slot)
+                  (do
+                    (set qbe-extra-fns (cons FnB (cons FnH (value qbe-extra-fns))))
+                    \* [body_tag handler_tag Ncap]: the C shim runs b_TB (body)
+                       with nil and b_TH (handler) with the caught error. *\
+                    (set qbe-trap-shims (cons [TB TH Ncap] (value qbe-trap-shims)))
+                    (qbe-emit (qbe-call (qbe-trap-shim-name TB TH)
+                                        (cons (cn "l " Out) (qbe-l-args Caps))))
+                    [[Out | Stk] Env Marks]))))))))
   _ [Op | _] _ _ -> (simple-error (cn "qbe: unsupported op " (str Op)))
   _ X _ _ -> (simple-error (cn "qbe: unknown instruction " (str X))))
 
@@ -525,6 +593,121 @@
   [] -> ""
   [[N Content] | R] -> (qbe-join ["data " N " = { b " (value qbe-dq) Content (value qbe-dq) ", b 0 }" (value qbe-nl) (qbe-datas-str R)]))
 
+\* -------------------------- cur / trap-error defunctionalization -------------------------- *\
+
+\* Max access index in a (nested) code list; recurses into nested [trap C1 C2]. *\
+(define qbe-max-access { (list zinc-code) --> number }
+  [] -> 0
+  [[access N] | R] -> (qbe-max2 N (qbe-max-access R))
+  [[trap C1 C2] | R] -> (qbe-max2 (qbe-max-access C1) (qbe-max2 (qbe-max-access C2) (qbe-max-access R)))
+  [_ | R] -> (qbe-max-access R))
+
+(define qbe-max2 { number --> number --> number }
+  A B -> A where (>= A B)
+  _ B -> B)
+
+\* Fresh tag for a cur body (global, monotonic — unique $b_<tag> per body). *\
+(define qbe-fresh-tag { --> number }
+  -> (let N (value qbe-cur-tag-count)
+       (do (set qbe-cur-tag-count (+ N 1)) N)))
+
+\* cur-body param names: %a0 (trap arg) then %cap_0 ... %cap_{Ncap-1}. *\
+(define qbe-cur-cap-params { number --> (list string) }
+  N -> (qbe-cur-cap-params-h N 0))
+(define qbe-cur-cap-params-h { number --> number --> (list string) }
+  N J -> [] where (>= J N)
+  N J -> [(cn "%cap_" (str J)) | (qbe-cur-cap-params-h N (+ J 1))])
+
+(define qbe-cur-params { number --> (list string) }
+  Ncap -> (cons "%a0" (qbe-cur-cap-params Ncap)))
+
+\* Entry Env for a cur body: [%a0 %cap_0 ... %cap_{Ncap-1}] (newest-first).
+   access 0 = %a0 (trap arg), access N = %cap_{N-1} = enclosing P access (N-1).
+   This mirrors the C VM: body env = captured ++ [nil], lookup_env(0)=nil. *\
+(define qbe-cur-env0 { number --> (list string) }
+  Ncap -> (qbe-cur-params Ncap))
+
+\* cur-body function header + assembly (reuses the shared block machinery). *\
+(define qbe-cur-fn-header { number --> number --> string }
+  Tag Ncap ->
+    (qbe-join ["export" (value qbe-nl) "function $b_" (str Tag) "("
+               (qbe-args-str (qbe-l-args (cons "%out" (qbe-cur-params Ncap))))
+               ") {" (value qbe-nl)]))
+
+(define qbe-cur-fn-string { number --> number --> string }
+  Tag Ncap ->
+    (qbe-join [(qbe-cur-fn-header Tag Ncap)
+               (qbe-blocks-str (qbe-inject-allocs (reverse (value qbe-block-lines))))
+               (value qbe-nl) "}" (value qbe-nl)]))
+
+\* Save / restore the parent closure's mutable lowering state around a cur-body
+   lowering, so the parent's CFG/temps/data continue untouched afterwards. *\
+(define qbe-cur-save { --> (list (list symbol zinc-value)) }
+  -> [[temp-count (value qbe-temp-count)]
+      [wcount (value qbe-wcount)]
+      [datas (value qbe-datas)]
+      [preds (value qbe-preds)]
+      [allocs (value qbe-allocs)]
+      [block-lines (value qbe-block-lines)]
+      [lines (value qbe-lines)]])
+
+(define qbe-cur-get { symbol --> (list (list symbol zinc-value)) --> zinc-value }
+  Key Saved -> (let P (assoc Key Saved)
+                 (if (empty? P) (simple-error "qbe: state save/restore mismatch") (hd (tl P)))))
+
+(define qbe-cur-restore { (list (list symbol zinc-value)) --> symbol }
+  Saved -> (do
+    (set qbe-temp-count (qbe-cur-get temp-count Saved))
+    (set qbe-wcount (qbe-cur-get wcount Saved))
+    (set qbe-datas (qbe-cur-get datas Saved))
+    (set qbe-preds (qbe-cur-get preds Saved))
+    (set qbe-allocs (qbe-cur-get allocs Saved))
+    (set qbe-block-lines (qbe-cur-get block-lines Saved))
+    (set qbe-lines (qbe-cur-get lines Saved))
+    done))
+
+\* Lower one cur body (nested code) to `function $b_<Tag>` capturing the
+   enclosing closure's accesses 0..Ncap-1 as %cap_0..%cap_{Ncap-1}. *\
+(define qbe-lower-cur { number --> (list zinc-code) --> number --> (list symbol) --> string }
+  Tag Nested Ncap ClosureSet ->
+    (let Saved (qbe-cur-save)
+      (do
+        (set qbe-temp-count 0)
+        (set qbe-wcount 0)
+        (set qbe-datas [])
+        (set qbe-preds [])
+        (set qbe-allocs [])
+        (set qbe-block-lines [])
+        (set qbe-lines [])
+        (let Env0 (qbe-cur-env0 Ncap)
+          (let Indexed (qbe-index Nested 0)
+            (let Total (length Indexed)
+              (let Blocks (qbe-make-blocks Indexed (qbe-leaders Indexed) Total)
+                (let Fn (do (qbe-lower-blocks Blocks [[] Env0 []] ClosureSet)
+                             (qbe-cur-fn-string Tag Ncap))
+                  (let ChildDatas (value qbe-datas)
+                    (do (qbe-cur-restore Saved)
+                        (set qbe-datas (append ChildDatas (value qbe-datas)))
+                        Fn))))))))))
+
+\* cap_j for the shim call: the enclosing closure's access j, or a fresh 0 slot
+   if j is past the enclosing env (mirrors lookup_env's OOB number-0 sentinel). *\
+(define qbe-trap-cap { number --> (list string) --> string }
+  J Env -> (if (>= J (length Env))
+               (let Z (qbe-slot)
+                 (do (qbe-emit (qbe-call "val_number_into" [(cn "l " Z) "l 0"]))
+                     Z))
+               (qbe-env-ref J Env)))
+
+(define qbe-trap-caps { number --> (list string) --> (list string) }
+  N Env -> (qbe-trap-caps-h N 0 Env))
+(define qbe-trap-caps-h { number --> number --> (list string) --> (list string) }
+  N J Env -> [] where (>= J N)
+  N J Env -> [(qbe-trap-cap J Env) | (qbe-trap-caps-h N (+ J 1) Env)])
+
+(define qbe-trap-shim-name { number --> number --> string }
+  T1 T2 -> (cn "trap_" (cn (str T1) (cn "_" (str T2)))))
+
 \* -------------------------- top-level lower -------------------------- *\
 
 (define lower { symbol --> klambda --> (list symbol) --> string }
@@ -539,8 +722,11 @@
       (set qbe-allocs [])
       (set qbe-block-lines [])
       (set qbe-lines [])
+      (set qbe-extra-fns [])
+      (set qbe-trap-shims [])
+      (set qbe-cur-name Name)
       (let Arity (qbe-arity Body)
-        (let Nested (qbe-nest Body)
+        (let Nested (qbe-renumber (qbe-pair-traps (qbe-nest Body)))
           (let Env0 (qbe-env0 (qbe-arg-temps Arity))
             (let Indexed (qbe-index Nested 0)
               (let Total (length Indexed)

@@ -6,6 +6,8 @@ zinctest
 qberun
 qbesmoke
 globals.qbe
+globals_trap.c
+globals_trap.list
 *.csexp
 /tmp/
 core.*
