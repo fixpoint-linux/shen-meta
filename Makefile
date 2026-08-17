@@ -1,4 +1,4 @@
-.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims qbe-tool qberun qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test
+.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -96,6 +96,26 @@ gen-prims: vm/prims.def
 	@awk '/^[ \t]*PRIM\(/ { match($$0, /PRIM\("[^"]*"/); printf " %s", substr($$0, RSTART+6, RLENGTH-7) }' vm/prims.def >> shen/prims-generated.shen
 	@printf '])\n' >> shen/prims-generated.shen
 
+# gen-qbe-subset: generate the Shen closure list for the QBE lowerer from the
+# authoritative first-order partition tools/bundle-verify/out/first_order.csv
+# (the sound QBE-compilable set, = top_first_order over the reduced bundle).
+# Mirrors gen-prims: emits shen/qbe-first-order.shen as plain data:
+#   (set qbe-first-order-closures [ name1 name2 ... ])
+# Loaded by serialize-qbe.shen so the QBE consumer selects closures from the
+# partition (single source of truth) instead of a manual hand-picked list.
+#
+# first_order.csv is itself a generated souffle output (make bundle-verify),
+# so it may be absent on a fresh checkout.  In that case the committed
+# shen/qbe-first-order.shen is used unchanged (it is regenerated whenever the
+# csv is present and newer).
+gen-qbe-subset:
+	@if [ -f tools/bundle-verify/out/first_order.csv ] && \
+	   [ tools/bundle-verify/out/first_order.csv -nt shen/qbe-first-order.shen ]; then \
+		printf '(set qbe-first-order-closures [' > shen/qbe-first-order.shen; \
+		awk -F, 'NR>1 { printf " %s", $$1 }' tools/bundle-verify/out/first_order.csv >> shen/qbe-first-order.shen; \
+		printf '])\n' >> shen/qbe-first-order.shen; \
+	fi
+
 bundle: gen-prims shen/serialize-reduced.shen
 	$(SHEN) script shen/serialize-reduced.shen 2>/dev/null
 	@echo "Bundle written to globals.csexp ($$(wc -c < globals.csexp) bytes)"
@@ -178,26 +198,34 @@ qbe-gen-prims: tools/qbe-gen-prims.awk vm/qbe-prims.list
 	awk -f tools/qbe-gen-prims.awk vm/qbe-prims.list
 
 # qbe-gen: run the Slice-3 lowerer over the reduced bundle's global-table,
-# emitting QBE IR for the Test 1-4 closures into globals.qbe.
-qbe-gen: gen-prims qbe-gen-prims shen/serialize-qbe.shen shen/qbe.shen shen/qbe-subset.shen shen/os-helpers.shen
+# emitting QBE IR for the first-order static closures (from the authoritative
+# first_order.csv partition) into globals.qbe.
+qbe-gen: gen-prims gen-qbe-subset qbe-gen-prims shen/serialize-qbe.shen shen/qbe.shen shen/qbe-subset.shen shen/qbe-first-order.shen shen/os-helpers.shen
 	$(SHEN) script shen/serialize-qbe.shen
 	@echo "QBE IR written to globals.qbe ($$(wc -c < globals.qbe) bytes)"
 
-# qberun: assemble+link the generated globals.qbe (4 closures) against the C
-# runtime (qberun.c + qbe_shims.c + qbe_prims_gen.c + zincvm.c + gc.c) into a
-# fat APE, then the native x86_64 ELF is copied out.  Runs the 4 differential
-# tests (see vm/qberun.c).
+# qberun: assemble+link the generated globals.qbe (the linkable-closed subset
+# of the first-order partition) against the C runtime (qberun.c + qbe_shims.c
+# + qbe_prims_gen.c + zincvm.c + gc.c) into the native x86_64 cosmo ELF that
+# runs the 5 differential tests (see vm/qberun.c).
+#
+# NOTE: this builds the amd64 target ONLY, via x86_64-unknown-cosmo-cc (the
+# single-arch variant of cosmocc) — NOT the dual-arch fat APE.  Lowering the
+# full first-order partition exposes closures with stack frames larger than
+# the 12-bit / 32KB immediates QBE's arm64 backend emits (prologue
+# `sub sp,sp,#N`, Oaddr, callee-saved str/ldr), so the aarch64 cross-slice of a
+# fat APE no longer assembles.  The differential tests run on this x86_64 host,
+# so the native amd64 cosmo ELF is sufficient; a cross-arch fat APE of the full
+# QBE output is deferred (needs QBE arm64 large-frame support or lowerer
+# frame-size reduction).  qbe-smoke still builds the dual-arch fat APE (its
+# small add12.qbe has no large frames).
 qberun: qbe-tool qbe-gen vm/qberun.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c globals.qbe
 	@T=$$(mktemp -d /tmp/qberun.build.XXXXXX) && \
-	mkdir -p $$T/.aarch64 && \
 	vendor/qbe/obj/qbe -t amd64_sysv -o $$T/globals.s globals.qbe && \
-	vendor/qbe/obj/qbe -t arm64     -o $$T/.aarch64/globals.s globals.qbe && \
 	$(COSMOAS)/x86_64-linux-cosmo-as  -o $$T/globals.o $$T/globals.s && \
-	$(COSMOAS)/aarch64-linux-cosmo-as -o $$T/.aarch64/globals.o $$T/.aarch64/globals.s && \
-	$(COSMOCC) -Wall -Wextra -O2 -I vm -DZINCTEST \
-		-o $$T/out.ape \
-		vm/qberun.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c $$T/globals.o && \
-	cp $$T/out.ape.com.dbg qberun && chmod 755 qberun; \
+	x86_64-unknown-cosmo-cc -Wall -Wextra -O2 -I vm -DZINCTEST -o $$T/qberun \
+		vm/qberun.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c $$T/globals.o -lm && \
+	cp $$T/qberun qberun && chmod 755 qberun; \
 	st=$$?; rm -rf $$T; exit $$st
 
 # qbe-test: build + run the 4 differential tests (Tests 1-4 vs zincvm).

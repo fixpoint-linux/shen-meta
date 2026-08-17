@@ -76,14 +76,63 @@
   S Acc -> (qbe-ident-h (tlstr (tlstr S)) (cn Acc "_to_")) where (and (> (qbe-strlen S) 1) (= "->" (cn (hdstr S) (hdstr (tlstr S)))))
   S Acc -> (qbe-ident-h (tlstr (tlstr S)) (cn Acc "_from_")) where (and (> (qbe-strlen S) 1) (= "<-" (cn (hdstr S) (hdstr (tlstr S)))))
   S Acc -> (qbe-ident-h (tlstr S) (cn Acc "p")) where (= "?" (hdstr S))
-  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "_")) where (= "." (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc ".")) where (= "." (hdstr S))
   S Acc -> (qbe-ident-h (tlstr S) (cn Acc "at")) where (= "@" (hdstr S))
   S Acc -> (qbe-ident-h (tlstr S) (cn Acc "bang")) where (= "!" (hdstr S))
   S Acc -> (qbe-ident-h (tlstr S) (cn Acc "_")) where (= "-" (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "eq")) where (= "=" (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "plus")) where (= "+" (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "mul")) where (= "*" (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "div")) where (= "/" (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "lt")) where (= "<" (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "gt")) where (= ">" (hdstr S))
+  S Acc -> (qbe-ident-h (tlstr S) (cn Acc "pct")) where (= "%" (hdstr S))
   S Acc -> (qbe-ident-h (tlstr S) (cn Acc (hdstr S))))
 
 (define qbe-clo-name { symbol --> string }
-  Name -> (cn "clo_" (qbe-ident (str Name))))
+  Name -> (let M (cn "clo_" (qbe-ident (str Name)))
+           (if (> (qbe-strlen M) 30)
+               (qbe-short-clo M)
+               M)))
+
+\* ----------------------------------------------------------------------------
+   QBE identifier-length guard.  QBE's lexer (vendor/qbe, NString=32) rejects
+   identifiers longer than 31 chars, INCLUDING the leading `$` on a global
+   symbol (so the mangled `clo_...` name must be <=30 chars).  The readable
+   mangle above is injective (distinct closure names -> distinct identifiers,
+   since `.` and `-` map to different chars) but some closure names (long
+   tc-hm / shen.* aliases) mangle past 30.  For those we keep the first 21
+   chars of the mangle and append a "_" + 8-hex FNV-style hash of the FULL
+   mangle, giving a unique 30-char identifier (`$` -> 31 total).  Only the
+   readable form is used for the (short) differential driver names, which stay
+   unchanged.
+   ---------------------------------------------------------------------------- *\
+(define qbe-take { number --> string --> string }
+  0 _ -> ""
+  N S -> (cn (hdstr S) (qbe-take (- N 1) (tlstr S))))
+
+(define qbe-hash { string --> number }
+  S -> (qbe-hash-h S 5381))
+(define qbe-hash-h { string --> number --> number }
+  "" H -> H
+  S H -> (qbe-hash-h (tlstr S) (mod (+ (* H 33) (string->n (hdstr S))) 4294967296)))
+
+(define qbe-hex { number --> string }
+  N -> (qbe-hex-h N ""))
+(define qbe-hex-h { number --> string --> string }
+  N Acc -> (let D (qbe-hex-digit (mod N 16))
+             (if (< N 16) (cn D Acc) (qbe-hex-h (div N 16) (cn D Acc)))))
+(define qbe-hex-digit { number --> string }
+  N -> (if (< N 10) (str N) (cn (n->string (+ 87 N)))))
+
+(define qbe-pad-left { number --> string --> string --> string }
+  N P S -> (if (>= (qbe-strlen S) N) S (qbe-pad-left N P (cn P S))))
+
+(define qbe-hex8 { number --> string }
+  N -> (qbe-pad-left 8 "0" (qbe-hex N)))
+
+(define qbe-short-clo { string --> string }
+  M -> (cn (qbe-take 21 M) (cn "_" (qbe-hex8 (qbe-hash M)))))
 
 \* -------------------------- flat->nested conversion -------------------------- *\
 
@@ -155,8 +204,8 @@
 (define qbe-string-lit { string --> string }
   S -> (qbe-data S))
 
-(define qbe-symbol-lit { string --> string }
-  S -> (qbe-data S))
+(define qbe-symbol-lit { symbol --> string }
+  S -> (qbe-data (str S)))
 
 \* Join already-typed call arguments ("l %t", "w 1", "l 42", ...) with ", ". *\
 (define qbe-args-str { (list string) --> string }
