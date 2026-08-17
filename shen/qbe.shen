@@ -34,6 +34,8 @@
 (set qbe-lines [])       \* current block's emitted lines (reversed) *\
 (set qbe-block-lines []) \* [ [start lines-reversed] ... ] (reversed) *\
 (set qbe-allocs [])
+(set qbe-zero-tmp false)
+(set qbe-zero-init "")
 (set qbe-preds [])       \* [ [target pred state] ... ] CFG edges *\
 (set qbe-cur-tag-count 0) \* next cur-body tag (GLOBAL, monotonic) *\
 (set qbe-extra-fns [])     \* cur-body fn strings (per closure) *\
@@ -519,8 +521,27 @@
                  (let Marks (qbe-marks (hd (tl (hd Preds))))
                    [Stk Env Marks])))))
 
+\* qbe-max-length: the longest predecessor slot-list length, so the reconcile
+   iterates over the LONGEST pred (every real slot gets a phi) and shorter preds
+   get the number-0 sentinel via qbe-col. *\
+(define qbe-max-length { (list (list zinc-value)) --> number }
+  [] -> 0
+  [S | R] -> (qbe-max2 (length S) (qbe-max-length R)))
+
+\* qbe-zero: the function-local number-0 sentinel temp.  Lazy: allocated on first
+   use, defined in block 0 (alloc8 40 + val_number_into) so it dominates every
+   phi predecessor.  Memoized per function (one %zero for all missing slots). *\
+(define qbe-zero { --> string }
+  -> (if (= (value qbe-zero-tmp) false)
+         (let T (qbe-fresh)
+           (do (set qbe-allocs (cons (qbe-join [T " =l alloc8 40"]) (value qbe-allocs)))
+               (set qbe-zero-init (qbe-call "val_number_into" [(cn "l " T) "l 0"]))
+               (set qbe-zero-tmp T)
+               T))
+         (value qbe-zero-tmp)))
+
 (define qbe-reconcile { (list (list zinc-value)) --> (list number) --> (list zinc-value) }
-  Slots Starts -> (qbe-reconcile-h Slots Starts 0 (length (hd Slots))))
+  Slots Starts -> (qbe-reconcile-h Slots Starts 0 (qbe-max-length Slots)))
 
 (define qbe-reconcile-h { (list (list zinc-value)) --> (list number) --> number --> number --> (list zinc-value) }
   Slots Starts J Max -> [] where (= J Max)
@@ -528,7 +549,7 @@
 
 (define qbe-col { (list (list zinc-value)) --> number --> (list zinc-value) }
   [] _ -> []
-  [S | R] J -> [(qbe-nth0 J S) | (qbe-col R J)])
+  [S | R] J -> [(if (>= J (length S)) (qbe-zero) (qbe-nth0 J S)) | (qbe-col R J)])
 
 (define qbe-all-eq { (list zinc-value) --> boolean }
   [] -> true
@@ -591,7 +612,7 @@
 
 (define qbe-inject-allocs { (list (list number (list string))) --> (list (list number (list string))) }
   [] -> []
-  [[0 Lines] | R] -> [[0 (append Lines (value qbe-allocs))] | R]
+  [[0 Lines] | R] -> [[0 (append Lines (append (if (= (value qbe-zero-init) "") [] [(value qbe-zero-init)]) (value qbe-allocs)))] | R]
   [B | R] -> [B | (qbe-inject-allocs R)])
 
 (define qbe-fn-string { symbol --> number --> string }
@@ -660,6 +681,8 @@
       [datas (value qbe-datas)]
       [preds (value qbe-preds)]
       [allocs (value qbe-allocs)]
+      [zero-tmp (value qbe-zero-tmp)]
+      [zero-init (value qbe-zero-init)]
       [block-lines (value qbe-block-lines)]
       [lines (value qbe-lines)]])
 
@@ -674,6 +697,8 @@
     (set qbe-datas (qbe-cur-get datas Saved))
     (set qbe-preds (qbe-cur-get preds Saved))
     (set qbe-allocs (qbe-cur-get allocs Saved))
+    (set qbe-zero-tmp (qbe-cur-get zero-tmp Saved))
+    (set qbe-zero-init (qbe-cur-get zero-init Saved))
     (set qbe-block-lines (qbe-cur-get block-lines Saved))
     (set qbe-lines (qbe-cur-get lines Saved))
     done))
@@ -689,6 +714,8 @@
         (set qbe-datas [])
         (set qbe-preds [])
         (set qbe-allocs [])
+        (set qbe-zero-tmp false)
+        (set qbe-zero-init "")
         (set qbe-block-lines [])
         (set qbe-lines [])
         (let Env0 (qbe-cur-env0 Ncap)
@@ -728,6 +755,8 @@
       (set qbe-datas [])
       (set qbe-preds [])
       (set qbe-allocs [])
+      (set qbe-zero-tmp false)
+      (set qbe-zero-init "")
       (set qbe-block-lines [])
       (set qbe-lines [])
       (set qbe-extra-fns [])

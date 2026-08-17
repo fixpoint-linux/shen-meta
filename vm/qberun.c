@@ -44,6 +44,9 @@ extern void clo_qbe_let_test(Value *out, Value *a0);
 /* Defunctionalized-cur closures (Slice 5): native trap-error == C VM. */
 extern void clo_strlen_acc(Value *out, Value *a0, Value *a1);
 extern void clo_fresh_var(Value *out, Value *a0);
+/* Phi-sentinel divergence gate (Test 8): emits only after the reconcile-to-MAX
+ * + %zero-sentinel fix (its final join has a (2 1) stack divergence). */
+extern void clo_shen_kl_app_headp(Value *out, Value *a0);
 
 /* Minimal deep equality for numbers/nil/booleans/cons (the test values). */
 static int qbe_equal(Value a, Value b) {
@@ -273,7 +276,37 @@ int main(void) {
         diff_check("(fresh-var X)", out7, ref7);
     }
 
+    /* ---- Test 8: (shen-kl-app-head? X) — phi-sentinel divergence gate.
+         shen-kl-app-head? has a (2 1) stack divergence at its final join, so it
+         only EMITS after the reconcile-to-MAX + %zero-sentinel fix.  Exercises
+         the phi-sentinel path: the shorter predecessor's missing slot is fed the
+         number-0 %zero temp.  Body: (if (symbol? H) (let S (str H) (if (= S "") false
+         (let Ch (string->n (pos S 0)) (not (and (>= Ch 65) (<= Ch 90)))))) false) ---- */
+    {
+        Value s_lo = val_symbol("foo"), s_hi = val_symbol("Foo"), o_lo, o_hi;
+        gc_root_push_value(&s_lo); gc_root_push_value(&s_hi);
+        clo_shen_kl_app_headp(&o_lo, &s_lo);
+        clo_shen_kl_app_headp(&o_hi, &s_hi);
+        gc_root_pop(); gc_root_pop();
+        int ok_lo = (o_lo.tag == VAL_BOOLEAN && o_lo.boolean == 1);
+        int ok_hi = (o_hi.tag == VAL_BOOLEAN && o_hi.boolean == 0);
+        printf("test8 (shen-kl-app-head? foo): "); print_value(o_lo);
+        printf("  %s\n", ok_lo ? "OK (expect true)" : "FAIL");
+        printf("test8 (shen-kl-app-head? Foo): "); print_value(o_hi);
+        printf("  %s\n", ok_hi ? "OK (expect false)" : "FAIL");
+        if (!ok_lo) fails++;
+        if (!ok_hi) fails++;
+
+        Value a_lo[1] = { s_lo };
+        Value r_lo = interp_ref("shen-kl-app-head?", a_lo, 1);
+        diff_check("(shen-kl-app-head? foo)", o_lo, r_lo);
+
+        Value a_hi[1] = { s_hi };
+        Value r_hi = interp_ref("shen-kl-app-head?", a_hi, 1);
+        diff_check("(shen-kl-app-head? Foo)", o_hi, r_hi);
+    }
+
     if (fails) { printf("DIFF-TEST FAILED: %d\n", fails); return 1; }
-    printf("DIFF-TEST ALL PASS: native QBE == C VM interpreter for Tests 1-7\n");
+    printf("DIFF-TEST ALL PASS: native QBE == C VM interpreter for Tests 1-8\n");
     return 0;
 }
