@@ -67,6 +67,30 @@ PRIM_ARITY = {
     "write-byte": 2,  # write-byte Byte Stream
     "read-file-as-string": 1,
     "@p": 2,  # tuple constructor
+    # prims.def entries not currently inlined as `P` but present in the C VM
+    # table (default arity=0 would silently over-count the stack if ever inlined).
+    "nth": 2,              # vm/prims.def PRIM("nth",2)
+    "shen.str->bytes": 1,  # vm/prims.def PRIM("shen.str->bytes",1)
+    "shen.bytes->string": 1,  # vm/prims.def PRIM("shen.bytes->string",1)
+    "shen.fail!": 1,       # vm/prims.def PRIM("shen.fail!",1)
+    "stinput": 0,          # vm/prims.def PRIM("stinput",0)  (0 = pop0/push1, already default)
+    "stoutput": 0,         # vm/prims.def PRIM("stoutput",0)
+    # Inline-prim helpers used by the metacircular interp / reduced bundle.
+    # These are dispatched via `P` (inline OP_PRIM) in the bundle, so the
+    # stack simulation MUST know their arity to keep stack depth balanced.
+    # Without these, PRIM_ARITY.get() defaults to 0 (pop 0, push 1), which
+    # inflates the simulated stack by +1 V per occurrence and makes
+    # downstream apply/appterm sites over-count supplied_args (e.g. shen.interp
+    # self-calls reported as 6-9 args instead of the true 5).
+    "reverse": 1,  # C VM zincvm.c:1451 — pops 1
+    "append": 2,   # C VM zincvm.c:986  — pops 2
+    "assoc": 2,    # C VM zincvm.c:962  — pops 2
+    "empty?": 1,   # C VM zincvm.c:1225 — pops 1
+    "length": 1,   # C VM zincvm.c:1304 — pops 1
+    "hash": 2,     # Shen OS arity table (init.kl): hash Key Size — 2 args
+    "shen.assoc-set": 3,  # sys.kl: (defun shen.assoc-set V3875 V3876 V3877) — 3 args
+    "c-tag": 1,       # interp constructor-tag helper — 1 arg
+    "c-tag-full": 1,  # interp constructor-tag helper — 1 arg
 }
 
 # Allowlisted primitives (from shen/util.shen primitive?)
@@ -436,9 +460,17 @@ class BundleParser:
 
         instructions: list of (idx, op, operand_kind, operand_value).
 
-        Maintains a first-wins map from pc → stack-shape tuple of 'V'(value)
-        / 'M'(mark).  At each apply/appterm, records supplied_args(name, pc, n)
-        where n = count of 'V' above the topmost 'M', excluding the callee.
+        Maintains a *set* of reachable stack shapes per pc (each shape is a
+        tuple of 'V'(value) / 'M'(mark)).  This is a proper meet/join dataflow
+        (monotone union over the control-flow graph, worklist-iterated to a
+        fixed point) rather than a first-wins map: every distinct stack shape
+        that can reach a merged pc is tracked, so a later branch reaching the
+        same apply/appterm from a different path is not silently dropped.
+
+        At each apply/appterm, records ONE supplied_args(name, pc, n) row per
+        distinct reachable shape, where n = count of 'V' above the topmost 'M',
+        excluding the callee.  The Datalog arity_mismatch rule then only fires
+        where a *genuinely reachable* path supplies a wrong arg count.
         """
         if not instructions:
             return
@@ -450,21 +482,19 @@ class BundleParser:
 
         max_idx = max(instr_at.keys())
 
-        # states[pc] = tuple of 'V'/'M' chars (first-wins)
+        # states[pc] = set of 'V'/'M' shape tuples reachable at pc.
+        # worklist holds (pc, shape) work-items; a shape is re-propagated only
+        # when it is newly joined into a pc's reachable set (monotone fixpoint).
         states = {}
-        worklist = [0]
-        states[0] = ()
+        worklist = [(0, ())]
 
         while worklist:
-            pc = worklist.pop(0)
+            pc, stack = worklist.pop(0)
             if pc not in instr_at:
                 continue
 
             op, op_value = instr_at[pc]
-            # Stack shape before this instruction executes
-            stack = list(states[pc])
-
-            # Compute new stack shape after this instruction
+            # Compute new stack shape after this instruction from this one shape
             new_stack = list(stack)
             successors = []
 
@@ -507,23 +537,21 @@ class BundleParser:
                 successors.append(pc + 1)
                 target = int(op_value) if op_value else pc + 1
                 if target <= max_idx + 1:
-                    self._propagate_state(states, worklist, target, tuple(new_stack))
+                    successors.append(target)
 
             elif op == 'j':  # jmp: no stack effect, one successor
                 target = int(op_value) if op_value else pc + 1
                 if target <= max_idx + 1:
-                    self._propagate_state(states, worklist, target, tuple(new_stack))
+                    successors.append(target)
                 # No pc+1 successor
 
             elif op in 'pt':  # apply / appterm
                 # Count 'V' above topmost 'M', excluding callee (the topmost V)
                 n_above = 0
-                saw_non_v = False
                 for ch in reversed(new_stack):
                     if ch == 'V':
                         n_above += 1
                     else:
-                        saw_non_v = True
                         break
                 supplied = n_above - 1  # exclude callee
                 if supplied >= 0:
@@ -546,17 +574,26 @@ class BundleParser:
             elif op == 'v':  # return: terminal, no successors
                 pass
 
-            # Propagate to fall-through successors
+            # Propagate to all successors
             for succ in successors:
                 if succ <= max_idx + 1:
                     self._propagate_state(states, worklist, succ, tuple(new_stack))
 
     @staticmethod
     def _propagate_state(states, worklist, pc, shape):
-        """Record stack shape at pc if not yet visited (first-wins)."""
-        if pc not in states:
-            states[pc] = shape
-            worklist.append(pc)
+        """Join `shape` into the reachable-shape set at `pc` (monotone union).
+
+        Only schedules the (pc, shape) work-item when `shape` is newly added,
+        which drives the worklist to a fixed point (a shape already present
+        never needs re-propagation).
+        """
+        cur = states.get(pc)
+        if cur is None:
+            states[pc] = {shape}
+            worklist.append((pc, shape))
+        elif shape not in cur:
+            cur.add(shape)
+            worklist.append((pc, shape))
 
 
 # ── Main ──────────────────────────────────────────────────────────────
