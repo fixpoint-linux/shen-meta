@@ -177,6 +177,16 @@
     (if (and (not (qbe-prim? G)) (element? G (value qbe-all-names)))
         [G | (qbe-callees R)]
         (qbe-callees R))
+  \* Operand-carrying instructions: consume the operand so a bare `global`
+     (as the operand of [symbol global], etc.) is not misread as an opcode. *\
+  [access _ | R]   -> (qbe-callees R)
+  [jmpf _ | R]     -> (qbe-callees R)
+  [jmp _ | R]      -> (qbe-callees R)
+  [number _ | R]   -> (qbe-callees R)
+  [string _ | R]   -> (qbe-callees R)
+  [symbol _ | R]   -> (qbe-callees R)
+  [boolean _ | R]  -> (qbe-callees R)
+  [prim _ | R]     -> (qbe-callees R)
   [_ | R] -> (qbe-callees R))
 
 (define qbe-has-skipped-callee { klambda --> (list symbol) --> boolean }

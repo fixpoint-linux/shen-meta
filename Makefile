@@ -190,6 +190,9 @@ COSMOCC  := $(shell command -v cosmocc || echo /usr/local/cosmo/bin/cosmocc)
 # thin wrapper in /usr/local/bin (or on PATH), so resolve the assembler dir
 # from the real toolchain location, falling back to cosmocc's dir.
 COSMOAS  := $(shell if [ -x /usr/local/cosmo/bin/x86_64-linux-cosmo-as ]; then echo /usr/local/cosmo/bin/; else echo $(dir $(COSMOCC)); fi)
+# Single-arch (amd64-only) cosmopolitan compiler, used by the qberun target.
+# Lives in the toolchain's own bin dir, which may not be on PATH.
+COSMO_CC := $(shell command -v x86_64-unknown-cosmo-cc || echo /usr/local/cosmo/bin/x86_64-unknown-cosmo-cc)
 
 # qbe-gen-prims: generate the C prim_<F> shims (vm/qbe_prims_gen.{h,c}) and the
 # Shen prim-name table (shen/qbe-prim-info.shen) from the single source of
@@ -223,7 +226,7 @@ qberun: qbe-tool qbe-gen vm/qberun.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_
 	@T=$$(mktemp -d /tmp/qberun.build.XXXXXX) && \
 	vendor/qbe/obj/qbe -t amd64_sysv -o $$T/globals.s globals.qbe && \
 	$(COSMOAS)/x86_64-linux-cosmo-as  -o $$T/globals.o $$T/globals.s && \
-	x86_64-unknown-cosmo-cc -Wall -Wextra -O2 -I vm -DZINCTEST -o $$T/qberun \
+	$(COSMO_CC) -Wall -Wextra -O2 -I vm -DZINCTEST -o $$T/qberun \
 		vm/qberun.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c $$T/globals.o -lm && \
 	cp $$T/qberun qberun && chmod 755 qberun; \
 	st=$$?; rm -rf $$T; exit $$st
