@@ -207,11 +207,24 @@
   N Code -> (trap-error (do (lower N Code (value qbe-all-names)) true) (lambda E false)))
 
 \* Initial skipped set = candidates that fail to lower (cur/trap-error). *\
+\* Plus the REGA blacklist: large HM-typechecker closures that the QBE
+   compiler (vendor/qbe, rega.c register allocation) cannot assemble
+   (Assertion `x != -1` at rega.c:571/586 on wide phi live-ranges).  Both the
+   shen.-prefixed and bare aliases are candidates, so blacklist both forms.
+   qbe-prune then drops them and any transitive callers. *\
+(set qbe-rega-blacklist
+  [shen.tc-infer-lambda shen.tc-infer-if shen.tc-infer-bool-op
+   shen.tc-type-pat-cons2 shen.tc-type-pat-list shen.tc-hm-one-clause
+   tc-infer-lambda tc-infer-if tc-infer-bool-op
+   tc-type-pat-cons2 tc-type-pat-list tc-hm-one-clause])
+
 (define qbe-skipped0 { (list (list symbol klambda)) --> (list symbol) }
   [] -> []
-  [[N Code] | R] -> (if (qbe-lowerable? N Code)
-                        (qbe-skipped0 R)
-                        (cons N (qbe-skipped0 R))))
+  [[N Code] | R] ->
+    (if (or (element? N (value qbe-rega-blacklist))
+            (not (qbe-lowerable? N Code)))
+        (cons N (qbe-skipped0 R))
+        (qbe-skipped0 R)))
 
 \* Fixed point: repeatedly add any candidate that (transitively) calls a
    skipped closure, until stable. *\

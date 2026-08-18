@@ -140,7 +140,7 @@
   N Acc -> (let D (qbe-hex-digit (mod N 16))
              (if (< N 16) (cn D Acc) (qbe-hex-h (div N 16) (cn D Acc)))))
 (define qbe-hex-digit { number --> string }
-  N -> (if (< N 10) (str N) (cn (n->string (+ 87 N)))))
+  N -> (if (< N 10) (str N) (n->string (+ 87 N))))
 
 (define qbe-pad-left { number --> string --> string --> string }
   N P S -> (if (>= (qbe-strlen S) N) S (qbe-pad-left N P (cn P S))))
