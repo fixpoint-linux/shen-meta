@@ -140,7 +140,7 @@ vm/*.c ──clang -Xclang -ast-dump=json──▶ extract.py ──CSV──▶
 - **Location:** new `tools/gc-verify/` directory — keeps the clang/soufflé dep
   tree out of the main cosmocc build.
 - **Build integration:** opt-in `make gc-verify` target. NOT added to
-  `make`/`make test`/`make test-debug`/`make run-bundle`. Mirrors the existing
+  `make`/`make test`/`make run-bundle`. Mirrors the existing
   `--gc-*` debug-flag opt-in convention.
 
 ## Fact schema (CSV → Soufflé)

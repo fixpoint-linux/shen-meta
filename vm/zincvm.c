@@ -664,29 +664,11 @@ static void vm_throw(const char *msg) {
 /* Type-error in a primitive.  Primary ownership is the Shen safe-wrapper layer
    (shen/primitives.shen): those wrappers validate args and raise a catchable
    simple-error before the raw primitive is ever called.  This C-level routing is
-   therefore only DEFENSE-IN-DEPTH, enabled solely in debug builds (ZINCVM_DEBUG)
+   therefore only DEFENSE-IN-DEPTH, enabled solely in debug builds
    so that raw/%%-style direct calls into a primitive are still catchable while
    developing.  In release builds the wrapper is the contract: a primitive that
    reaches here prints and returns -1 (a hard, non-catchable VM error), which is
    fine because the wrapper never forwards bad input. */
-#ifdef ZINCVM_DEBUG
-#define PRIM_TYPE_ERROR(msg) \
-    do { \
-        if (vm_catch_chain && vm_catch_chain->in_trap_error) \
-            vm_throw(msg); \
-        fprintf(stderr, "runtime: %s\n", msg); \
-        return -1; \
-    } while (0)
-#else
-/* Release: the Shen safe-wrapper layer is the sole owner of argument
-   validation, and static call sites from the proven type-safe interpreter
-   never pass bad types.  Expanding to a bare ((void)0) makes GCC -O2
-   eliminate the enclosing `if (cond) PRIM_TYPE_ERROR(...)` entirely — no
-   comparison, no type check, no runtime cost.  Only the always-on throw
-   sites (simple-error, fail, apply/appterm non-callable, env_pop, eval-kl)
-   remain, since they are not primitive type guards. */
-#define PRIM_TYPE_ERROR(msg) ((void)0)
-#endif
 
 /* alarm_jmp and test_timed_out moved to zinctest.c (test binary) */
 
@@ -935,7 +917,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
     case 'a':
         if (strcmp(name, "absvector") == 0) {
             Value a = va_pop(stack);
-            if (a.tag != VAL_NUMBER || a.number < 0) PRIM_TYPE_ERROR("absvector bad size");
             *acc = val_vector((int)a.number); return 0;
         }
         if (strcmp(name, "absvector?") == 0) {
@@ -943,9 +924,7 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         }
         if (strcmp(name, "address->") == 0) {
             Value vec = va_pop(stack), idx = va_pop(stack), val = va_pop(stack);
-            if (vec.tag != VAL_VECTOR || idx.tag != VAL_NUMBER) PRIM_TYPE_ERROR("address-> bad types");
             int i = (int)idx.number;
-            if (i < 0 || i >= vec.vector.len) PRIM_TYPE_ERROR("address-> OOB");
             vec.vector.data[i] = val;
             if (vec.vector.data &&
                 gc_in_oldgen(vec.vector.data) &&
@@ -1078,7 +1057,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         }
         if (strcmp(name, "close") == 0) {
             Value s = va_pop(stack);
-            if (s.tag != VAL_STREAM) PRIM_TYPE_ERROR("close on non-stream");
             if (s.stream.is_string) {
                 int idx = (int)(intptr_t)s.stream.file - 1;
                 if (idx < 0 || idx >= n_string_streams) { fprintf(stderr, "runtime: bad string stream idx\n"); return -1; }
@@ -1092,7 +1070,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         /* c-strlen: O(1) string length (kills the per-char trap-error loop). */
         if (strcmp(name, "c-strlen") == 0) {
             Value a = va_pop(stack);
-            if (a.tag != VAL_STRING) PRIM_TYPE_ERROR("c-strlen on non-string");
             *acc = val_number(a.str.len); return 0;
         }
         /* char-code: byte at index as integer (no 1-char string allocation). */
@@ -1219,7 +1196,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         if (strcmp(name, "emptylist") == 0) {
             Value a = va_pop(stack);
             if (a.tag == VAL_NUMBER && a.number == 0) { *acc = val_nil(); return 0; }
-            if (a.tag != VAL_NUMBER || a.number != 0) PRIM_TYPE_ERROR("emptylist on non-zero");
         }
         /* empty?: () <-> VAL_NIL.  Any non-nil value is not empty. */
         if (strcmp(name, "empty?") == 0) {
@@ -1232,7 +1208,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
     case 'f':
         if (strcmp(name, "fst") == 0) {
             Value a = va_pop(stack);
-            if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("fst on non-cons");
             *acc = *a.cons.car; return 0;
         }
         if (strcmp(name, "function?") == 0) {
@@ -1259,15 +1234,9 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         }
         if (strcmp(name, "get-time") == 0) {
             Value mode = va_pop(stack);
-            if (mode.tag != VAL_SYMBOL) PRIM_TYPE_ERROR("get-time requires symbol");
             if (strcmp(mode.sym.name, "unix") == 0 || strcmp(mode.sym.name, "real") == 0)
                 { *acc = val_number((long)time(NULL)); return 0; }
             if (strcmp(mode.sym.name, "run") == 0) { *acc = val_number((long)clock()); return 0; }
-#ifdef ZINCVM_DEBUG
-            if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                vm_throw("get-time unknown mode");
-            fprintf(stderr, "runtime: unknown get-time mode '%s'\n", mode.sym.name); return -1;
-#endif
         }
         break;
 
@@ -1276,12 +1245,10 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         if (strcmp(name, "hd") == 0) {
             Value a = va_pop(stack);
             if (a.tag == VAL_NIL) { *acc = val_nil(); return 0; }
-            if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("hd on non-cons");
             *acc = *a.cons.car; return 0;
         }
         if (strcmp(name, "hdstr") == 0) {
             Value a = va_pop(stack);
-            if (a.tag != VAL_STRING || a.str.len < 1) PRIM_TYPE_ERROR("hdstr on empty/non-string");
             *acc = val_string_from(&a, 0, 1); return 0;
         }
         break;
@@ -1290,7 +1257,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
     case 'i':
         if (strcmp(name, "intern") == 0) {
             Value a = va_pop(stack);
-            if (a.tag != VAL_STRING) PRIM_TYPE_ERROR("intern on non-string");
             char buf[256]; int n = a.str.len < 255 ? a.str.len : 255;
             memcpy(buf, a.str.data, n); buf[n] = '\0';
             *acc = val_symbol(buf); return 0;
@@ -1314,7 +1280,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
     case 'n':
         if (strcmp(name, "n->string") == 0) {
             Value a = va_pop(stack);
-            if (a.tag != VAL_NUMBER) PRIM_TYPE_ERROR("n->string on non-number");
             char buf[2] = { (char)a.number, '\0' };
             *acc = val_string(buf, 1); return 0;
         }
@@ -1344,24 +1309,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
     case 'o':
         if (strcmp(name, "open") == 0) {
             Value path = va_pop(stack), dir = va_pop(stack);
-#ifdef ZINCVM_DEBUG
-            if (path.tag != VAL_STRING || dir.tag != VAL_SYMBOL) {
-                if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                    vm_throw("open bad types");
-                fprintf(stderr, "runtime: open bad types — path.tag=%d dir.tag=%d", path.tag, dir.tag);
-                if (path.tag == VAL_SYMBOL) fprintf(stderr, " path='%s'", path.sym.name);
-                if (path.tag == VAL_MARK) fprintf(stderr, " path=MARK");
-                if (dir.tag == VAL_STRING) fprintf(stderr, " dir='%.*s'", dir.str.len, dir.str.data);
-                fprintf(stderr, " stack_remaining=%d\n", stack->len);
-                for (int si = stack->len - 1; si >= 0 && si >= stack->len - 5; si--) {
-                    fprintf(stderr, "  stack[%d]: tag=%d", si, stack->data[si].tag);
-                    if (stack->data[si].tag == VAL_SYMBOL) fprintf(stderr, " '%s'", stack->data[si].sym.name);
-                    if (stack->data[si].tag == VAL_MARK) fprintf(stderr, " MARK");
-                    fprintf(stderr, "\n");
-                }
-                return -1;
-            }
-#endif
             char pb[256]; int n = path.str.len < 255 ? path.str.len : 255;
             memcpy(pb, path.str.data, n); pb[n] = '\0';
             if (strcmp(dir.sym.name, "in") == 0) {
@@ -1377,11 +1324,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
                 if (!f) { *acc = val_boolean(false); return 0; }
                 *acc = val_stream_out(f); return 0;
             }
-#ifdef ZINCVM_DEBUG
-            if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                vm_throw("open invalid direction");
-            fprintf(stderr, "runtime: open direction must be in or out\n"); return -1;
-#endif
         }
         break;
 
@@ -1389,13 +1331,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
     case 'p':
         if (strcmp(name, "pos") == 0) {
             Value a1 = va_pop(stack), a2 = va_pop(stack);
-#ifdef ZINCVM_DEBUG
-            if (a1.tag != VAL_STRING || a2.tag != VAL_NUMBER) {
-                if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                    vm_throw("pos on bad types");
-                fprintf(stderr, "runtime: pos on bad types\n"); return -1;
-            }
-#endif
             int pl = (int)a2.number;
             if (pl < 0 || pl >= a1.str.len) {
                 if (vm_catch_chain && vm_catch_chain->in_trap_error)
@@ -1410,13 +1345,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
     case 'r':
         if (strcmp(name, "read-byte") == 0) {
             Value s = va_pop(stack);
-#ifdef ZINCVM_DEBUG
-            if (s.tag != VAL_STREAM || !s.stream.is_input) {
-                if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                    vm_throw("read-byte on non-input");
-                fprintf(stderr, "runtime: read-byte on non-input\n"); return -1;
-            }
-#endif
             if (s.stream.is_string) {
                 int idx = (int)(intptr_t)s.stream.file - 1;
                 if (idx < 0 || idx >= n_string_streams) { return -1; }
@@ -1431,7 +1359,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         }
         if (strcmp(name, "read-file-as-string") == 0) {
             Value path = va_pop(stack);
-            if (path.tag != VAL_STRING) PRIM_TYPE_ERROR("read-file-as-string on non-string");
             char *p = strndup(path.str.data, path.str.len);
             FILE *f = fopen(p, "r");
             free(p);
@@ -1514,12 +1441,10 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         }
         if (strcmp(name, "set") == 0) {
             Value sym = va_pop(stack), v = va_pop(stack);
-            if (sym.tag != VAL_SYMBOL) PRIM_TYPE_ERROR("set requires symbol");
             value_set(sym.sym.name, v); *acc = v; return 0;
         }
         if (strcmp(name, "string->n") == 0) {
             Value a = va_pop(stack);
-            if (a.tag != VAL_STRING) PRIM_TYPE_ERROR("string->n on non-string");
             *acc = val_number(a.str.len > 0 ? (unsigned char)a.str.data[0] : 0); return 0;
         }
         if (strcmp(name, "shen.fail!") == 0) {
@@ -1532,7 +1457,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         }
         if (strcmp(name, "snd") == 0) {
             Value a = va_pop(stack);
-            if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("snd on non-cons");
             *acc = *a.cons.cdr; return 0;
         }
         /* substring: zero-copy view Str[Start..Start+Len), clamped. */
@@ -1541,7 +1465,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             Value st = va_pop(stack);     /* start */
             Value ln = va_pop(stack);     /* len */
             int start = (int)st.number, len = (int)ln.number;
-            if (s.tag != VAL_STRING) PRIM_TYPE_ERROR("substring on non-string");
             if (start < 0) start = 0;
             if (start > s.str.len) start = s.str.len;
             if (len < 0) len = 0;
@@ -1605,7 +1528,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         if (strcmp(name, "tl") == 0) {
             Value a = va_pop(stack);
             if (a.tag == VAL_NIL) { *acc = val_nil(); return 0; }
-            if (a.tag != VAL_CONS) PRIM_TYPE_ERROR("tl on non-cons");
             *acc = *a.cons.cdr; return 0;
         }
         if (strcmp(name, "trap-error") == 0) {
@@ -1613,7 +1535,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             volatile Value handler = va_pop(stack);
             gc_root_push_value_volatile(&body);
             gc_root_push_value_volatile(&handler);
-            if (handler.tag != VAL_LAMBDA) PRIM_TYPE_ERROR("trap-error handler not fn");
             CatchFrame cf;
             cf.parent = vm_catch_chain;
             cf.in_trap_error = 0;
@@ -1663,7 +1584,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         }
         if (strcmp(name, "tlstr") == 0) {
             Value a = va_pop(stack);
-            if (a.tag != VAL_STRING || a.str.len < 1) PRIM_TYPE_ERROR("tlstr on empty/non-string");
             *acc = val_string_from(&a, 1, a.str.len - 1); return 0;
         }
         break;
@@ -1672,14 +1592,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
     case 'v':
         if (strcmp(name, "value") == 0) {
             Value a = va_pop(stack);
-#ifdef ZINCVM_DEBUG
-            if (a.tag != VAL_SYMBOL) {
-                if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                    vm_throw("value on non-symbol");
-                fprintf(stderr, "runtime: value on non-symbol\n");
-                return -1;
-            }
-#endif
             *acc = value_get(a.sym.name); return 0;
         }
         if (strcmp(name, "variable?") == 0) {
@@ -1706,18 +1618,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         if (strcmp(name, "write-byte") == 0) {
             Value byte = va_pop(stack);
             Value s    = va_pop(stack);
-#ifdef ZINCVM_DEBUG
-            if (s.tag != VAL_STREAM || s.stream.is_input) {
-                if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                    vm_throw("write-byte on non-output");
-                fprintf(stderr, "runtime: write-byte on non-output\n"); return -1;
-            }
-            if (byte.tag != VAL_NUMBER) {
-                if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                    vm_throw("write-byte requires number");
-                fprintf(stderr, "runtime: write-byte requires number\n"); return -1;
-            }
-#endif
             fputc((int)byte.number, s.stream.file);
             if (s.stream.file == stdout) fflush(stdout);
             *acc = val_number(byte.number); return 0;
@@ -1728,29 +1628,24 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
     case '+':
         if (strcmp(name, "+") == 0) {
             Value a1 = va_pop(stack), a2 = va_pop(stack);
-            if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("+ on non-numbers");
             *acc = val_number(a1.number + a2.number); return 0;
         }
         break;
     case '-':
         if (strcmp(name, "-") == 0) {
             Value a1 = va_pop(stack), a2 = va_pop(stack);
-            if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("- on non-numbers");
             *acc = val_number(a1.number - a2.number); return 0;
         }
         break;
     case '*':
         if (strcmp(name, "*") == 0) {
             Value a1 = va_pop(stack), a2 = va_pop(stack);
-            if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("* on non-numbers");
             *acc = val_number(a1.number * a2.number); return 0;
         }
         break;
     case '/':
         if (strcmp(name, "/") == 0) {
             Value a1 = va_pop(stack), a2 = va_pop(stack);
-            if (a1.tag != VAL_NUMBER || a2.tag != VAL_NUMBER) PRIM_TYPE_ERROR("/ on non-numbers");
-            if (a2.number == 0) PRIM_TYPE_ERROR("division by zero");
             *acc = val_number(a1.number / a2.number); return 0;
         }
         break;
@@ -1793,21 +1688,7 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
         }
         if (strcmp(name, "<-address") == 0) {
             Value vec = va_pop(stack), idx = va_pop(stack);
-#ifdef ZINCVM_DEBUG
-            if (vec.tag != VAL_VECTOR || idx.tag != VAL_NUMBER) {
-                if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                    vm_throw("<-address bad types");
-                fprintf(stderr, "runtime: <-address bad types\n"); return -1;
-            }
-#endif
             int i = (int)idx.number;
-#ifdef ZINCVM_DEBUG
-            if (i < 0 || i >= vec.vector.len) {
-                if (vm_catch_chain && vm_catch_chain->in_trap_error)
-                    vm_throw("<-address OOB");
-                fprintf(stderr, "runtime: <-address OOB\n"); return -1;
-            }
-#endif
             *acc = vec.vector.data[i]; return 0;
         }
         break;

@@ -104,8 +104,9 @@ This design was chosen through a recorded chain of decisions:
 - **Error model** (`vm/zincvm.h:55-60`, `zincvm.c:358-366`): per-catch-site linked
   list of stack-allocated `CatchFrame`s; `vm_throw` writes `error_val` and
   `longjmp`s to chain head. `trap-error`/`simple-error`/`apply-non-callable`/
-  `env_pop`/`eval-kl` throw sites stay always-on; primitive type guards are
-  `PRIM_TYPE_ERROR`, **compiled out in release** (`zincvm.c:385-393`).
+  `env_pop`/`eval-kl` throw sites stay always-on; the C-level primitive type
+  guards (`PRIM_TYPE_ERROR`) were removed entirely (ownership is the Shen safe
+  wrappers).
 - **Typing today** (`shen/types.shen`): `zinc-value` (`:44-118`) and `zinc-code`
   (`:124-208`) are real structural datatypes. `klambda` (`:19-42`) is **degenerate**.
   `primitive?` (`:1-7`) is the single source of truth; `bytecode?` (`:120-122`)
@@ -662,8 +663,9 @@ doesn't block the engineering. Only after Stage 1 + Stage 3 both pass attempt
 differential testing.
 
 **Verified-reference + fast-runtime pairing:** C VM stays the fast production runtime;
-QBE path is the proven reference. Reasons: (a) the C VM's compiled-out
-`PRIM_TYPE_ERROR` (`zincvm.c:393`) is faster than a shim-routed QBE path; (b) the C VM
+QBE path is the proven reference. Reasons: (a) the C VM (no primitive type
+guards — those were removed, owned by the Shen safe wrappers) is faster than a
+shim-routed QBE path; (b) the C VM
 already passes the full self-hosting + GC stress suite; (c) keeping the C VM default
 means no regression risk. QBE-becomes-default deferred to Stage 6+ if Stage 5 shows
 parity.

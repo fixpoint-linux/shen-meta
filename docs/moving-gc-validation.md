@@ -133,7 +133,7 @@ See Hazard 3 above. The key risk is `Value` locals in callee-saved registers bei
 - `trap-error` handler (line 997): `volatile Value handler` — but `handler` is set at line 969 before `setjmp`, read at 997-1003 after `longjmp`. Make it `volatile`.
 - `eval-kl` (line 1185): `volatile Value result` — set before `setjmp`, read after `longjmp`.
 - `run_test_timeout` (line 1787-1788): `Instr *code` is GC-managed. Make `volatile Instr *code`.
-- Test: `make test && make test-debug` — should pass (volatile doesn't change behavior with Boehm).
+- Test: `make test` — should pass (volatile doesn't change behavior with Boehm).
 
 **Step 0.2: Add a `scan_value(Value *v)` function.**
 - File: `vm/zincvm.c`, new function before `vm_exec_env`.
@@ -199,8 +199,7 @@ See Hazard 3 above. The key risk is `Value` locals in callee-saved registers bei
 - After `longjmp`, re-validate any GC pointers by checking they're in the current semi-space (post-swap). If not, they're stale and must be re-read from a root.
 
 **Step 1.6: Test.**
-- `make test` (34 release tests) — all must pass.
-- `make test-debug` (39 debug tests) — all must pass.
+- `make test` (34 tests) — all must pass.
 - `make run-bundle` (self-hosting tests) — all must pass.
 - Add a GC stress test: allocate 100K cons cells in a tight loop, verify no corruption.
 - Add a forwarding-pointer test: allocate, trigger GC, verify moved objects are accessible via old pointers (forwarding).

@@ -45,7 +45,7 @@ Goals, in priority order:
 ## Phased implementation
 
 ### Phase 0 — Preparation (no GC change)
-Gate: `make test && make test-debug` still pass on Boehm.
+Gate: `make test` still passes on Boehm.
 
 - [ ] Add `volatile` to `Value` locals read after `longjmp`: `handler`
       (`trap-error`, ~line 969), `result` (`eval-kl`, ~line 1185),
@@ -160,7 +160,7 @@ lifecycle as dirty_vectors.  Fixed 256-byte bitset (GLOBAL_TABLE_MAX=2048 bits,
 no overflow path).  Instrumented via `gc_dirty_globals_fired` (0→1 transitions)
 and `gc_dirty_globals_scanned` (per-scavenge scan count).
 
-**Ordered steps (each gated by `make test && make test-debug && make run-bundle`):
+**Ordered steps (each gated by `make test && make run-bundle`):
 ** 1) [DONE] Add `NURSERY`+region+predicates (no behavior change); 2) [DONE] route
 `gc_alloc` to the nursery bump + `gc_alloc_oldgen` for large; 3) [DONE] teach
 `collect()` to evacuate nursery pages; 4) [DONE via Step 3] implement
@@ -194,9 +194,8 @@ old-gen full `collect()` now fire on independent, pre-emptive triggers:
   `gc_reactive_scavenge_count`, `gc_full_collect_count`. Test 7 in
   `gc_nursery_tests()` (zinctest) burst-allocates 30K dead objects and asserts
   the pre-emptive trigger fires while the reactive path never does. Probe
-  location is informational: under `ZINCVM_DEBUG` the conservative stack scan
-  pins more nursery pages, so the nursery may legitimately degrade to one-shot
-  promotion (probe in old-gen) — accepted, not a failure.
+  location is informational (the `-O0 -g` `zinctest-gc` build) and not a failure
+  criterion.
 
 **Top risks:** (1) `scavenge_to_space` — handled by the no-flip pin-in-place
 design: promoted pages go to the live old-gen `current_space`, never

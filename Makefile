@@ -1,10 +1,7 @@
-.PHONY: all vm test test-debug debug bundle pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test
+.PHONY: all vm test bundle pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
-# Debug build enables ZINCVM_DEBUG: C primitives route type-errors through
-# vm_throw as defense-in-depth (normally owned by the Shen safe wrappers).
-DCFLAGS = -Wall -Wextra -O0 -g -DZINCVM_DEBUG -I vm
 
 all: zincvm zincdec zinctest
 
@@ -13,7 +10,7 @@ all: zincvm zincdec zinctest
 # land in the repo; only the native x86_64 ELF (.com.dbg) is copied out as the
 # final binary.  Leaves the working dir unpolluted by build products.
 
-# $1 = final binary path (zincvm / zincvm-debug / zincdec), $2 = extra CFLAGS
+# $1 = final binary path (zincvm / zincdec / zinctest ...), $2 = extra CFLAGS
 define compile-vm
 	@T=$$(mktemp -d /tmp/$(notdir $(1)).build.XXXXXX) && \
 	cosmocc $(2) -o $$T/out.ape $(3) && \
@@ -24,12 +21,6 @@ endef
 zincvm: vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
 	$(call compile-vm,$@,$(CFLAGS),vm/zincvm.c vm/gc.c)
 
-zincvm-debug: vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
-	$(call compile-vm,$@,$(DCFLAGS),vm/zincvm.c vm/gc.c)
-
-debug: zincvm-debug
-	@echo "Built ./zincvm-debug (ZINCVM_DEBUG: C-level type-error defense-in-depth active)"
-
 zincvm-asan: vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
 	$(call compile-vm,$@,$(CFLAGS) -O0 -g -fsanitize=undefined,vm/zincvm.c vm/gc.c)
 
@@ -39,26 +30,26 @@ zincdec: vm/zincdec.c
 zinctest: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
 	$(call compile-vm,$@,$(CFLAGS) -DZINCTEST,vm/zinctest.c vm/zincvm.c vm/gc.c)
 
-zinctest-debug: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
-	$(call compile-vm,$@,$(DCFLAGS) -DZINCTEST,vm/zinctest.c vm/zincvm.c vm/gc.c)
+# GC-observable test binary: -O0 -g with no optimization so GC diag flags
+# (--gc-verbose etc.) show addresses/backtraces usefully.  The guard-enabled
+# debug build was removed, so this is a plain -O0 -g build of the same code.
+zinctest-gc: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
+	$(call compile-vm,$@,-Wall -Wextra -O0 -g -DZINCTEST -I vm,vm/zinctest.c vm/zincvm.c vm/gc.c)
 
 zinctest-asan: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
 	$(call compile-vm,$@,$(CFLAGS) -O0 -g -fsanitize=undefined -DZINCTEST,vm/zinctest.c vm/zincvm.c vm/gc.c)
 
 clean:
-	rm -f zincvm zincvm-debug zincdec zincvm-asan zinctest zinctest-debug zinctest-asan *.csexp globals.csexp
+	rm -f zincvm zincdec zincvm-asan zinctest zinctest-gc zinctest-asan *.csexp globals.csexp
 
 test: zinctest
 	./zinctest
 
-test-debug: zinctest-debug
-	./zinctest-debug
-
-# GC debugging tooling helper.  Builds the existing zinctest-debug target
-# (-O0 -g -DZINCVM_DEBUG) and lists the opt-in observability flags that
-# zinctest/zincvm accept at runtime.  No new compile target; no semantics
-# change — this is pure per-run diagnostics.
-gcdebug: zinctest-debug
+# GC debugging tooling helper.  Builds the zinctest-gc target (-O0 -g, no
+# ZINCVM_DEBUG — the guard-enabled debug build was removed) and lists the
+# opt-in observability flags that zinctest/zincvm accept at runtime.
+# No semantics change — this is pure per-run diagnostics.
+gcdebug: zinctest-gc
 	@echo ""
 	@echo "GC debug tooling (opt-in argv flags; all write to stderr):"
 	@echo "  --gc-verbose         per-collection stats: [GC NURSERY/FULL #N] trigger/shadow_depth/live/free"
@@ -74,12 +65,12 @@ gcdebug: zinctest-debug
 	@echo "  --trace <name>       (existing) trace a closure's bytecode execution"
 	@echo ""
 	@echo "Example: ./zinctest globals.csexp --gc-verbose --gc-check-closures --gc-dump-roots"
-	@echo "         ./zinctest-debug globals.csexp --gc-verbose"
+	@echo "         ./zinctest-gc globals.csexp --gc-verbose"
 
 test-asan: zinctest-asan
 	./zinctest-asan
 
-gate: test test-debug test-asan
+gate: test test-asan
 
 asan: zinctest-asan
 	./zinctest-asan globals.csexp

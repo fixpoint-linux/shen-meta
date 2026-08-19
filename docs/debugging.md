@@ -39,16 +39,15 @@ observability, no GC correctness/semantics change. Release build and default
   `gc_check_closure(&(cl), where)` (was a no-op); call sites `APPLY` (~1752) and
   `APPTERM` (~1859) now invoke the real check. Flag scan added to both `main()`
   argv loops.
-- `Makefile` — `gcdebug` convenience target (no new compile target; uses the
-  existing `zinctest-debug`).
+- `Makefile` — `gcdebug` convenience target (uses `zinctest-gc`, a plain `-O0 -g`
+  build; the guard-enabled `zinctest-debug` was removed).
 
 ### Build / run
 
 ```sh
 make                      # release (zincvm, zincdec, zinctest)
-make debug                # -O0 -g -DZINCVM_DEBUG
-make test                 # 34/34 built-in tests (release, unaffected)
-make gcdebug              # prints available flags
+make test                 # 34/34 built-in tests
+make gcdebug              # builds zinctest-gc and prints available flags
 
 # Probe build (runtime .kl load experiment):
 cosmocc -Wall -Wextra -O2 -I vm -DZINCTEST -DZINC_TEST_OS_LOAD \
@@ -168,7 +167,7 @@ the live set still above the threshold.
 **Verification:** cumulative 22-file audit at 256MB → **0/1111 fail**
 (46s, no perf regression); same with `--gc-verify-live-from 2000` → 536
 verifier passes, all `bad=0`; 1GB → 0/1111; `make test` 34/34;
-`make test-debug` 39/39; `make run-bundle` green (self-hosting + GC
+`make run-bundle` green (self-hosting + GC
 stress + retention).
 
 ### Bug 2 — stale-scan localization (commit `---`) [historical: the C-stack attribution below was a red herring — the miss was heap-internal, see the RESOLVED section above]

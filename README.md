@@ -51,7 +51,7 @@ make test     # run 34 built-in bytecode tests
 make pipeline # compile (+ 1 2) through full pipeline
 make bundle   # compile bundle .shen via shen->kl → globals.csexp
 make run-bundle  # run C VM with self-hosting bundle
-make gate     # test + test-debug + test-asan
+make gate     # test + test-asan
 ```
 
 Requires [shen-scheme](https://github.com/tizoc/shen-scheme) (Shen 41.2 on Chez Scheme) at `vendor/shen-scheme/` (used to bootstrap the serializer; the shipped bundle is compiled by our own `shen->kl`).
@@ -159,7 +159,7 @@ The reduced bundle contains zero Shen OS `.kl` closures. Every bytecode closure 
 
 ## Status
 
-- [x] 34 built-in VM tests (arithmetic, types, closures, error handling, I/O, trap-error routing; 39 in `ZINCVM_DEBUG`)
+- [x] 34 built-in VM tests (arithmetic, types, closures, error handling, I/O, trap-error routing)
 - [x] ~295 bundled closures loaded and executing (reduced self-contained bundle; 340 compiled by the meta-interpreter)
 - [x] **Self-hosting proven**: eval-kl chain returns `3` for `(+ 1 2)` — no C bypass
 - [x] Custom moving generational GC (nursery + old-gen, precise roots, write barrier) — 18 nursery scavenge/retention tests pass

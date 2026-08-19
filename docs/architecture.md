@@ -7,9 +7,7 @@ reduced self-contained bundle.
 
 ```sh
 make              # build C VM (release; links Boehm GC via -lgc)
-make test         # run 34 built-in tests (release)
-make debug        # build C VM with -DZINCVM_DEBUG (C-level type-error defense active)
-make test-debug   # run 39 built-in tests (adds debug-only trap-error tests 29-32b)
+make test         # run 34 built-in tests
 make pipeline     # compile (+ 1 2) through full pipeline
 make bundle       # serialize all safe wrappers → globals.csexp
 make run-bundle   # run C VM with globals.csexp (self-hosting tests)
@@ -62,11 +60,10 @@ Consequence — call sites split into two kinds:
 
 `[global X]` → `safe.X` only fires on the dynamic path (a primitive used *as a
 value*, higher-order, or explicit `(function X)`). Normal direct calls use
-`[prim X]`. The C primitives' own type checks are therefore defense-in-depth and
-are `ZINCVM_DEBUG`-only. In RELEASE they are **compiled out entirely** — the
-`PRIM_TYPE_ERROR(msg)` macro expands to `((void)0)`, so GCC -O2 eliminates the
-enclosing `if (cond) PRIM_TYPE_ERROR(...)` (no comparison, no type check, no
-runtime cost). This is safe ONLY for a type-safe bundle.
+`[prim X]`. The C primitives have NO runtime type guards (the guard-enabled
+`ZINCVM_DEBUG` build and its `PRIM_TYPE_ERROR` machinery were removed). Type
+validation is owned entirely by the Shen safe-wrapper layer. This is safe ONLY
+for a type-safe bundle.
 
 ## The reduced self-contained bundle (guard-free release VM)
 

@@ -2366,33 +2366,6 @@ int main(int argc, char **argv) {
         "g[10:s]trap-errorp)", 1);
     run_test("28. [get-time unix]",      "(ms[4:s]unixg[8:s]get-timep)", 1);
 
-#ifdef ZINCVM_DEBUG
-    /* C-primitive-level type errors inside trap-error being caught by the
-       handler.  These verify the DEFENSE-IN-DEPTH routing that is enabled
-       only in debug builds; in release builds the Shen safe wrappers own
-       these errors and the raw primitives return -1 (uncatchable) instead.
-       RTL: handler pushed FIRST (bottom), body pushed LAST (top). */
-    run_test("29. trap-error catches value on non-symbol",
-        "(mc(S[6:S]caughtv)"                           /* handler pushed FIRST */
-        "c(mn[2:n]42g[5:s]valuepv)"                   /* body pushed LAST */
-        "g[10:s]trap-errorp)", 1);
-    run_test("30. trap-error catches pos on bad types",
-        "(mc(S[6:S]caughtv)"                           /* handler pushed FIRST */
-        "c(mS[3:S]badS[5:S]hellog[3:s]pospv)"        /* body pushed LAST */
-        "g[10:s]trap-errorp)", 1);
-    run_test("31. trap-error catches write-byte on non-output",
-        "(mc(S[6:S]caughtv)"                           /* handler pushed FIRST */
-        "c(mn[2:n]42n[2:n]65g[10:s]write-bytepv)"    /* body pushed LAST */
-        "g[10:s]trap-errorp)", 1);
-    run_test("32. trap-error catches <-address bad types",
-        "(mc(S[6:S]caughtv)"                           /* handler pushed FIRST */
-        "c(mn[1:n]0n[1:n]0g[9:s]<-addresspv)"        /* body pushed LAST */
-        "g[10:s]trap-errorp)", 1);
-    run_test("32b. trap-error catches + on non-numbers",
-        "(mc(S[6:S]caughtv)"                           /* handler pushed FIRST */
-        "c(mS[1:S]xn[1:n]1g[1:s]+pv)"                /* body: (+ 1 "x") */
-        "g[10:s]trap-errorp)", 1);
-#endif
 
     /* === appterm ('t' opcode) tests ===
        Stack layout for appterm: [mark, argN..arg1, function]
@@ -2424,10 +2397,7 @@ int main(int argc, char **argv) {
        but no pushmark; arg gets collected, then stack empty → error    */
     run_test("38. appterm: missing mark", "(n[2:n]42c(a[1:n]0v)t)", 0);
 
-#ifdef ZINCVM_DEBUG
-    printf("=== All 39 tests done ===\n");
-#else
     printf("=== All 34 tests done ===\n");
-#endif
+
     return 0;
 }

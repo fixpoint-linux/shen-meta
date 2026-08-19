@@ -19,17 +19,16 @@ rescue `setjmp(vm_error_jmp)` at the top of `vm_exec_env`.
 - `simple-error` always `vm_throw`s to the current chain head. Inside a trap-error
   BODY the frame's `in_trap_error=1`, so type-error primitives throw too.
 
-### C-level type-error routing is DEFENSE-IN-DEPTH
+### C-level primitive type guards removed
 
-Compiled only in `ZINCVM_DEBUG` builds (the `PRIM_TYPE_ERROR` macro + inline
-guards). Primary ownership of catchable runtime errors is the Shen safe-wrapper
-layer (`shen/primitives.shen`): each `safe.X` validates args and raises a
-catchable `simple-error` before the raw primitive is called. In RELEASE
-`PRIM_TYPE_ERROR` expands to `((void)0)` so the guards compile out entirely. The
-always-on throw sites are those NOT protected by a safe wrapper and not type
-guards: `simple-error`, `fail`, `apply`/`appterm` non-callable + too-many-args,
-`env_pop`, `pos` OOB inside `trap-error`, and eval-kl's catch. Debug-only tests
-29-32b verify the C-primitive-level defense path.
+The `ZINCVM_DEBUG` build (with the `PRIM_TYPE_ERROR` macro + inline guards) was
+removed — the full OS bundle that needed it is gone. Primary ownership of
+catchable runtime type errors is the Shen safe-wrapper layer
+(`shen/primitives.shen`): each `safe.X` validates args and raises a catchable
+`simple-error` before the raw primitive is called. The always-on throw sites
+(not safe-wrapper-protected, not type guards) are: `simple-error`, `fail`,
+`apply`/`appterm` non-callable + too-many-args, `env_pop`, `pos` OOB inside
+`trap-error`, and eval-kl's catch.
 
 ### Other mechanisms
 

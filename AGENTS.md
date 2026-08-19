@@ -4,9 +4,9 @@
 
 ```sh
 make          # build C VM, zincdec, and zinctest (release; links Boehm GC via -lgc)
-make test     # build+run zinctest — 34 built-in bytecode tests (release)
-make debug    # build C VM with -DZINCVM_DEBUG (C-level type-error defense active)
-make test-debug # build+run zinctest-debug — 39 built-in tests (adds debug-only trap-error tests 29-32b)
+make test     # build+run zinctest — 34 built-in bytecode tests
+make gcdebug  # build zinctest-gc (-O0 -g) for GC observability flags
+make test-asan # build+run zinctest-asan (UBSan)
 make pipeline # compile (+ 1 2) through full pipeline
 make bundle   # serialize all safe wrappers → globals.csexp
 make run-bundle  # run zinctest with globals.csexp (self-hosting + GC stress tests)
@@ -17,7 +17,7 @@ make run-bundle  # run zinctest with globals.csexp (self-hosting + GC stress tes
 
 # ./zincvm with no args prints usage (tests moved to ./zinctest)
 ./zincvm                         # prints usage
-./zinctest                        # runs 34/39 built-in bytecode tests
+./zinctest                        # runs 34 built-in bytecode tests
 ./zinctest globals.csexp          # runs self-hosting + GC nursery + stress tests
 ```
 
@@ -67,16 +67,15 @@ Consequence — call sites split into two kinds:
 
 `[global X]` → `safe.X` only fires on the dynamic path (a primitive used *as a
 value*, higher-order, or explicit `(function X)`). Normal direct calls use
-`[prim X]`. The C primitives' own type checks are therefore defense-in-depth and
-are `ZINCVM_DEBUG`-only. In RELEASE they are **compiled out entirely** — the
-`PRIM_TYPE_ERROR(msg)` macro expands to `((void)0)`, so GCC -O2 eliminates the
-enclosing `if (cond) PRIM_TYPE_ERROR(...)` (no comparison, no type check, no
-runtime cost). This is safe ONLY for a type-safe bundle: the canonical bundle
-(`make bundle` → `globals.csexp`) is the **reduced self-contained interpreter**
-(meta-interpreter + safe-subset helpers), which never passes bad types. The full
-Shen OS is not serialized into a second bundle — it runs by loading its `.kl`
-files at **runtime** into the meta-interpreter via `interp-load-raw`
-(`./zincvm globals.csexp --repl`).
+`[prim X]`. The C primitives have NO runtime type guards (the guard-enabled
+`ZINCVM_DEBUG` build and its `PRIM_TYPE_ERROR` machinery were removed — the full
+OS bundle that needed them is gone). Type validation is owned entirely by the
+Shen safe-wrapper layer. This is safe ONLY for a type-safe bundle: the canonical
+bundle (`make bundle` → `globals.csexp`) is the **reduced self-contained
+interpreter** (meta-interpreter + safe-subset helpers), which never passes bad
+types. The full Shen OS is not serialized into a second bundle — it runs by
+loading its `.kl` files at **runtime** into the meta-interpreter via
+`interp-load-raw` (`./zincvm globals.csexp --repl`).
 
 Always-on throw sites that are NOT type guards and stay in release: `simple-error`,
 `fail`, `apply`/`appterm` non-callable + too-many-args, `env_pop`, `eval-kl` catch,
@@ -427,7 +426,7 @@ The old `./zincvm globals.csexp -d <name>` flag still works for quick inspection
   This is the #1 recurring bug pattern. See tests 27-32 for examples.
 - Built-in tests use `m` (pushmark) before args; mark ends up at stack bottom,
   not popped by `OP_APPLY` with `VAL_PRIM` (mark must be on top to be popped)
-- **Built-in tests**: 34 hand-written bytecode tests in `vm/zincvm.c` (release build; 39 in `ZINCVM_DEBUG`, which adds debug-only C-primitive trap-error tests 29-32b).
+- **Built-in tests**: 34 hand-written bytecode tests in `vm/zincvm.c`.
   Tests 1-32 exercise apply ('p'), tests 33-38 exercise appterm ('t').
   Built-in tests run without a bundle (`./zincvm`). Self-hosting tests
   (10) + GC stress run with bundle (`./zincvm globals.csexp`).
@@ -456,16 +455,15 @@ rescue `setjmp(vm_error_jmp)` at the top of `vm_exec_env`.
   and `setjmp(cf.buf)`. On the error path the frame is **unlinked first** so a
   `simple-error` raised inside a handler propagates to the enclosing frame.
 - `simple-error` always `vm_throw`s to the current chain head. Inside a trap-error
-  BODY the frame's `in_trap_error=1`, so type-error primitives throw too. **However,
-  C-level type-error routing is DEFENSE-IN-DEPTH, compiled only in `ZINCVM_DEBUG`
-  builds** (the `PRIM_TYPE_ERROR` macro + inline guards). Primary ownership is the
-  Shen safe-wrapper layer (`shen/primitives.shen`): each `safe.X` validates args and
-  raises a catchable `simple-error` before the raw primitive is called. In RELEASE
-  `PRIM_TYPE_ERROR` expands to `((void)0)` so the guards compile out entirely (see
-  "Design intent" above). The always-on throw sites are those NOT protected by a
-  safe wrapper and not type guards: `simple-error`, `fail`, `apply`/`appterm`
-  non-callable + too-many-args, `env_pop`, `pos` OOB inside `trap-error`, and
-  eval-kl's catch. Debug-only tests 29-32b verify the C-primitive-level defense path.
+  BODY the frame's `in_trap_error=1`, so a `simple-error` raised in the body throws.
+  **C-level primitive type guards were removed** (the `ZINCVM_DEBUG` build and its
+  `PRIM_TYPE_ERROR` machinery are gone — the full OS bundle that needed them is
+  removed). Primary ownership of catchable runtime type errors is the Shen
+  safe-wrapper layer (`shen/primitives.shen`): each `safe.X` validates args and
+  raises a catchable `simple-error` before the raw primitive is called. The always-on
+  throw sites (not safe-wrapper-protected, not type guards) are: `simple-error`,
+  `fail`, `apply`/`appterm` non-callable + too-many-args, `env_pop`, `pos` OOB inside
+  `trap-error`, and eval-kl's catch.
 - `val_error` GC-allocates its message (no `strdup` leak).
 - The `alarm_jmp` (test TIMEOUT) and `repl_exit_jmp` (REPL EOF) mechanisms are
   separate from the catch chain and unaffected.
