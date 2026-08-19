@@ -98,6 +98,16 @@
         (set global-table (cons [(intern (cn "shen." (str Name))) Closure]
                                 (value global-table))))
     (shen.add-prefix-aliases Rest)))
+\* dedupe-globals MUST run BEFORE shen.add-prefix-aliases (matching
+   serialize-reduced.shen): without dedupe first, add-prefix-aliases creates
+   shen.X aliases for BOTH the shen-load'd (our static full-arity) AND the
+   set-toplevel'd (host `ps` → shen-scheme-compiled, higher-order) copies of
+   each bare name.  The set-toplevel'd alias is prepended LAST → lands at front
+   → dedupe keeps it → `lower` sees the host-compiled closure (with
+   shen.f-error / dynamic applies / real cur opcodes) instead of our static
+   one.  Dedupe first so each bare name survives exactly once (the shen-load'd
+   static copy), and its shen. alias maps to it. *\
+(set global-table (dedupe-globals (value global-table)))
 (shen.add-prefix-aliases (value global-table))
 (tc +)
 
