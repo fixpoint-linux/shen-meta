@@ -1,12 +1,10 @@
 (tc -)
 (load "shen/toplevel.shen")
 
-(define interp-load
-  File -> (interp-eval-all (read-file File)))
-
-(define interp-load-safe
-  File -> (trap-error (interp-eval-all (read-file File))
-                      (/. X X)))
+\* interp-load / interp-load-safe (the HOST-only read-file loaders) live in
+   shen/interp-load.shen, which the bundle builders do not load.  The runtime
+   self-hosting loader that stays here is interp-load-raw (read-file-raw ->
+   read-file-as-string, a real primitive). *\
 
 (define interp-load-raw
   File -> (interp-eval-all (read-file-raw File)))
