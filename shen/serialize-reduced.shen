@@ -5,6 +5,7 @@
    shen-load below compiles source. *\
 (load "shen/prims-generated.shen")
 (load "shen/interp.shen")
+(load "shen/set-toplevel.shen")
 (tc -)
 (load "shen/compile.shen")
 (load "shen/load.shen")
