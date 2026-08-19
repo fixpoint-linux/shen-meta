@@ -34,6 +34,8 @@
 (set qbe-lines [])       \* current block's emitted lines (reversed) *\
 (set qbe-block-lines []) \* [ [start lines-reversed] ... ] (reversed) *\
 (set qbe-allocs [])
+(set qbe-temp-names [])  \* bare %tN names of the alloc8 40 slots (for per-frame GC rooting) *\
+(set qbe-wm-temp "")     \* function-entry gc_root_watermark() temp name (read at ret sites) *\
 (set qbe-zero-tmp false)
 (set qbe-zero-init "")
 (set qbe-preds [])       \* [ [target pred state] ... ] CFG edges *\
@@ -255,6 +257,7 @@
 (define qbe-slot { --> string }
   -> (let T (qbe-fresh)
        (do (set qbe-allocs (cons (qbe-join [T " =l alloc8 40"]) (value qbe-allocs)))
+           (set qbe-temp-names (cons T (value qbe-temp-names)))
            T)))
 
 \* Register a string/symbol data literal, return its $dN label. *\
@@ -426,10 +429,12 @@
   _ appterm [Stk Env Marks] ClosureSet ->
     (let R (qbe-pop-k (- (length (tl Stk)) (hd Marks)) (tl Stk))
       (do (qbe-emit (qbe-do-tail (hd Stk) (hd R) ClosureSet))
+          (qbe-emit (qbe-call "gc_root_pop_to" [(cn "l " (value qbe-wm-temp))]))
           (qbe-emit "ret")
           [(hd (tl R)) Env (tl Marks)]))
   _ return [Stk Env Marks] _ ->
     (do (qbe-emit (qbe-call "copy_value" ["l %out" (cn "l " (hd Stk))]))
+        (qbe-emit (qbe-call "gc_root_pop_to" [(cn "l " (value qbe-wm-temp))]))
         (qbe-emit "ret")
         [Stk Env Marks])
   _ [jmp L] State _ ->
@@ -535,6 +540,7 @@
   -> (if (= (value qbe-zero-tmp) false)
          (let T (qbe-fresh)
            (do (set qbe-allocs (cons (qbe-join [T " =l alloc8 40"]) (value qbe-allocs)))
+               (set qbe-temp-names (cons T (value qbe-temp-names)))
                (set qbe-zero-init (qbe-call "val_number_into" [(cn "l " T) "l 0"]))
                (set qbe-zero-tmp T)
                T))
@@ -610,9 +616,50 @@
                (qbe-args-str (qbe-l-args (cons "%out" (qbe-arg-temps Arity))))
                ") {" (value qbe-nl)]))
 
+\* Per-frame GC rooting prologue lines.  qbe-temp-names holds the bare %tN names
+   of every alloc8 40 slot in this function (qbe-slot / qbe-zero cons them in
+   reverse-allocation order, matching qbe-allocs).  We emit, AFTER the alloc8 40
+   declarations and BEFORE the body:
+     (a) a `call $val_nil_into(l %tN)` per slot — alloc8 reserves UNINITIALIZED
+         stack; pushing an uninitialized Value as ROOT_VALUE would let the GC
+         scan a garbage tag/interior pointers and crash.  val_nil_into writes a
+         non-allocating VAL_NIL Value (gc_scan_value on VAL_NIL is a no-op).
+     (b) `<wm> =l call $gc_root_watermark()` — captures the shadow-stack depth
+         from BEFORE this function's pushes; pop_to(wm) at exit removes exactly
+         this function's pushes.  Taken between zero-init and pushes (zero-init
+         does not push, so the watermark is unaffected).
+     (c) a `call $gc_root_push_value(l %tN)` per slot — registers each slot as
+         a ROOT_VALUE for the whole function lifetime.  Over-rooting (dead slots
+         stay pushed) is SAFE: gc_scan_value on a nil Value is a no-op, and on a
+         live Value evacuates its interior pointers idempotently.
+   The qbe-zero sentinel's val_number_into (qbe-zero-init) runs AFTER the
+   per-frame val_nil_into, overwriting that slot's nil with number 0 (last
+   write wins; the slot is rooted throughout).  Phi temps are NOT pushed
+   (they alias existing alloc slots); params %out/%aN are NOT pushed
+   (caller-rooted).  Using pop_to(wm) (not paired pops) at function exit
+   makes the trap-error longjmp path automatically balanced — the trap shims
+   already do pop_to(wm) on both paths, which composes correctly with the
+   per-frame pushes done by the cur bodies they run. *\
+(define qbe-nil-lines { (list string) --> (list string) }
+  [] -> []
+  [T | R] -> [(qbe-call "val_nil_into" [(cn "l " T)]) | (qbe-nil-lines R)])
+
+(define qbe-push-lines { (list string) --> (list string) }
+  [] -> []
+  [T | R] -> [(qbe-call "gc_root_push_value" [(cn "l " T)]) | (qbe-push-lines R)])
+
+(define qbe-wm-line { --> string }
+  -> (cn (value qbe-wm-temp) " =l call $gc_root_watermark()"))
+
 (define qbe-inject-allocs { (list (list number (list string))) --> (list (list number (list string))) }
   [] -> []
-  [[0 Lines] | R] -> [[0 (append Lines (append (if (= (value qbe-zero-init) "") [] [(value qbe-zero-init)]) (value qbe-allocs)))] | R]
+  [[0 Lines] | R] ->
+    [[0 (append Lines
+              (append (qbe-push-lines (value qbe-temp-names))
+                (append [(qbe-wm-line)]
+                  (append (if (= (value qbe-zero-init) "") [] [(value qbe-zero-init)])
+                    (append (qbe-nil-lines (value qbe-temp-names))
+                      (value qbe-allocs))))))] | R]
   [B | R] -> [B | (qbe-inject-allocs R)])
 
 (define qbe-fn-string { symbol --> number --> string }
@@ -681,6 +728,8 @@
       [datas (value qbe-datas)]
       [preds (value qbe-preds)]
       [allocs (value qbe-allocs)]
+      [temp-names (value qbe-temp-names)]
+      [wm-temp (value qbe-wm-temp)]
       [zero-tmp (value qbe-zero-tmp)]
       [zero-init (value qbe-zero-init)]
       [block-lines (value qbe-block-lines)]
@@ -697,6 +746,8 @@
     (set qbe-datas (qbe-cur-get datas Saved))
     (set qbe-preds (qbe-cur-get preds Saved))
     (set qbe-allocs (qbe-cur-get allocs Saved))
+    (set qbe-temp-names (qbe-cur-get temp-names Saved))
+    (set qbe-wm-temp (qbe-cur-get wm-temp Saved))
     (set qbe-zero-tmp (qbe-cur-get zero-tmp Saved))
     (set qbe-zero-init (qbe-cur-get zero-init Saved))
     (set qbe-block-lines (qbe-cur-get block-lines Saved))
@@ -714,6 +765,8 @@
         (set qbe-datas [])
         (set qbe-preds [])
         (set qbe-allocs [])
+        (set qbe-temp-names [])
+        (set qbe-wm-temp (qbe-fresh))
         (set qbe-zero-tmp false)
         (set qbe-zero-init "")
         (set qbe-block-lines [])
@@ -755,6 +808,8 @@
       (set qbe-datas [])
       (set qbe-preds [])
       (set qbe-allocs [])
+      (set qbe-temp-names [])
+      (set qbe-wm-temp (qbe-fresh))
       (set qbe-zero-tmp false)
       (set qbe-zero-init "")
       (set qbe-block-lines [])

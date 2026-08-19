@@ -33,15 +33,38 @@
 .decl phi_in(f:symbol, sid:number, t:symbol)
 .input phi_in(IO=file, delimiter=",", headers=true, filename="phi_in.csv")
 
+// pushed(f, t): temp t (a per-frame alloc8 40 slot) has been registered as a
+// ROOT_VALUE for this function's whole lifetime via the per-frame rooting
+// prologue emitted by qbe-inject-allocs (`call $gc_root_push_value(l %tN)`
+// at function entry).  Such slots are rooted across EVERY collecting call in
+// the function body, so a live slot that is pushed is NOT a root miss.
+.decl pushed(f:symbol, t:symbol)
+.input pushed(IO=file, delimiter=",", headers=true, filename="pushed.csv")
+
 // ═══════════════════════════════════════════════════════════════════════
 // A call MAY trigger collection.  All producing/allocating calls are
-// collecting; the only non-collecting call in the QBE output is is_false
-// (a pure word test).  Over-approximates (some prims don't allocate), which is
-// sound for flagging.
+// collecting; the only non-collecting calls in the QBE output are:
+//   - is_false            (pure word test)
+//   - val_nil_into        (writes a non-allocating VAL_NIL stack Value)
+//   - gc_root_push_value  (grows the C shadow-stack array via realloc; no GC)
+//   - gc_root_watermark   (pure read of shadow_len)
+//   - gc_root_pop_to      (pure write to shadow_len)
+// The last three are the per-frame rooting prologue/epilogue emitted by
+// qbe-inject-allocs; they do not touch the GC heap, so a live slot across
+// them is NOT at risk.  Excluding them is sound (they genuinely don't
+// collect) and avoids a large cross-product of spurious root_miss
+// candidates at function entry (every slot is "live" across every prologue
+// call, but all are pushed, so they would be filtered by !pushed anyway —
+// at huge Datalog cost).
 // ═══════════════════════════════════════════════════════════════════════
 
 .decl collecting_call(f:symbol, sid:number)
-collecting_call(f, sid) :- call(f, sid, callee), callee != "is_false".
+collecting_call(f, sid) :- call(f, sid, callee),
+                           callee != "is_false",
+                           callee != "val_nil_into",
+                           callee != "gc_root_push_value",
+                           callee != "gc_root_watermark",
+                           callee != "gc_root_pop_to".
 
 // ═══════════════════════════════════════════════════════════════════════
 // A temp HOLDS a GC-managed Value if it is the out of a producing call
@@ -81,12 +104,14 @@ live_at(f, sid, t) :- gc_value(f, t), local_slot(f, t),
 
 // ═══════════════════════════════════════════════════════════════════════
 // ROOT MISS: a live GC Value in an unrooted local slot across a collecting
-// call.  The QBE backend emits NO shadow-stack pushes, so every such slot is
-// unrooted => the GC may collect it mid-closure.
+// call.  A slot is rooted if it has been registered as a ROOT_VALUE for the
+// whole frame lifetime via the per-frame rooting prologue (pushed(f, t)).
+// With per-frame rooting, every alloc8 40 slot is pushed at function entry,
+// so root_miss should be 0 for every function.
 // ═══════════════════════════════════════════════════════════════════════
 
 .decl root_miss(f:symbol, sid:number, t:symbol)
-root_miss(f, sid, t) :- live_at(f, sid, t), collecting_call(f, sid).
+root_miss(f, sid, t) :- live_at(f, sid, t), collecting_call(f, sid), !pushed(f, t).
 
 // ── Summaries ──────────────────────────────────────────────────────────
 
