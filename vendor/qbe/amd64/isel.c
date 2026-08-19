@@ -25,7 +25,7 @@ struct ANum {
 	Ins *i;
 };
 
-static void amatch(Addr *, Ref, ANum *, Fn *, int);
+static int amatch(Addr *, Ref, int, ANum *, Fn *);
 
 static int
 noimm(Ref r, Fn *fn)
@@ -59,18 +59,17 @@ rslot(Ref r, Fn *fn)
 }
 
 static void
-fixarg(Ref *r, int k, int op, Fn *fn)
+fixarg(Ref *r, int k, Ins *i, Fn *fn)
 {
 	char buf[32];
 	Addr a, *m;
 	Ref r0, r1;
-	int s, n, cpy, mem;
+	int s, n, op;
 
 	r1 = r0 = *r;
 	s = rslot(r0, fn);
-	cpy = op == Ocopy || op == -1;
-	mem = isstore(op) || isload(op) || op == Ocall;
-	if (KBASE(k) == 1 && rtype(r0) == RCon) {
+	op = i ? i->op : Ocopy;
+	if (KBASE(k) == 1 && rtype(r0) == RCon && fn->con[r0.val].bits.i != 0) {
 		/* load floating points from memory
 		 * slots, they can't be used as
 		 * immediates
@@ -85,13 +84,15 @@ fixarg(Ref *r, int k, int op, Fn *fn)
 		a.offset.label = intern(buf);
 		fn->mem[fn->nmem-1] = a;
 	}
-	else if (!cpy && k == Kl && noimm(r0, fn)) {
+	else if (op != Ocopy && ((k == Kl && noimm(r0, fn)) || (KBASE(k) == 1 && rtype(r0) == RCon))) {
 		/* load constants that do not fit in
 		 * a 32bit signed integer into a
-		 * long temporary
+		 * long temporary OR
+		 * load positive zero into a floating
+		 * point register
 		 */
-		r1 = newtmp("isel", Kl, fn);
-		emit(Ocopy, Kl, r1, r0, R);
+		r1 = newtmp("isel", k, fn);
+		emit(Ocopy, k, r1, r0, R);
 	}
 	else if (s != -1) {
 		/* load fast locals' addresses into
@@ -101,16 +102,23 @@ fixarg(Ref *r, int k, int op, Fn *fn)
 		r1 = newtmp("isel", Kl, fn);
 		emit(Oaddr, Kl, r1, SLOT(s), R);
 	}
-	else if (!mem && rtype(r0) == RCon
+	else if (!(isstore(op) && r == &i->arg[1])
+	&& !isload(op) && op != Ocall && rtype(r0) == RCon
 	&& fn->con[r0.val].type == CAddr) {
-		/* apple asm fix */
+		/* apple as does not support 32-bit
+		 * absolute addressing, use a rip-
+		 * relative leaq instead
+		 */
 		r1 = newtmp("isel", Kl, fn);
 		emit(Oaddr, Kl, r1, r0, R);
 	}
 	else if (rtype(r0) == RMem) {
-		/* apple asm fix */
+		/* eliminate memory operands of
+		 * the form $foo(%rip, ...)
+		 */
 		m = &fn->mem[r0.val];
-		if (req(m->base, R)) {
+		if (req(m->base, R))
+		if (m->offset.type == CAddr) {
 			n = fn->ncon;
 			vgrow(&fn->con, ++fn->ncon);
 			fn->con[n] = m->offset;
@@ -131,13 +139,17 @@ seladdr(Ref *r, ANum *an, Fn *fn)
 
 	r0 = *r;
 	if (rtype(r0) == RTmp) {
-		amatch(&a, r0, an, fn, 1);
-		if (req(a.base, r0))
+		memset(&a, 0, sizeof a);
+		if (!amatch(&a, r0, an[r0.val].n, an, fn))
 			return;
-		if (a.offset.type == CAddr)
-		if (!req(a.base, R)) {
-			/* apple asm fix */
-			if (!req(a.index, R))
+		if (!req(a.base, R))
+		if (a.offset.type == CAddr) {
+			/* apple as does not support
+			 * $foo(%r0, %r1, M); try to
+			 * rewrite it or bail out if
+			 * impossible
+			 */
+			if (!req(a.index, R) || rtype(a.base) != RTmp)
 				return;
 			else {
 				a.index = a.base;
@@ -155,34 +167,47 @@ seladdr(Ref *r, ANum *an, Fn *fn)
 }
 
 static int
-selcmp(Ref arg[2], int k, Fn *fn)
+cmpswap(Ref arg[2], int op)
 {
-	int swap;
-	Ref r, *iarg;
+	switch (op) {
+	case NCmpI+Cflt:
+	case NCmpI+Cfle:
+		return 1;
+	case NCmpI+Cfgt:
+	case NCmpI+Cfge:
+		return 0;
+	}
+	return rtype(arg[0]) == RCon;
+}
 
-	swap = rtype(arg[0]) == RCon;
+static void
+selcmp(Ref arg[2], int k, int swap, Fn *fn)
+{
+	Ref r;
+	Ins *icmp;
+
 	if (swap) {
 		r = arg[1];
 		arg[1] = arg[0];
 		arg[0] = r;
 	}
 	emit(Oxcmp, k, R, arg[1], arg[0]);
-	iarg = curi->arg;
+	icmp = curi;
 	if (rtype(arg[0]) == RCon) {
-		assert(k == Kl);
-		iarg[1] = newtmp("isel", k, fn);
-		emit(Ocopy, k, iarg[1], arg[0], R);
+		assert(k != Kw);
+		icmp->arg[1] = newtmp("isel", k, fn);
+		emit(Ocopy, k, icmp->arg[1], arg[0], R);
+		fixarg(&curi->arg[0], k, curi, fn);
 	}
-	fixarg(&iarg[0], k, Oxcmp, fn);
-	fixarg(&iarg[1], k, Oxcmp, fn);
-	return swap;
+	fixarg(&icmp->arg[0], k, icmp, fn);
+	fixarg(&icmp->arg[1], k, icmp, fn);
 }
 
 static void
 sel(Ins i, ANum *an, Fn *fn)
 {
-	Ref r0, r1, *iarg;
-	int x, k, kc;
+	Ref r0, r1;
+	int x, k, kc, swap;
 	int64_t sz;
 	Ins *i0, *i1;
 
@@ -226,20 +251,25 @@ sel(Ins i, ANum *an, Fn *fn)
 			emit(Ocopy, k, TMP(RDX), CON_Z, R);
 		}
 		emit(Ocopy, k, TMP(RAX), i.arg[0], R);
-		fixarg(&curi->arg[0], k, Ocopy, fn);
+		fixarg(&curi->arg[0], k, curi, fn);
 		if (rtype(i.arg[1]) == RCon)
 			emit(Ocopy, k, r0, i.arg[1], R);
 		break;
 	case Osar:
 	case Oshr:
 	case Oshl:
-		if (rtype(i.arg[1]) == RCon)
-			goto Emit;
 		r0 = i.arg[1];
+		if (rtype(r0) == RCon)
+			goto Emit;
+		if (fn->tmp[r0.val].slot != -1)
+			err("unlikely argument %%%s in %s",
+				fn->tmp[r0.val].name, optab[i.op].name);
 		i.arg[1] = TMP(RCX);
 		emit(Ocopy, Kw, R, TMP(RCX), R);
 		emiti(i);
+		i1 = curi;
 		emit(Ocopy, Kw, TMP(RCX), r0, R);
+		fixarg(&i1->arg[0], argcls(&i, 0), i1, fn);
 		break;
 	case Onop:
 		break;
@@ -280,9 +310,9 @@ sel(Ins i, ANum *an, Fn *fn)
 	case_OExt:
 Emit:
 		emiti(i);
-		iarg = curi->arg; /* fixarg() can change curi */
-		fixarg(&iarg[0], argcls(&i, 0), i.op, fn);
-		fixarg(&iarg[1], argcls(&i, 1), i.op, fn);
+		i1 = curi; /* fixarg() can change curi */
+		fixarg(&i1->arg[0], argcls(&i, 0), i1, fn);
+		fixarg(&i1->arg[1], argcls(&i, 1), i1, fn);
 		break;
 	case Oalloc:
 	case Oalloc+1:
@@ -316,16 +346,37 @@ Emit:
 		if (isload(i.op))
 			goto case_Oload;
 		if (iscmp(i.op, &kc, &x)) {
+			switch (x) {
+			case NCmpI+Cfeq:
+				/* zf is set when operands are
+				 * unordered, so we may have to
+				 * check pf
+				 */
+				r0 = newtmp("isel", Kw, fn);
+				r1 = newtmp("isel", Kw, fn);
+				emit(Oand, Kw, i.to, r0, r1);
+				emit(Oflagfo, k, r1, R, R);
+				i.to = r0;
+				break;
+			case NCmpI+Cfne:
+				r0 = newtmp("isel", Kw, fn);
+				r1 = newtmp("isel", Kw, fn);
+				emit(Oor, Kw, i.to, r0, r1);
+				emit(Oflagfuo, k, r1, R, R);
+				i.to = r0;
+				break;
+			}
+			swap = cmpswap(i.arg, x);
+			if (swap)
+				x = cmpop(x);
 			emit(Oflag+x, k, i.to, R, R);
-			i1 = curi;
-			if (selcmp(i.arg, kc, fn))
-				i1->op = Oflag + cmpop(x);
+			selcmp(i.arg, kc, swap, fn);
 			break;
 		}
 		die("unknown instruction %s", optab[i.op].name);
 	}
 
-	while (i0 > curi && --i0) {
+	while (i0>curi && --i0) {
 		assert(rslot(i0->arg[0], fn) == -1);
 		assert(rslot(i0->arg[1], fn) == -1);
 	}
@@ -349,7 +400,7 @@ static void
 seljmp(Blk *b, Fn *fn)
 {
 	Ref r;
-	int c, k;
+	int c, k, swap;
 	Ins *fi;
 	Tmp *t;
 
@@ -359,7 +410,7 @@ seljmp(Blk *b, Fn *fn)
 	r = b->jmp.arg;
 	t = &fn->tmp[r.val];
 	b->jmp.arg = R;
-	assert(!req(r, R) && rtype(r) != RCon);
+	assert(rtype(r) == RTmp);
 	if (b->s1 == b->s2) {
 		chuse(r, -1, fn);
 		b->jmp.type = Jjmp;
@@ -368,13 +419,17 @@ seljmp(Blk *b, Fn *fn)
 	}
 	fi = flagi(b->ins, &b->ins[b->nins]);
 	if (!fi || !req(fi->to, r)) {
-		selcmp((Ref[2]){r, CON_Z}, Kw, fn); /* todo, long jnz */
+		selcmp((Ref[2]){r, CON_Z}, Kw, 0, fn); /* todo, long jnz */
 		b->jmp.type = Jjf + Cine;
 	}
-	else if (iscmp(fi->op, &k, &c)) {
+	else if (iscmp(fi->op, &k, &c)
+	     && c != NCmpI+Cfeq /* see sel() */
+	     && c != NCmpI+Cfne) {
+		swap = cmpswap(fi->arg, c);
+		if (swap)
+			c = cmpop(c);
 		if (t->nuse == 1) {
-			if (selcmp(fi->arg, k, fn))
-				c = cmpop(c);
+			selcmp(fi->arg, k, swap, fn);
 			*fi = (Ins){.op = Onop};
 		}
 		b->jmp.type = Jjf + c;
@@ -443,22 +498,21 @@ anumber(ANum *ai, Blk *b, Con *con)
 	 */
 	static char add[10][10] = {
 		[2] [2] = 2,              /* folding */
-		[2] [5] = 5, [5] [2] = 5,
+		[2] [4] = 4, [4] [2] = 4,
 		[2] [6] = 6, [6] [2] = 6,
 		[2] [7] = 7, [7] [2] = 7,
-		[0] [0] = 4,              /* 4: b + s * i */
-		[0] [3] = 4, [3] [0] = 4,
-		[2] [3] = 5, [3] [2] = 5, /* 5: o + s * i */
-		[0] [2] = 6, [2] [0] = 6, /* 6: o + b */
-		[2] [4] = 7, [4] [2] = 7, /* 7: o + b + s * i */
-		[0] [5] = 7, [5] [0] = 7,
-		[6] [3] = 7, [3] [6] = 7,
-
+		[0] [2] = 4, [2] [0] = 4, /* 4: o + b */
+		[0] [0] = 5,              /* 5: b + s * i */
+		[0] [3] = 5, [3] [0] = 5,
+		[2] [3] = 6, [3] [2] = 6, /* 6: o + s * i */
+		[2] [5] = 7, [5] [2] = 7, /* 7: o + b + s * i */
+		[0] [6] = 7, [6] [0] = 7,
+		[4] [3] = 7, [3] [4] = 7,
 	};
 	int a, a1, a2, n1, n2, t1, t2;
 	Ins *i;
 
-	for (i=b->ins; i-b->ins < b->nins; i++) {
+	for (i=b->ins; i<&b->ins[b->nins]; i++) {
 		if (rtype(i->to) == RTmp)
 			ai[i->to.val].i = i;
 		if (i->op != Oadd && i->op != Omul)
@@ -488,18 +542,18 @@ anumber(ANum *ai, Blk *b, Con *con)
 	}
 }
 
-static void
-amatch(Addr *a, Ref r, ANum *ai, Fn *fn, int top)
+static int
+amatch(Addr *a, Ref r, int n, ANum *ai, Fn *fn)
 {
 	Ins *i;
 	int nl, nr, t, s;
 	Ref al, ar;
 
-	if (top)
-		memset(a, 0, sizeof *a);
 	if (rtype(r) == RCon) {
-		addcon(&a->offset, &fn->con[r.val]);
-		return;
+		if (!addcon(&a->offset, &fn->con[r.val]))
+			err("unlikely sum of $%s and $%s",
+				str(a->offset.label), str(fn->con[r.val].label));
+		return 1;
 	}
 	assert(rtype(r) == RTmp);
 	i = ai[r.val].i;
@@ -515,15 +569,12 @@ amatch(Addr *a, Ref r, ANum *ai, Fn *fn, int top)
 			ar = i->arg[1];
 		}
 	}
-	switch (ai[r.val].n) {
+	switch (n) {
 	case 3: /* s * i */
-		if (!top) {
-			a->index = al;
-			a->scale = fn->con[ar.val].bits.i;
-		} else
-			a->base = r;
-		break;
-	case 4: /* b + s * i */
+		a->index = al;
+		a->scale = fn->con[ar.val].bits.i;
+		return 0;
+	case 5: /* b + s * i */
 		switch (nr) {
 		case 0:
 			if (fn->tmp[ar.val].slot != -1) {
@@ -534,23 +585,24 @@ amatch(Addr *a, Ref r, ANum *ai, Fn *fn, int top)
 			a->scale = 1;
 			break;
 		case 3:
-			amatch(a, ar, ai, fn, 0);
+			amatch(a, ar, nr, ai, fn);
 			break;
 		}
 		r = al;
+		/* fall through */
 	case 0:
 		s = fn->tmp[r.val].slot;
 		if (s != -1)
 			r = SLOT(s);
 		a->base = r;
-		break;
+		return n || s != -1;
 	case 2: /* constants */
-	case 5: /* o + s * i */
-	case 6: /* o + b */
+	case 4: /* o + b */
+	case 6: /* o + s * i */
 	case 7: /* o + b + s * i */
-		amatch(a, ar, ai, fn, 0);
-		amatch(a, al, ai, fn, 0);
-		break;
+		amatch(a, ar, nr, ai, fn);
+		amatch(a, al, nl, ai, fn);
+		return 1;
 	default:
 		die("unreachable");
 	}
@@ -574,7 +626,7 @@ amd64_isel(Fn *fn)
 	b = fn->start;
 	/* specific to NAlign == 3 */ /* or change n=4 and sz /= 4 below */
 	for (al=Oalloc, n=4; al<=Oalloc1; al++, n*=2)
-		for (i=b->ins; i-b->ins < b->nins; i++)
+		for (i=b->ins; i<&b->ins[b->nins]; i++)
 			if (i->op == al) {
 				if (rtype(i->arg[0]) != RCon)
 					break;
@@ -583,6 +635,8 @@ amd64_isel(Fn *fn)
 					err("invalid alloc size %"PRId64, sz);
 				sz = (sz + n-1) & -n;
 				sz /= 4;
+				if (sz > INT_MAX - fn->slot)
+					die("alloc too large");
 				fn->tmp[i->to.val].slot = fn->slot;
 				fn->slot += sz;
 				*i = (Ins){.op = Onop};
@@ -597,7 +651,7 @@ amd64_isel(Fn *fn)
 			for (p=(*sb)->phi; p; p=p->link) {
 				for (a=0; p->blk[a] != b; a++)
 					assert(a+1 < p->narg);
-				fixarg(&p->arg[a], p->cls, -1, fn);
+				fixarg(&p->arg[a], p->cls, 0, fn);
 			}
 		memset(ainfo, 0, n * sizeof ainfo[0]);
 		anumber(ainfo, b, fn->con);

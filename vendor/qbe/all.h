@@ -31,8 +31,7 @@ typedef struct Dat Dat;
 typedef struct Target Target;
 
 enum {
-	NString = 32,
-	NPred   = 63,
+	NString = 72,
 	NIns    = 1 << 20,
 	NAlign  = 3,
 	NField  = 32,
@@ -171,12 +170,13 @@ enum {
 	Jjf1 = Jjffuo,
 };
 
-#define isstore(o) (Ostoreb <= o && o <= Ostored)
-#define isload(o) (Oloadsb <= o && o <= Oload)
-#define isext(o) (Oextsb <= o && o <= Oextuw)
-#define ispar(o) (Opar <= o && o <= Opare)
-#define isarg(o) (Oarg <= o && o <= Oarge)
-#define isret(j) (Jret0 <= j && j <= Jretc)
+#define INRANGE(x, l, u) ((unsigned)(x) - l <= u - l) /* linear in x */
+#define isstore(o) INRANGE(o, Ostoreb, Ostored)
+#define isload(o) INRANGE(o, Oloadsb, Oload)
+#define isext(o) INRANGE(o, Oextsb, Oextuw)
+#define ispar(o) INRANGE(o, Opar, Opare)
+#define isarg(o) INRANGE(o, Oarg, Oargv)
+#define isret(j) INRANGE(j, Jret0, Jretc)
 
 enum Class {
 	Kx = -1, /* "top" class (see usecheck() and clsmerge()) */
@@ -197,15 +197,15 @@ struct Op {
 
 struct Ins {
 	uint op:30;
+	uint cls:2;
 	Ref to;
 	Ref arg[2];
-	uint cls:2;
 };
 
 struct Phi {
 	Ref to;
-	Ref arg[NPred];
-	Blk *blk[NPred];
+	Ref *arg;
+	Blk **blk;
 	uint narg;
 	int cls;
 	Phi *link;
@@ -246,7 +246,7 @@ struct Use {
 		UIns,
 		UJmp,
 	} type;
-	int bid;
+	uint bid;
 	union {
 		Ins *ins;
 		Phi *phi;
@@ -279,8 +279,9 @@ struct Tmp {
 	char name[NString];
 	Use *use;
 	uint ndef, nuse;
+	uint bid; /* id of a defining block */
 	uint cost;
-	short slot; /* -1 for unset */
+	int slot; /* -1 for unset */
 	short cls;
 	struct {
 		int r;  /* register or -1 */
@@ -431,7 +432,7 @@ int phicls(int, Tmp *);
 Ref newtmp(char *, int, Fn *);
 void chuse(Ref, int, Fn *);
 Ref getcon(int64_t, Fn *);
-void addcon(Con *, Con *);
+int addcon(Con *, Con *);
 void blit(Ref, uint, Ref, uint, Fn *);
 void dumpts(BSet *, Tmp *, FILE *);
 
@@ -493,9 +494,6 @@ void fillpreds(Fn *);
 void fillrpo(Fn *);
 void ssa(Fn *);
 void ssacheck(Fn *);
-
-/* simpl.c */
-void simpl(Fn *);
 
 /* copy.c */
 void copy(Fn *);

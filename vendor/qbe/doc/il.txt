@@ -215,16 +215,17 @@ using the `export` keyword.
         # Regular type
         'type' :IDENT '=' ['align' NUMBER]
         '{'
-            ( EXTTY [NUMBER] ),
+            ( SUBTY [NUMBER] ),
         '}'
       | # Opaque type
         'type' :IDENT '=' 'align' NUMBER '{' NUMBER '}'
 
+    SUBTY := EXTTY | :IDENT
+
 Aggregate type definitions start with the `type` keyword.
 They have file scope, but types must be defined before being
 referenced.  The inner structure of a type is expressed by a
-comma-separated list of <@ Simple Types> enclosed in curly
-braces.
+comma-separated list of types enclosed in curly braces.
 
     type :fourfloats = { s, s, d, d }
 
@@ -253,7 +254,7 @@ their size between curly braces.
 
     `bnf
     DATADEF :=
-        ['export'] 'data' $IDENT '='
+        ['export'] 'data' $IDENT '=' ['align' NUMBER]
         '{'
             ( EXTTY DATAITEM+
             | 'z'   NUMBER ),
@@ -748,9 +749,9 @@ single-precision floating point number `%f` into `%rs`.
     CALL := [%IDENT '=' ABITY] 'call' VAL '(' (ARG), ')'
 
     ARG :=
-        ABITY %IDENT  # Regular argument
-      | 'env' VAL     # Environment argument (first)
-      | '...'         # Variadic marker (last)
+        ABITY VAL  # Regular argument
+      | 'env' VAL  # Environment argument (first)
+      | '...'      # Variadic marker
 
     ABITY := BASETY | :IDENT
 
@@ -777,8 +778,8 @@ integer.  If the called function does not expect an environment
 parameter, it will be safely discarded.  See the <@ Functions >
 section for more information about environment parameters.
 
-When the called function is variadic, the last argument
-must be `...`.
+When the called function is variadic, there must be a `...`
+marker separating the named and variadic arguments.
 
 ~ Variadic
 ~~~~~~~~~~

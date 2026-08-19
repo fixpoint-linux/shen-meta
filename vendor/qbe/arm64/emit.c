@@ -67,9 +67,9 @@ static struct {
 	{ Ostores, Kw, "str %S0, %M1" },
 	{ Ostored, Kw, "str %D0, %M1" },
 	{ Oloadsb, Ki, "ldrsb %=, %M0" },
-	{ Oloadub, Ki, "ldrb %=, %M0" },
+	{ Oloadub, Ki, "ldrb %W=, %M0" },
 	{ Oloadsh, Ki, "ldrsh %=, %M0" },
-	{ Oloaduh, Ki, "ldrh %=, %M0" },
+	{ Oloaduh, Ki, "ldrh %W=, %M0" },
 	{ Oloadsw, Kw, "ldr %=, %M0" },
 	{ Oloadsw, Kl, "ldrsw %=, %M0" },
 	{ Oloaduw, Ki, "ldr %W=, %M0" },
@@ -81,6 +81,7 @@ static struct {
 	{ Oextsw,  Ki, "sxtw %L=, %W0" },
 	{ Oextuw,  Ki, "mov %W=, %W0" },
 	{ Oexts,   Kd, "fcvt %=, %S0" },
+	{ Otruncd, Ks, "fcvt %=, %D0" },
 	{ Ocast,   Kw, "fmov %=, %S0" },
 	{ Ocast,   Kl, "fmov %=, %D0" },
 	{ Ocast,   Ks, "fmov %=, %W0" },
@@ -217,10 +218,19 @@ emitf(char *s, Ins *i, E *e)
 			break;
 		case 'M':
 			c = *s++;
-			assert(c == '0' || c == '1');
-			r = i->arg[c - '0'];
-			assert(isreg(r) && "TODO emit non reg addresses");
-			fprintf(e->f, "[%s]", rname(r.val, Kl));
+			assert(c == '0' || c == '1' || c == '=');
+			r = c == '=' ? i->to : i->arg[c - '0'];
+			switch (rtype(r)) {
+			default:
+				die("todo (arm emit): unhandled ref");
+			case RTmp:
+				assert(isreg(r));
+				fprintf(e->f, "[%s]", rname(r.val, Kl));
+				break;
+			case RSlot:
+				fprintf(e->f, "[x29, %"PRIu64"]", slot(r.val, e));
+				break;
+			}
 			break;
 		}
 	}
@@ -270,6 +280,8 @@ static void
 emitins(Ins *i, E *e)
 {
 	int o;
+	char *rn;
+	uint64_t s;
 
 	switch (i->op) {
 	default:
@@ -295,15 +307,52 @@ emitins(Ins *i, E *e)
 	case Ocopy:
 		if (req(i->to, i->arg[0]))
 			break;
-		if (rtype(i->arg[0]) != RCon)
+		if (rtype(i->to) == RSlot) {
+			switch (rtype(i->arg[0])) {
+			case RSlot:
+				emitf("ldr %?, %M0\n\tstr %?, %M=", i, e);
+				break;
+			case RCon:
+				loadcon(&e->fn->con[i->arg[0].val], R18, i->cls, e->f);
+				emitf("str %?, %M=", i, e);
+				break;
+			default:
+				assert(isreg(i->arg[0]));
+				emitf("str %0, %M=", i, e);
+			}
+			break;
+		}
+		assert(isreg(i->to));
+		switch (rtype(i->arg[0])) {
+		case RCon:
+			loadcon(&e->fn->con[i->arg[0].val], i->to.val, i->cls, e->f);
+			break;
+		case RSlot:
+			emitf("ldr %=, %M0", i, e);
+			break;
+		default:
 			goto Table;
-		loadcon(&e->fn->con[i->arg[0].val], i->to.val, i->cls, e->f);
+		}
 		break;
 	case Oaddr:
 		assert(rtype(i->arg[0]) == RSlot);
-		fprintf(e->f, "\tadd\t%s, x29, #%"PRIu64"\n",
-			rname(i->to.val, Kl), slot(i->arg[0].val, e)
-		);
+		rn = rname(i->to.val, Kl);
+		s = slot(i->arg[0].val, e);
+		if (s <= 4095)
+			fprintf(e->f, "\tadd\t%s, x29, #%"PRIu64"\n", rn, s);
+		else if (s <= 65535)
+			fprintf(e->f,
+				"\tmov\t%s, #%"PRIu64"\n"
+				"\tadd\t%s, x29, %s\n",
+				rn, s, rn, rn
+			);
+		else
+			fprintf(e->f,
+				"\tmov\t%s, #%"PRIu64"\n"
+				"\tmovk\t%s, #%"PRIu64", lsl #16\n"
+				"\tadd\t%s, x29, %s\n",
+				rn, s & 0xFFFF, rn, s >> 16, rn, rn
+			);
 		break;
 	}
 }
@@ -377,28 +426,60 @@ arm64_emitfn(Fn *fn, FILE *out)
 	if (e->fn->vararg) {
 		for (n=7; n>=0; n--)
 			fprintf(e->f, "\tstr\tq%d, [sp, -16]!\n", n);
-		for (n=7; n>=0; n--)
-			fprintf(e->f, "\tstr\tx%d, [sp, -8]!\n", n);
+		for (n=7; n>=0; n-=2)
+			fprintf(e->f, "\tstp\tx%d, x%d, [sp, -16]!\n", n-1, n);
 	}
 
-	if (e->frame + 16 > 512)
+	if (e->frame + 16 <= 512)
+		fprintf(e->f,
+			"\tstp\tx29, x30, [sp, -%"PRIu64"]!\n",
+			e->frame + 16
+		);
+	else if (e->frame <= 4095)
 		fprintf(e->f,
 			"\tsub\tsp, sp, #%"PRIu64"\n"
 			"\tstp\tx29, x30, [sp, -16]!\n",
 			e->frame
 		);
+	else if (e->frame <= 65535)
+		fprintf(e->f,
+			"\tmov\tx16, #%"PRIu64"\n"
+			"\tsub\tsp, sp, x16\n"
+			"\tstp\tx29, x30, [sp, -16]!\n",
+			e->frame
+		);
 	else
 		fprintf(e->f,
-			"\tstp\tx29, x30, [sp, -%"PRIu64"]!\n",
-			e->frame + 16
+			"\tmov\tx16, #%"PRIu64"\n"
+			"\tmovk\tx16, #%"PRIu64", lsl #16\n"
+			"\tsub\tsp, sp, x16\n"
+			"\tstp\tx29, x30, [sp, -16]!\n",
+			e->frame & 0xFFFF, e->frame >> 16
 		);
 	fputs("\tadd\tx29, sp, 0\n", e->f);
 	for (o=e->frame+16, r=arm64_rclob; *r>=0; r++)
-		if (e->fn->reg & BIT(*r))
-			fprintf(e->f,
-				"\tstr\t%s, [sp, %"PRIu64"]\n",
-				rname(*r, Kx), o -= 8
-			);
+		if (e->fn->reg & BIT(*r)) {
+			if (o <= 32760)
+				fprintf(e->f,
+					"\tstr\t%s, [sp, %"PRIu64"]\n",
+					rname(*r, Kx), o -= 8
+				);
+			else if (o <= 65535)
+				fprintf(e->f,
+					"\tmov\tx16, #%"PRIu64"\n"
+					"\tstr\t%s, [sp, x16]\n",
+					o -= 8, rname(*r, Kx)
+				);
+			else {
+				o -= 8;
+				fprintf(e->f,
+					"\tmov\tx16, #%"PRIu64"\n"
+					"\tmovk\tx16, #%"PRIu64", lsl #16\n"
+					"\tstr\t%s, [sp, x16]\n",
+					o & 0xFFFF, o >> 16, rname(*r, Kx)
+				);
+			}
+		}
 
 	for (lbl=0, b=e->fn->start; b; b=b->link) {
 		if (lbl || b->npred > 1)
@@ -409,24 +490,56 @@ arm64_emitfn(Fn *fn, FILE *out)
 		switch (b->jmp.type) {
 		case Jret0:
 			for (o=e->frame+16, r=arm64_rclob; *r>=0; r++)
-				if (e->fn->reg & BIT(*r))
-					fprintf(e->f,
-						"\tldr\t%s, [sp, %"PRIu64"]\n",
-						rname(*r, Kx), o -= 8
-					);
+				if (e->fn->reg & BIT(*r)) {
+					if (o <= 32760)
+						fprintf(e->f,
+							"\tldr\t%s, [sp, %"PRIu64"]\n",
+							rname(*r, Kx), o -= 8
+						);
+					else if (o <= 65535)
+						fprintf(e->f,
+							"\tmov\tx16, #%"PRIu64"\n"
+							"\tldr\t%s, [sp, x16]\n",
+							o -= 8, rname(*r, Kx)
+						);
+					else {
+						o -= 8;
+						fprintf(e->f,
+							"\tmov\tx16, #%"PRIu64"\n"
+							"\tmovk\tx16, #%"PRIu64", lsl #16\n"
+							"\tldr\t%s, [sp, x16]\n",
+							o & 0xFFFF, o >> 16, rname(*r, Kx)
+						);
+					}
+				}
 			o = e->frame + 16;
 			if (e->fn->vararg)
 				o += 192;
-			if (o > 504)
+			if (o <= 504)
+				fprintf(e->f,
+					"\tldp\tx29, x30, [sp], %"PRIu64"\n",
+					o
+				);
+			else if (o - 16 <= 4095)
 				fprintf(e->f,
 					"\tldp\tx29, x30, [sp], 16\n"
 					"\tadd\tsp, sp, #%"PRIu64"\n",
 					o - 16
 				);
+			else if (o - 16 <= 65535)
+				fprintf(e->f,
+					"\tldp\tx29, x30, [sp], 16\n"
+					"\tmov\tx16, #%"PRIu64"\n"
+					"\tadd\tsp, sp, x16\n",
+					o - 16
+				);
 			else
 				fprintf(e->f,
-					"\tldp\tx29, x30, [sp], %"PRIu64"\n",
-					o
+					"\tldp\tx29, x30, [sp], 16\n"
+					"\tmov\tx16, #%"PRIu64"\n"
+					"\tmovk\tx16, #%"PRIu64", lsl #16\n"
+					"\tadd\tsp, sp, x16\n",
+					(o - 16) & 0xFFFF, (o - 16) >> 16
 				);
 			fprintf(e->f, "\tret\n");
 			break;

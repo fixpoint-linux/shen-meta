@@ -96,7 +96,7 @@ static struct {
 	{ Oextub,  Ki, "movzb%k %B0, %=" },
 
 	{ Oexts,   Kd, "cvtss2sd %0, %=" },
-	{ Otruncd, Ks, "cvttsd2ss %0, %=" },
+	{ Otruncd, Ks, "cvtsd2ss %0, %=" },
 	{ Ostosi,  Ki, "cvttss2si%k %0, %=" },
 	{ Odtosi,  Ki, "cvttsd2si%k %0, %=" },
 	{ Oswtof,  Ka, "cvtsi2%k %W0, %=" },
@@ -110,8 +110,8 @@ static struct {
 	{ Osign,   Kw, "cltd" },
 	{ Oxdiv,   Ki, "div%k %0" },
 	{ Oxidiv,  Ki, "idiv%k %0" },
-	{ Oxcmp,   Ks, "comiss %S0, %S1" },
-	{ Oxcmp,   Kd, "comisd %D0, %D1" },
+	{ Oxcmp,   Ks, "ucomiss %S0, %S1" },
+	{ Oxcmp,   Kd, "ucomisd %D0, %D1" },
 	{ Oxcmp,   Ki, "cmp%k %0, %1" },
 	{ Oxtest,  Ki, "test%k %0, %1" },
 #define X(c, s) \
@@ -161,12 +161,13 @@ slot(int s, Fn *fn)
 static void
 emitcon(Con *con, FILE *f)
 {
-	char *p;
+	char *p, *l;
 
 	switch (con->type) {
 	case CAddr:
-		p = con->local ? gasloc : gassym;
-		fprintf(f, "%s%s", p, str(con->label));
+		l = str(con->label);
+		p = con->local ? gasloc : l[0] == '"' ? "" : gassym;
+		fprintf(f, "%s%s", p, l);
 		if (con->bits.i)
 			fprintf(f, "%+"PRId64, con->bits.i);
 		break;
@@ -183,6 +184,7 @@ regtoa(int reg, int sz)
 {
 	static char buf[6];
 
+	assert(reg <= XMM15);
 	if (reg >= XMM0) {
 		sprintf(buf, "xmm%d", reg-XMM0);
 		return buf;
@@ -292,10 +294,10 @@ Next:
 			if (m->offset.type != CUndef)
 				emitcon(&m->offset, f);
 			fputc('(', f);
-			if (req(m->base, R))
-				fprintf(f, "%%rip");
-			else
+			if (!req(m->base, R))
 				fprintf(f, "%%%s", regtoa(m->base.val, SLong));
+			else if (m->offset.type == CAddr)
+				fprintf(f, "%%rip");
 			if (!req(m->index, R))
 				fprintf(f, ", %%%s, %d",
 					regtoa(m->index.val, SLong),
@@ -333,8 +335,10 @@ Next:
 			fprintf(f, "%d(%%rbp)", slot(ref.val, fn));
 			break;
 		case RCon:
-			emitcon(&fn->con[ref.val], f);
-			fprintf(f, "(%%rip)");
+			off = fn->con[ref.val];
+			emitcon(&off, f);
+			if (off.type == CAddr)
+				fprintf(f, "(%%rip)");
 			break;
 		case RTmp:
 			assert(isreg(ref));
@@ -360,7 +364,7 @@ emitins(Ins i, Fn *fn, FILE *f)
 {
 	Ref r;
 	int64_t val;
-	int o;
+	int o, t0;
 
 	switch (i.op) {
 	default:
@@ -404,7 +408,7 @@ emitins(Ins i, Fn *fn, FILE *f)
 	case Osub:
 		/* we have to use the negation trick to handle
 		 * some 3-address subtractions */
-		if (req(i.to, i.arg[1])) {
+		if (req(i.to, i.arg[1]) && !req(i.arg[0], i.to)) {
 			if (KBASE(i.cls) == 0)
 				emitf("neg%k %=", &i, fn, f);
 			else
@@ -430,25 +434,60 @@ emitins(Ins i, Fn *fn, FILE *f)
 		}
 		goto Table;
 	case Ocopy:
-		/* make sure we don't emit useless copies,
-		 * also, we can use a trick to load 64-bits
-		 * registers, it's detailed in my note below
-		 * http://c9x.me/art/notes.html?09/19/2015 */
+		/* copies are used for many things; see my note
+		 * to understand how to load big constants:
+		 * https://c9x.me/notes/2015-09-19.html */
+		assert(rtype(i.to) != RMem);
 		if (req(i.to, R) || req(i.arg[0], R))
 			break;
-		if (isreg(i.to)
-		&& rtype(i.arg[0]) == RCon
-		&& i.cls == Kl
+		if (req(i.to, i.arg[0]))
+			break;
+		t0 = rtype(i.arg[0]);
+		if (t0 == RCon
 		&& fn->con[i.arg[0].val].type == CBits
-		&& (val = fn->con[i.arg[0].val].bits.i) >= 0
-		&& val <= UINT32_MAX) {
-			emitf("movl %W0, %W=", &i, fn, f);
-		} else if (isreg(i.to)
-		&& rtype(i.arg[0]) == RCon
+		&& fn->con[i.arg[0].val].bits.i == 0) {
+			if (isreg(i.to)) {
+				if (KBASE(i.cls) == 0)
+					emitf("xor%k %=, %=", &i, fn, f);
+				else
+					emitf("pxor %D=, %D=", &i, fn, f);
+				break;
+			}
+			i.cls = KWIDE(i.cls) ? Kl : Kw;
+		}
+		if (i.cls == Kl
+		&& t0 == RCon
+		&& fn->con[i.arg[0].val].type == CBits) {
+			val = fn->con[i.arg[0].val].bits.i;
+			if (isreg(i.to))
+			if (val >= 0 && val <= UINT32_MAX) {
+				emitf("movl %W0, %W=", &i, fn, f);
+				break;
+			}
+			if (rtype(i.to) == RSlot)
+			if (val < INT32_MIN || val > INT32_MAX) {
+				emitf("movl %0, %=", &i, fn, f);
+				emitf("movl %0>>32, 4+%=", &i, fn, f);
+				break;
+			}
+		}
+		if (isreg(i.to)
+		&& t0 == RCon
 		&& fn->con[i.arg[0].val].type == CAddr) {
 			emitf("lea%k %M0, %=", &i, fn, f);
-		} else if (!req(i.arg[0], i.to))
-			emitf("mov%k %0, %=", &i, fn, f);
+			break;
+		}
+		if (rtype(i.to) == RSlot
+		&& (t0 == RSlot || t0 == RMem)) {
+			i.cls = KWIDE(i.cls) ? Kd : Ks;
+			i.arg[1] = TMP(XMM0+15);
+			emitf("mov%k %0, %1", &i, fn, f);
+			emitf("mov%k %1, %=", &i, fn, f);
+			break;
+		}
+		/* conveniently, the assembler knows if it
+		 * should use movabsq when reading movq */
+		emitf("mov%k %0, %=", &i, fn, f);
 		break;
 	case Ocall:
 		/* calls simply have a weird syntax in AT&T
@@ -514,19 +553,21 @@ amd64_emitfn(Fn *fn, FILE *f)
 	Ins *i, itmp;
 	int *r, c, o, n, lbl;
 	uint64_t fs;
+	char *p;
 
+	p = fn->name[0] == '"' ? "" : gassym;
 	fprintf(f, ".text\n");
 	if (fn->export)
-		fprintf(f, ".globl %s%s\n", gassym, fn->name);
+		fprintf(f, ".globl %s%s\n", p, fn->name);
 	fprintf(f,
 		"%s%s:\n"
 		"\tpushq %%rbp\n"
 		"\tmovq %%rsp, %%rbp\n",
-		gassym, fn->name
+		p, fn->name
 	);
 	fs = framesz(fn);
 	if (fs)
-		fprintf(f, "\tsub $%"PRIu64", %%rsp\n", fs);
+		fprintf(f, "\tsubq $%"PRIu64", %%rsp\n", fs);
 	if (fn->vararg) {
 		o = -176;
 		for (r=amd64_sysv_rsave; r<&amd64_sysv_rsave[6]; r++, o+=8)

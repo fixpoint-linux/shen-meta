@@ -221,7 +221,7 @@ fold(Fn *fn)
 			for (p=b->phi; p; p=p->link)
 				visitphi(p, n, fn);
 			if (b->visit == 0) {
-				for (i=b->ins; i-b->ins < b->nins; i++)
+				for (i=b->ins; i<&b->ins[b->nins]; i++)
 					visitins(i, fn);
 				visitjmp(b, n, fn);
 			}
@@ -289,7 +289,7 @@ fold(Fn *fn)
 						renref(&p->arg[a]);
 				pp = &p->link;
 			}
-		for (i=b->ins; i-b->ins < b->nins; i++)
+		for (i=b->ins; i<&b->ins[b->nins]; i++)
 			if (renref(&i->to))
 				*i = (Ins){.op = Onop};
 			else
@@ -343,7 +343,7 @@ foldint(Con *res, int op, int w, Con *cl, Con *cr)
 	if (op == Oadd) {
 		if (cl->type == CAddr) {
 			if (cr->type == CAddr)
-				err("undefined addition (addr + addr)");
+				return 1;
 			lab = cl->label;
 			typ = CAddr;
 		}
@@ -358,29 +358,26 @@ foldint(Con *res, int op, int w, Con *cl, Con *cr)
 				lab = cl->label;
 				typ = CAddr;
 			} else if (cl->label != cr->label)
-				err("undefined substraction (addr1 - addr2)");
+				return 1;
 		}
 		else if (cr->type == CAddr)
-			err("undefined substraction (num - addr)");
-	}
-	else if (cl->type == CAddr || cr->type == CAddr) {
-		if (Ocmpl <= op && op <= Ocmpl1)
 			return 1;
-		err("invalid address operand for '%s'", optab[op].name);
 	}
+	else if (cl->type == CAddr || cr->type == CAddr)
+		return 1;
 	switch (op) {
 	case Oadd:  x = l.u + r.u; break;
 	case Osub:  x = l.u - r.u; break;
-	case Odiv:  x = l.s / r.s; break;
-	case Orem:  x = l.s % r.s; break;
-	case Oudiv: x = l.u / r.u; break;
-	case Ourem: x = l.u % r.u; break;
+	case Odiv:  x = w ? l.s / r.s : (int32_t)l.s / (int32_t)r.s; break;
+	case Orem:  x = w ? l.s % r.s : (int32_t)l.s % (int32_t)r.s; break;
+	case Oudiv: x = w ? l.u / r.u : (uint32_t)l.u / (uint32_t)r.u; break;
+	case Ourem: x = w ? l.u % r.u : (uint32_t)l.u % (uint32_t)r.u; break;
 	case Omul:  x = l.u * r.u; break;
 	case Oand:  x = l.u & r.u; break;
 	case Oor:   x = l.u | r.u; break;
 	case Oxor:  x = l.u ^ r.u; break;
-	case Osar:  x = l.s >> (r.u & 63); break;
-	case Oshr:  x = l.u >> (r.u & 63); break;
+	case Osar:  x = (w ? l.s : (int32_t)l.s) >> (r.u & 63); break;
+	case Oshr:  x = (w ? l.u : (uint32_t)l.u) >> (r.u & 63); break;
 	case Oshl:  x = l.u << (r.u & 63); break;
 	case Oextsb: x = (int8_t)l.u;   break;
 	case Oextub: x = (uint8_t)l.u;  break;
@@ -459,6 +456,8 @@ foldflt(Con *res, int op, int w, Con *cl, Con *cr)
 
 	if (cl->type != CBits || cr->type != CBits)
 		err("invalid address operand for '%s'", optab[op].name);
+	*res = (Con){.type = CBits};
+	memset(&res->bits, 0, sizeof(res->bits));
 	if (w)  {
 		ld = cl->bits.d;
 		rd = cr->bits.d;
@@ -473,7 +472,8 @@ foldflt(Con *res, int op, int w, Con *cl, Con *cr)
 		case Ocast: xd = ld; break;
 		default: die("unreachable");
 		}
-		*res = (Con){CBits, .bits={.d=xd}, .flt=2};
+		res->bits.d = xd;
+		res->flt = 2;
 	} else {
 		ls = cl->bits.s;
 		rs = cr->bits.s;
@@ -488,7 +488,8 @@ foldflt(Con *res, int op, int w, Con *cl, Con *cr)
 		case Ocast: xs = ls; break;
 		default: die("unreachable");
 		}
-		*res = (Con){CBits, .bits={.s=xs}, .flt=1};
+		res->bits.s = xs;
+		res->flt = 1;
 	}
 }
 
@@ -500,7 +501,7 @@ opfold(int op, int cls, Con *cl, Con *cr, Fn *fn)
 
 	if ((op == Odiv || op == Oudiv
 	|| op == Orem || op == Ourem) && czero(cr, KWIDE(cls)))
-		err("null divisor in '%s'", optab[op].name);
+		return Bot;
 	if (cls == Kw || cls == Kl) {
 		if (foldint(&c, op, cls == Kl, cl, cr))
 			return Bot;

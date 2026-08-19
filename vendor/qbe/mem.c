@@ -12,7 +12,7 @@ memopt(Fn *fn)
 
 	/* promote uniform stack slots to temporaries */
 	b = fn->start;
-	for (i=b->ins; i-b->ins < b->nins; i++) {
+	for (i=b->ins; i<&b->ins[b->nins]; i++) {
 		if (Oalloc > i->op || i->op > Oalloc1)
 			continue;
 		/* specific to NAlign == 3 */
@@ -65,6 +65,7 @@ memopt(Fn *fn)
 				case Oloaduw:
 					if (k == Kl)
 						goto Extend;
+					/* fall through */
 				case Oload:
 					if (KBASE(k) != KBASE(l->cls))
 						l->op = Ocast;

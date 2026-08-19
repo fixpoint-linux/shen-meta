@@ -153,7 +153,7 @@ selret(Blk *b, Fn *fn)
 static int
 argsclass(Ins *i0, Ins *i1, AClass *ac, int op, AClass *aret, Ref *env)
 {
-	int nint, ni, nsse, ns, n, *pn;
+	int varc, envc, nint, ni, nsse, ns, n, *pn;
 	AClass *a;
 	Ins *i;
 
@@ -162,6 +162,8 @@ argsclass(Ins *i0, Ins *i1, AClass *ac, int op, AClass *aret, Ref *env)
 	else
 		nint = 6;
 	nsse = 8;
+	varc = 0;
+	envc = 0;
 	for (i=i0, a=ac; i<i1; i++, a++)
 		switch (i->op - op + Oarg) {
 		case Oarg:
@@ -196,14 +198,23 @@ argsclass(Ins *i0, Ins *i1, AClass *ac, int op, AClass *aret, Ref *env)
 				a->inmem = 1;
 			break;
 		case Oarge:
+			envc = 1;
 			if (op == Opar)
 				*env = i->to;
 			else
 				*env = i->arg[0];
 			break;
+		case Oargv:
+			varc = 1;
+			break;
+		default:
+			die("unreachable");
 		}
 
-	return ((6-nint) << 4) | ((8-nsse) << 8);
+	if (varc && envc)
+		err("sysv abi does not support variadic env calls");
+
+	return ((varc|envc) << 12) | ((6-nint) << 4) | ((8-nsse) << 8);
 }
 
 int amd64_sysv_rsave[] = {
@@ -290,7 +301,7 @@ selcall(Fn *fn, Ins *i0, Ins *i1, RAlloc **rap)
 {
 	Ins *i;
 	AClass *ac, *a, aret;
-	int ca, ni, ns, al, varc, envc;
+	int ca, ni, ns, al;
 	uint stk, off;
 	Ref r, r1, r2, reg[2], env;
 	RAlloc *ra;
@@ -345,7 +356,7 @@ selcall(Fn *fn, Ins *i0, Ins *i1, RAlloc **rap)
 		ra = alloc(sizeof *ra);
 		/* specific to NAlign == 3 */
 		al = aret.align >= 2 ? aret.align - 2 : 0;
-		ra->i = (Ins){Oalloc+al, r1, {getcon(aret.size, fn)}, Kl};
+		ra->i = (Ins){Oalloc+al, Kl, r1, {getcon(aret.size, fn)}};
 		ra->link = (*rap);
 		*rap = ra;
 	} else {
@@ -358,22 +369,20 @@ selcall(Fn *fn, Ins *i0, Ins *i1, RAlloc **rap)
 			ca += 1 << 2;
 		}
 	}
-	envc = !req(R, env);
-	varc = i1->op == Ovacall;
-	if (varc && envc)
-		err("sysv abi does not support variadic env calls");
-	ca |= (varc | envc) << 12;
+
 	emit(Ocall, i1->cls, R, i1->arg[0], CALL(ca));
-	if (envc)
+
+	if (!req(R, env))
 		emit(Ocopy, Kl, TMP(RAX), env, R);
-	if (varc)
+	else if ((ca >> 12) & 1) /* vararg call */
 		emit(Ocopy, Kw, TMP(RAX), getcon((ca >> 8) & 15, fn), R);
 
 	ni = ns = 0;
 	if (ra && aret.inmem)
 		emit(Ocopy, Kl, rarg(Kl, &ni, &ns), ra->i.to, R); /* pass hidden argument */
+
 	for (i=i0, a=ac; i<i1; i++, a++) {
-		if (a->inmem)
+		if (i->op >= Oarge || a->inmem)
 			continue;
 		r1 = rarg(a->cls[0], &ni, &ns);
 		if (i->op == Oargc) {
@@ -393,7 +402,7 @@ selcall(Fn *fn, Ins *i0, Ins *i1, RAlloc **rap)
 
 	r = newtmp("abi", Kl, fn);
 	for (i=i0, a=ac, off=0; i<i1; i++, a++) {
-		if (!a->inmem)
+		if (i->op >= Oarge || !a->inmem)
 			continue;
 		if (i->op == Oargc) {
 			if (a->align == 4)
@@ -427,6 +436,7 @@ selpar(Fn *fn, Ins *i0, Ins *i1)
 		fa = argsclass(i0, i1, ac, Opar, &aret, &env);
 	} else
 		fa = argsclass(i0, i1, ac, Opar, 0, &env);
+	fn->reg = amd64_sysv_argregs(CALL(fa), 0);
 
 	for (i=i0, a=ac; i<i1; i++, a++) {
 		if (i->op != Oparc || a->inmem)
@@ -465,12 +475,14 @@ selpar(Fn *fn, Ins *i0, Ins *i1)
 			s += 2;
 			continue;
 		}
+		if (i->op == Opare)
+			continue;
 		r = rarg(a->cls[0], &ni, &ns);
 		if (i->op == Oparc) {
-			emit(Ocopy, Kl, a->ref[0], r, R);
+			emit(Ocopy, a->cls[0], a->ref[0], r, R);
 			if (a->size > 8) {
 				r = rarg(a->cls[1], &ni, &ns);
-				emit(Ocopy, Kl, a->ref[1], r, R);
+				emit(Ocopy, a->cls[1], a->ref[1], r, R);
 			}
 		} else
 			emit(Ocopy, i->cls, i->to, r, R);
@@ -493,7 +505,7 @@ split(Fn *fn, Blk *b)
 	idup(&bn->ins, curi, bn->nins);
 	curi = &insb[NIns];
 	bn->visit = ++b->visit;
-	snprintf(bn->name, NString, "%s.%d", b->name, b->visit);
+	(void)!snprintf(bn->name, NString, "%s.%d", b->name, b->visit);
 	bn->loop = b->loop;
 	bn->link = b->link;
 	b->link = bn;
@@ -590,9 +602,13 @@ selvaarg(Fn *fn, Blk *b, Ins *i)
 	*b0->phi = (Phi){
 		.cls = Kl, .to = loc,
 		.narg = 2,
-		.blk = {bstk, breg},
-		.arg = {lstk, lreg},
+		.blk = vnew(2, sizeof b0->phi->blk[0], Pfn),
+		.arg = vnew(2, sizeof b0->phi->arg[0], Pfn),
 	};
+	b0->phi->blk[0] = bstk;
+	b0->phi->blk[1] = breg;
+	b0->phi->arg[0] = lstk;
+	b0->phi->arg[1] = lreg;
 	r0 = newtmp("abi", Kl, fn);
 	r1 = newtmp("abi", Kw, fn);
 	b->jmp.type = Jjnz;
@@ -642,7 +658,7 @@ amd64_sysv_abi(Fn *fn)
 		b->visit = 0;
 
 	/* lower parameters */
-	for (b=fn->start, i=b->ins; i-b->ins<b->nins; i++)
+	for (b=fn->start, i=b->ins; i<&b->ins[b->nins]; i++)
 		if (!ispar(i->op))
 			break;
 	fa = selpar(fn, b->ins, i);
@@ -669,7 +685,6 @@ amd64_sysv_abi(Fn *fn)
 				emiti(*i);
 				break;
 			case Ocall:
-			case Ovacall:
 				for (i0=i; i0>b->ins; i0--)
 					if (!isarg((i0-1)->op))
 						break;

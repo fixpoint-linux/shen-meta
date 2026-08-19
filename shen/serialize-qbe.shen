@@ -206,23 +206,17 @@
 (define qbe-lowerable? { symbol --> klambda --> boolean }
   N Code -> (trap-error (do (lower N Code (value qbe-all-names)) true) (lambda E false)))
 
-\* Initial skipped set = candidates that fail to lower (cur/trap-error). *\
-\* Plus the REGA blacklist: large HM-typechecker closures that the QBE
-   compiler (vendor/qbe, rega.c register allocation) cannot assemble
-   (Assertion `x != -1` at rega.c:571/586 on wide phi live-ranges).  Both the
-   shen.-prefixed and bare aliases are candidates, so blacklist both forms.
-   qbe-prune then drops them and any transitive callers. *\
-(set qbe-rega-blacklist
-  [shen.tc-infer-lambda shen.tc-infer-if shen.tc-infer-bool-op
-   shen.tc-type-pat-cons2 shen.tc-type-pat-list shen.tc-hm-one-clause
-   tc-infer-lambda tc-infer-if tc-infer-bool-op
-   tc-type-pat-cons2 tc-type-pat-list tc-hm-one-clause])
+\* Initial skipped set = candidates that fail to lower (cur/trap-error / dynamic
+   apply — the Slice-5 deferred constructs).  The qbe-rega-blacklist was
+   REMOVED 2026-08-19: vendor/qbe was updated to latest upstream (4420727),
+   which fixes the rega.c Assertion `x != -1` on wide phi live-ranges, so the
+   HM-typechecker closures now assemble natively.  qbe-prune drops the failures
+   and any transitive callers. *\
 
 (define qbe-skipped0 { (list (list symbol klambda)) --> (list symbol) }
   [] -> []
   [[N Code] | R] ->
-    (if (or (element? N (value qbe-rega-blacklist))
-            (not (qbe-lowerable? N Code)))
+    (if (not (qbe-lowerable? N Code))
         (cons N (qbe-skipped0 R))
         (qbe-skipped0 R)))
 

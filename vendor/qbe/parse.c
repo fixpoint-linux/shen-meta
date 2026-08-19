@@ -41,6 +41,7 @@ enum {
 	Tfunc,
 	Ttype,
 	Tdata,
+	Tsection,
 	Talign,
 	Tl,
 	Tw,
@@ -90,6 +91,7 @@ static char *kwmap[Ntok] = {
 	[Tfunc] = "function",
 	[Ttype] = "type",
 	[Tdata] = "data",
+	[Tsection] = "section",
 	[Talign] = "align",
 	[Tl] = "l",
 	[Tw] = "w",
@@ -102,6 +104,9 @@ static char *kwmap[Ntok] = {
 };
 
 enum {
+	NPred = 63,
+
+	TMask = 16383, /* for temps hash */
 	BMask = 8191, /* for blocks hash */
 
 	K = 3233235, /* found using tools/lexh.c */
@@ -122,6 +127,7 @@ static struct {
 static int lnum;
 
 static Fn *curf;
+static int tmph[TMask+1];
 static Phi **plink;
 static Blk *curb;
 static Blk **blink;
@@ -173,11 +179,9 @@ getint()
 
 	n = 0;
 	c = fgetc(inf);
-	m = 0;
-	switch (c) {
-	case '-': m = 1;
-	case '+': c = fgetc(inf);
-	}
+	m = (c == '-');
+	if (m || c == '+')
+		c = fgetc(inf);
 	do {
 		n = 10*n + (c - '0');
 		c = fgetc(inf);
@@ -227,19 +231,25 @@ lex()
 		return Tfltd;
 	case '%':
 		t = Ttmp;
+		c = fgetc(inf);
 		goto Alpha;
 	case '@':
 		t = Tlbl;
+		c = fgetc(inf);
 		goto Alpha;
 	case '$':
 		t = Tglo;
+		if ((c = fgetc(inf)) == '"')
+			goto Quoted;
 		goto Alpha;
 	case ':':
 		t = Ttyp;
+		c = fgetc(inf);
 		goto Alpha;
 	case '#':
 		while ((c=fgetc(inf)) != '\n' && c != EOF)
 			;
+		/* fall through */
 	case '\n':
 		lnum++;
 		return Tnl;
@@ -250,23 +260,25 @@ lex()
 		return Tint;
 	}
 	if (c == '"') {
-		tokval.str = vnew(0, 1, Pfn);
+		t = Tstr;
+	Quoted:
+		tokval.str = vnew(2, 1, Pfn);
+		tokval.str[0] = c;
 		esc = 0;
-		for (i=0;; i++) {
+		for (i=1;; i++) {
 			c = fgetc(inf);
 			if (c == EOF)
 				err("unterminated string");
-			vgrow(&tokval.str, i+1);
+			vgrow(&tokval.str, i+2);
+			tokval.str[i] = c;
 			if (c == '"' && !esc) {
-				tokval.str[i] = 0;
-				return Tstr;
+				tokval.str[i+1] = 0;
+				return t;
 			}
 			esc = (c == '\\' && !esc);
-			tokval.str[i] = c;
 		}
 	}
-	if (0)
-Alpha:		c = fgetc(inf);
+Alpha:
 	if (!isalpha(c) && c != '.' && c != '_')
 		err("invalid character %c (%d)", c, c);
 	i = 0;
@@ -347,11 +359,19 @@ expect(int t)
 static Ref
 tmpref(char *v)
 {
-	int t;
+	int t, *h;
 
-	for (t=Tmp0; t<curf->ntmp; t++)
-		if (strcmp(v, curf->tmp[t].name) == 0)
+	h = &tmph[hash(v) & TMask];
+	t = *h;
+	if (t) {
+		if (strcmp(curf->tmp[t].name, v) == 0)
 			return TMP(t);
+		for (t=curf->ntmp-1; t>=Tmp0; t--)
+			if (strcmp(curf->tmp[t].name, v) == 0)
+				return TMP(t);
+	}
+	t = curf->ntmp;
+	*h = t;
 	newtmp(0, Kx, curf);
 	strcpy(curf->tmp[t].name, v);
 	return TMP(t);
@@ -430,53 +450,69 @@ parsecls(int *tyn)
 static int
 parserefl(int arg)
 {
-	int k, ty, env, hasenv;
+	int k, ty, env, hasenv, vararg;
 	Ref r;
 
 	hasenv = 0;
+	vararg = 0;
 	expect(Tlparen);
-	while (peek() != Trparen && peek() != Tdots) {
+	while (peek() != Trparen) {
 		if (curi - insb >= NIns)
 			err("too many instructions (1)");
-		env = peek() == Tenv;
-		if (env) {
+		if (!arg && vararg)
+			err("no parameters allowed after '...'");
+		switch (peek()) {
+		case Tdots:
+			if (vararg)
+				err("only one '...' allowed");
+			vararg = 1;
+			if (arg) {
+				*curi = (Ins){.op = Oargv};
+				curi++;
+			}
+			next();
+			goto Next;
+		case Tenv:
+			if (hasenv)
+				err("only one environment allowed");
+			hasenv = 1;
+			env = 1;
 			next();
 			k = Kl;
-		} else
+			break;
+		default:
+			env = 0;
 			k = parsecls(&ty);
+			break;
+		}
 		r = parseref();
 		if (req(r, R))
 			err("invalid argument");
-		if (hasenv && env)
-			err("only one environment allowed");
 		if (!arg && rtype(r) != RTmp)
 			err("invalid function parameter");
 		if (k == 4)
 			if (arg)
-				*curi = (Ins){Oargc, R, {TYPE(ty), r}, Kl};
+				*curi = (Ins){Oargc, Kl, R, {TYPE(ty), r}};
 			else
-				*curi = (Ins){Oparc, r, {TYPE(ty)}, Kl};
+				*curi = (Ins){Oparc, Kl, r, {TYPE(ty)}};
 		else if (env)
 			if (arg)
-				*curi = (Ins){Oarge, R, {r}, k};
+				*curi = (Ins){Oarge, k, R, {r}};
 			else
-				*curi = (Ins){Opare, r, {R}, k};
+				*curi = (Ins){Opare, k, r, {R}};
 		else
 			if (arg)
-				*curi = (Ins){Oarg, R, {r}, k};
+				*curi = (Ins){Oarg, k, R, {r}};
 			else
-				*curi = (Ins){Opar, r, {R}, k};
+				*curi = (Ins){Opar, k, r, {R}};
 		curi++;
-		hasenv |= env;
+	Next:
 		if (peek() == Trparen)
 			break;
 		expect(Tcomma);
 	}
-	if (next() == Tdots) {
-		expect(Trparen);
-		return 1;
-	}
-	return 0;
+	expect(Trparen);
+	return vararg;
 }
 
 static Blk *
@@ -601,10 +637,8 @@ DoOp:
 	}
 	if (op == Tcall) {
 		arg[0] = parseref();
-		if (parserefl(1))
-			op = Ovacall;
-		else
-			op = Ocall;
+		parserefl(1);
+		op = Ocall;
 		expect(Tnl);
 		if (k == 4) {
 			k = Kl;
@@ -613,7 +647,9 @@ DoOp:
 			arg[1] = R;
 		goto Ins;
 	}
-	if (op >= Tloadw && op <= Tloadd)
+	if (op == Tloadw)
+		op = Oloadsw;
+	if (op >= Tloadl && op <= Tloadd)
 		op = Oload;
 	if (op == Talloc1 || op == Talloc2)
 		op = Oalloc;
@@ -657,7 +693,9 @@ Ins:
 		phi = alloc(sizeof *phi);
 		phi->to = r;
 		phi->cls = k;
+		phi->arg = vnew(i, sizeof arg[0], Pfn);
 		memcpy(phi->arg, arg, i * sizeof arg[0]);
+		phi->blk = vnew(i, sizeof blk[0], Pfn);
 		memcpy(phi->blk, blk, i * sizeof blk[0]);
 		phi->narg = i;
 		*plink = phi;
@@ -691,7 +729,7 @@ typecheck(Fn *fn)
 	for (b=fn->start; b; b=b->link) {
 		for (p=b->phi; p; p=p->link)
 			fn->tmp[p->to.val].cls = p->cls;
-		for (i=b->ins; i-b->ins < b->nins; i++)
+		for (i=b->ins; i<&b->ins[b->nins]; i++)
 			if (rtype(i->to) == RTmp) {
 				t = &fn->tmp[i->to.val];
 				if (clsmerge(&t->cls, i->cls))
@@ -719,7 +757,7 @@ typecheck(Fn *fn)
 			if (!bsequal(pb, ppb))
 				err("predecessors not matched in phi %%%s", t->name);
 		}
-		for (i=b->ins; i-b->ins < b->nins; i++)
+		for (i=b->ins; i<&b->ins[b->nins]; i++)
 			for (n=0; n<2; n++) {
 				k = optab[i->op].argcls[n][i->cls];
 				r = i->arg[n];
@@ -791,7 +829,7 @@ parsefn(int export)
 		rcls = 5;
 	if (next() != Tglo)
 		err("function name expected");
-	strcpy(curf->name, tokval.str);
+	strncpy(curf->name, tokval.str, NString-1);
 	curf->vararg = parserefl(0);
 	if (nextnl() != Tlbrace)
 		err("function body must start with {");
@@ -811,6 +849,7 @@ parsefn(int export)
 		b->dlink = 0; /* was trashed by findblk() */
 	for (i=0; i<BMask+1; ++i)
 		blkh[i] = 0;
+	memset(tmph, 0, sizeof tmph);
 	typecheck(curf);
 	return curf;
 }
@@ -844,9 +883,9 @@ parsefields(Field *fld, Typ *ty, int t)
 		}
 		if (a > al)
 			al = a;
-		a = sz & (s-1);
+		a = (1 << a) - 1;
+		a = ((sz + a) & ~a) - sz;
 		if (a) {
-			a = s - a;
 			if (n < NField) {
 				/* padding */
 				fld[n].type = FPad;
@@ -963,29 +1002,36 @@ parsedatstr(Dat *d)
 static void
 parsedat(void cb(Dat *), int export)
 {
-	char s[NString];
+	char name[NString] = {0};
 	int t;
 	Dat d;
 
-	d.type = DStart;
-	d.isstr = 0;
-	d.isref = 0;
-	d.export = export;
-	cb(&d);
 	if (nextnl() != Tglo || nextnl() != Teq)
 		err("data name, then = expected");
-	strcpy(s, tokval.str);
+	strncpy(name, tokval.str, NString-1);
 	t = nextnl();
+	d.u.str = 0;
+	if (t == Tsection) {
+		if (nextnl() != Tstr)
+			err("section \"name\" expected");
+		d.u.str = tokval.str;
+		t = nextnl();
+	}
+	d.type = DStart;
+	cb(&d);
 	if (t == Talign) {
 		if (nextnl() != Tint)
 			err("alignment expected");
 		d.type = DAlign;
 		d.u.num = tokval.num;
+		d.isstr = 0;
+		d.isref = 0;
 		cb(&d);
 		t = nextnl();
 	}
 	d.type = DName;
-	d.u.str = s;
+	d.u.str = name;
+	d.export = export;
 	cb(&d);
 
 	if (t != Tlbrace)
@@ -1004,8 +1050,8 @@ parsedat(void cb(Dat *), int export)
 		}
 		t = nextnl();
 		do {
-			d.isref = 0;
 			d.isstr = 0;
+			d.isref = 0;
 			memset(&d.u, 0, sizeof d.u);
 			if (t == Tflts)
 				d.u.flts = tokval.flts;
@@ -1180,7 +1226,7 @@ printfn(Fn *fn, FILE *f)
 					fprintf(f, ", ");
 			}
 		}
-		for (i=b->ins; i-b->ins < b->nins; i++) {
+		for (i=b->ins; i<&b->ins[b->nins]; i++) {
 			fprintf(f, "\t");
 			if (!req(i->to, R)) {
 				printref(i->to, fn, f);

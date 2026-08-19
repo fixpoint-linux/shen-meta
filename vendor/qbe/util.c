@@ -246,13 +246,15 @@ void
 idup(Ins **pd, Ins *s, ulong n)
 {
 	*pd = alloc(n * sizeof(Ins));
-	memcpy(*pd, s, n * sizeof(Ins));
+	if (n)
+		memcpy(*pd, s, n * sizeof(Ins));
 }
 
 Ins *
 icpy(Ins *d, Ins *s, ulong n)
 {
-	memcpy(d, s, n * sizeof(Ins));
+	if (n)
+		memcpy(d, s, n * sizeof(Ins));
 	return d + n;
 }
 
@@ -360,19 +362,21 @@ getcon(int64_t val, Fn *fn)
 	return CON(c);
 }
 
-void
+int
 addcon(Con *c0, Con *c1)
 {
 	if (c0->type == CUndef)
 		*c0 = *c1;
 	else {
 		if (c1->type == CAddr) {
-			assert(c0->type != CAddr && "adding two addresses");
+			if (c0->type == CAddr)
+				return 0;
 			c0->type = CAddr;
 			c0->label = c1->label;
 		}
 		c0->bits.i += c1->bits.i;
 	}
+	return 1;
 }
 
 void
@@ -380,7 +384,7 @@ blit(Ref rdst, uint doff, Ref rsrc, uint sz, Fn *fn)
 {
 	struct { int st, ld, cls, size; } *p, tbl[] = {
 		{ Ostorel, Oload,   Kl, 8 },
-		{ Ostorew, Oload,   Kw, 8 },
+		{ Ostorew, Oload,   Kw, 4 },
 		{ Ostoreh, Oloaduh, Kw, 2 },
 		{ Ostoreb, Oloadub, Kw, 1 }
 	};

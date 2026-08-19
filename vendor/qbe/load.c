@@ -77,7 +77,7 @@ iins(int cls, int op, Ref a0, Ref a1, Loc *l)
 	ist->num = inum++;
 	ist->bid = l->blk->id;
 	ist->off = l->off;
-	ist->new.ins = (Ins){op, R, {a0, a1}, cls};
+	ist->new.ins = (Ins){op, cls, R, {a0, a1}};
 	return ist->new.ins.to = newtmp("ld", cls, curf);
 }
 
@@ -92,14 +92,17 @@ cast(Ref *r, int cls, Loc *l)
 	cls0 = curf->tmp[r->val].cls;
 	if (cls0 == cls || (cls == Kw && cls0 == Kl))
 		return;
-	assert(!KWIDE(cls0) || KWIDE(cls));
-	if (KWIDE(cls) == KWIDE(cls0))
-		*r = iins(cls, Ocast, *r, R, l);
-	else {
-		assert(cls == Kl);
+	if (KWIDE(cls0) < KWIDE(cls)) {
 		if (cls0 == Ks)
 			*r = iins(Kw, Ocast, *r, R, l);
 		*r = iins(Kl, Oextuw, *r, R, l);
+		if (cls == Kd)
+			*r = iins(Kd, Ocast, *r, R, l);
+	} else {
+		if (cls0 == Kd && cls != Kl)
+			*r = iins(Kl, Ocast, *r, R, l);
+		if (cls0 != Kd || cls != Kw)
+			*r = iins(cls, Ocast, *r, R, l);
 	}
 }
 
@@ -330,6 +333,8 @@ def(Slice sl, bits msk, Blk *b, Ins *i, Loc *il)
 	p->to = r;
 	p->cls = sl.cls;
 	p->narg = b->npred;
+	p->arg = vnew(p->narg, sizeof p->arg[0], Pfn);
+	p->blk = vnew(p->narg, sizeof p->blk[0], Pfn);
 	for (np=0; np<b->npred; ++np) {
 		bp = b->pred[np];
 		if (!bp->s2
@@ -434,6 +439,7 @@ loadopt(Fn *fn)
 							i->op = ext;
 							break;
 						}
+						/* fall through */
 					case Oload:
 						i->op = Ocopy;
 						break;

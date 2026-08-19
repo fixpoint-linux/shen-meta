@@ -13,7 +13,7 @@ AMD64OBJ = $(AMD64SRC:%.c=$(OBJDIR)/%.o)
 ARM64OBJ = $(ARM64SRC:%.c=$(OBJDIR)/%.o)
 OBJ      = $(SRC:%.c=$(OBJDIR)/%.o) $(AMD64OBJ) $(ARM64OBJ)
 
-CFLAGS += -Wall -fPIC -Wextra -std=c99 -g -pedantic
+CFLAGS += -Wall -Wextra -std=c99 -g -pedantic
 
 $(OBJDIR)/$(BIN): $(OBJ) $(OBJDIR)/timestamp
 	@test -z "$(V)" || echo "ld $@"
@@ -32,7 +32,7 @@ $(OBJDIR)/timestamp:
 $(OBJ): all.h ops.h
 $(AMD64OBJ): amd64/all.h
 $(ARM64OBJ): arm64/all.h
-obj/main.o: config.h
+$(OBJDIR)/main.o: config.h
 
 config.h:
 	@case `uname` in                               \
@@ -44,7 +44,7 @@ config.h:
 		echo "#define Defasm Gaself";          \
 		case `uname -m` in                     \
 		*aarch64*)                             \
-			echo "$define Deftgt T_arm64"; \
+			echo "#define Deftgt T_arm64"; \
 			;;                             \
 		*)                                     \
 			echo "#define Deftgt T_amd64_sysv";\

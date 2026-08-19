@@ -24,13 +24,13 @@ enum Asm {
 
 char debug['Z'+1] = {
 	['P'] = 0, /* parsing */
-	['A'] = 0, /* abi lowering */
-	['I'] = 0, /* instruction selection */
-	['L'] = 0, /* liveness */
 	['M'] = 0, /* memory optimization */
 	['N'] = 0, /* ssa construction */
 	['C'] = 0, /* copy elimination */
 	['F'] = 0, /* constant folding */
+	['A'] = 0, /* abi lowering */
+	['I'] = 0, /* instruction selection */
+	['L'] = 0, /* liveness */
 	['S'] = 0, /* spilling */
 	['R'] = 0, /* reg. allocation */
 };
@@ -65,10 +65,10 @@ func(Fn *fn)
 	fillpreds(fn);
 	filluse(fn);
 	memopt(fn);
+	filluse(fn);
 	ssa(fn);
 	filluse(fn);
 	ssacheck(fn);
-	fillloop(fn);
 	fillalias(fn);
 	loadopt(fn);
 	filluse(fn);
@@ -82,6 +82,7 @@ func(Fn *fn)
 	T.isel(fn);
 	fillrpo(fn);
 	filllive(fn);
+	fillloop(fn);
 	fillcost(fn);
 	spill(fn);
 	rega(fn);
@@ -192,8 +193,11 @@ main(int ac, char *av[])
 		parse(inf, f, data, func);
 	} while (++optind < ac);
 
-	if (!dbg)
+	if (!dbg) {
 		gasemitfin(outf);
+		if (asm == Gaself)
+			fprintf(outf, ".section .note.GNU-stack,\"\",@progbits\n");
+	}
 
 	exit(0);
 }

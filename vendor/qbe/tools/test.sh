@@ -2,26 +2,36 @@
 
 dir=`cd $(dirname "$0"); pwd`
 bin=$dir/../obj/qbe
+binref=$dir/../obj/qbe.ref
 
 tmp=/tmp/qbe.zzzz
 
 drv=$tmp.c
 asm=$tmp.s
+asmref=$tmp.ref.s
 exe=$tmp.exe
 out=$tmp.out
+
+testcc() {
+	echo "int main() { }" | $1 -x c -o /dev/null - >/dev/null 2>&1
+	return $?
+}
 
 init() {
 	case "$TARGET" in
 	arm64)
 		for p in aarch64-linux-musl aarch64-linux-gnu
 		do
-			cc=$p-gcc
-			qemu="qemu-aarch64 -L /usr/$p"
+			cc="$p-gcc -no-pie -static"
+			qemu="qemu-aarch64"
 			if
 				$cc -v >/dev/null 2>&1 &&
-				$qemu -version >/dev/null 2>&1 &&
-				test -d /usr/$p
+				$qemu -version >/dev/null 2>&1
 			then
+				if sysroot=$($cc -print-sysroot) && test -n "$sysroot"
+				then
+					qemu="$qemu -L $sysroot"
+				fi
 				break
 			fi
 			cc=
@@ -31,7 +41,7 @@ init() {
 			echo "Cannot find arm64 compiler or qemu."
 			exit 1
 		fi
-                bin="$bin -t arm64"
+		bin="$bin -t arm64"
 		;;
 	"")
 		case `uname` in
@@ -46,6 +56,7 @@ init() {
 			;;
 		*)
 			cc="cc -no-pie"
+			testcc "$cc" || cc="cc"
 			;;
 		esac
 		;;
@@ -103,6 +114,11 @@ once() {
 		return 1
 	fi
 
+	if test -x $binref
+	then
+		$binref -o $asmref $t 2>/dev/null
+	fi
+
 	extract driver $t > $drv
 	extract output $t > $out
 
@@ -121,13 +137,13 @@ once() {
 
 	if test -s $out
 	then
-		$qemu $exe a b c | diff - $out
+		$qemu $exe a b c | diff -u - $out
 		ret=$?
 		reason="output"
 	else
 		$qemu $exe a b c
 		ret=$?
-		reason="returned $RET"
+		reason="returned $ret"
 	fi
 
 	if test $ret -ne 0
@@ -137,6 +153,14 @@ once() {
 	fi
 
 	echo "[ok]"
+
+	if test -f $asmref && ! cmp -s $asm $asmref
+	then
+		loc0=`wc -l $asm    | cut -d' ' -f1`
+		loc1=`wc -l $asmref | cut -d' ' -f1`
+		printf "    asm diff: %+d\n" $(($loc0 - $loc1))
+		return 0
+	fi
 }
 
 #trap cleanup TERM QUIT

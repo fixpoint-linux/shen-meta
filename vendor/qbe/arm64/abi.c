@@ -72,6 +72,7 @@ isfloatv(Typ *t, char *cls)
 			case FTyp:
 				if (isfloatv(&typ[f->len], cls))
 					break;
+				/* fall through */
 			default:
 				return 0;
 			}
@@ -254,6 +255,10 @@ argsclass(Ins *i0, Ins *i1, Class *carg, Ref *env)
 		case Oarge:
 			*env = i->arg[0];
 			break;
+		case Oargv:
+			break;
+		default:
+			die("unreachable");
 		}
 
 	return ((gp-gpreg) << 5) | ((fp-fpreg) << 9);
@@ -307,15 +312,14 @@ stkblob(Ref r, Class *c, Fn *fn, Insl **ilp)
 {
 	Insl *il;
 	int al;
+	uint64_t sz;
 
 	il = alloc(sizeof *il);
 	al = c->t->align - 2; /* NAlign == 3 */
 	if (al < 0)
 		al = 0;
-	il->i = (Ins){
-		Oalloc + al, r,
-		{getcon(c->t->size, fn)}, Kl
-	};
+	sz = c->class & Cptr ? c->t->size : c->size;
+	il->i = (Ins){Oalloc+al, Kl, r, {getcon(sz, fn)}};
 	il->link = *ilp;
 	*ilp = il;
 }
@@ -354,7 +358,7 @@ selcall(Fn *fn, Ins *i0, Ins *i1, Insl **ilp)
 		stkblob(i1->to, &cr, fn, ilp);
 		cty |= (cr.nfp << 2) | cr.ngp;
 		if (cr.class & Cptr) {
-			cty |= 1 << 13;
+			cty |= 1 << 13 | 1;
 			emit(Ocopy, Kw, R, TMP(R0), R);
 		} else {
 			sttmps(tmp, cr.cls, cr.nreg, i1->to, fn);
@@ -373,10 +377,11 @@ selcall(Fn *fn, Ins *i0, Ins *i1, Insl **ilp)
 		}
 	}
 
+	emit(Ocall, 0, R, i1->arg[0], CALL(cty));
+
 	envc = !req(R, env);
 	if (envc)
 		die("todo (arm abi): env calls");
-	emit(Ocall, 0, R, i1->arg[0], CALL(cty));
 
 	if (cty & (1 << 13))
 		/* struct return argument */
@@ -385,9 +390,9 @@ selcall(Fn *fn, Ins *i0, Ins *i1, Insl **ilp)
 	for (i=i0, c=ca; i<i1; i++, c++) {
 		if ((c->class & Cstk) != 0)
 			continue;
-		if (i->op != Oargc)
+		if (i->op == Oarg)
 			emit(Ocopy, *c->cls, TMP(*c->reg), i->arg[0], R);
-		else
+		if (i->op == Oargc)
 			ldregs(c->reg, c->cls, c->nreg, i->arg[1], fn);
 	}
 
@@ -395,11 +400,12 @@ selcall(Fn *fn, Ins *i0, Ins *i1, Insl **ilp)
 	for (i=i0, c=ca; i<i1; i++, c++) {
 		if ((c->class & Cstk) == 0)
 			continue;
-		if (i->op != Oargc) {
+		if (i->op == Oarg) {
 			r = newtmp("abi", Kl, fn);
 			emit(Ostorel, 0, R, i->arg[0], r);
 			emit(Oadd, Kl, r, TMP(SP), getcon(off, fn));
-		} else
+		}
+		if (i->op == Oargc)
 			blit(TMP(SP), off, i->arg[1], c->size, fn);
 		off += c->size;
 	}
@@ -425,6 +431,7 @@ selpar(Fn *fn, Ins *i0, Ins *i1)
 	curi = &insb[NIns];
 
 	cty = argsclass(i0, i1, ca, &env);
+	fn->reg = arm64_argregs(CALL(cty), 0);
 
 	il = 0;
 	t = tmp;
@@ -443,6 +450,7 @@ selpar(Fn *fn, Ins *i0, Ins *i1)
 		if (cr.class & Cptr) {
 			fn->retr = newtmp("abi", Kl, fn);
 			emit(Ocopy, Kl, fn->retr, TMP(R8), R);
+			fn->reg |= BIT(R8);
 		}
 	}
 
@@ -490,7 +498,7 @@ split(Fn *fn, Blk *b)
 	idup(&bn->ins, curi, bn->nins);
 	curi = &insb[NIns];
 	bn->visit = ++b->visit;
-	snprintf(bn->name, NString, "%s.%d", b->name, b->visit);
+	(void)!snprintf(bn->name, NString, "%s.%d", b->name, b->visit);
 	bn->loop = b->loop;
 	bn->link = b->link;
 	b->link = bn;
@@ -585,9 +593,13 @@ selvaarg(Fn *fn, Blk *b, Ins *i)
 	*b0->phi = (Phi){
 		.cls = Kl, .to = loc,
 		.narg = 2,
-		.blk = {bstk, breg},
-		.arg = {lstk, lreg},
+		.blk = vnew(2, sizeof b0->phi->blk[0], Pfn),
+		.arg = vnew(2, sizeof b0->phi->arg[0], Pfn),
 	};
+	b0->phi->blk[0] = bstk;
+	b0->phi->blk[1] = breg;
+	b0->phi->arg[0] = lstk;
+	b0->phi->arg[1] = lreg;
 	r0 = newtmp("abi", Kl, fn);
 	r1 = newtmp("abi", Kw, fn);
 	b->jmp.type = Jjnz;
@@ -645,7 +657,7 @@ arm64_abi(Fn *fn)
 		b->visit = 0;
 
 	/* lower parameters */
-	for (b=fn->start, i=b->ins; i-b->ins<b->nins; i++)
+	for (b=fn->start, i=b->ins; i<&b->ins[b->nins]; i++)
 		if (!ispar(i->op))
 			break;
 	p = selpar(fn, b->ins, i);
@@ -672,7 +684,6 @@ arm64_abi(Fn *fn)
 				emiti(*i);
 				break;
 			case Ocall:
-			case Ovacall:
 				for (i0=i; i0>b->ins; i0--)
 					if (!isarg((i0-1)->op))
 						break;
