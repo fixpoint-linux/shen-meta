@@ -1962,8 +1962,8 @@ int main(int argc, char **argv) {
                     const char *path_str = "shen/probe-kl/test-add.kl";
 
                     /* Ordered Shen OS kernel load probe.  Loads the real OS .kl
-                     * files in the same order shen-scheme uses (shen/serialize.shen),
-                     * each via interp-load-raw (defuns land in the meta-interp's
+                     * files in the standard Shen OS Kernel load order, each via
+                     * interp-load-raw (defuns land in the meta-interp's
                      * global-table, namespace 2).  Reports per-file result and
                      * stops at the first file that does NOT return `loaded`.
                      * Runs AFTER the test-add.kl probe so the mechanism is already

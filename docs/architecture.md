@@ -32,7 +32,7 @@ Shen source → kmacros → normalize-term → debruijn → zinc-c → compile-z
 - `shen/compile.shen` — ZINC → canonical s-expression (csexp)
 - `shen/primitives.shen` — 37 type-checked safe wrappers
 - `vm/zincvm.c` — native C parser + VM (~1800+ lines, includes GC)
-- `shen/serialize.shen` — compile all closures from global-table to csexp bundle
+- `shen/serialize-reduced.shen` — serialize the reduced bundle's global-table to csexp (`globals.csexp`)
 - `shen/toplevel.shen` — `interp-eval` — compiles defun forms through interpreter
 - `shen/load.shen` — `interp-load` / `interp-load-raw` — file loading
 - `shen/util.shen` — `defun->lambda`, `primitive?` (single source of truth), `dedupe-globals`
@@ -75,12 +75,12 @@ self-contained interpreter** (meta-interpreter `.shen` + the type-safe `.kl`
 base: `core/declarations/types/macros/load/toplevel/sys/dict/track/reader/writer`,
 excluding the heavy OS). It self-hosts guard-free (exit 0).
 
-The full Shen OS bundle (`make bundle-full` → `globals-full.csexp`) is
-type-unsafe (`shen.initialise` does `+ - * /` on non-numbers) and **CANNOT run on
-the guard-free release VM** — it segfaults; run it with
-`./zincvm-debug globals-full.csexp`. Root cause of the type-unsafety (confirmed):
-the type-unsafe code lives in the heavy OS (`prolog`/`yacc`/`sequent`/`t-star`/
-`stlib`/extensions) pulled in by `shen.initialise`.
+The full Shen OS is not serialized into a second bundle — it is loaded from
+`.kl` at **runtime** by the C VM's `--repl` mode (`./zincvm globals.csexp
+--repl` loads the OS kernel `.kl` into the meta-interpreter via
+`interp-load-raw`, then runs `shen.initialise`/`shen.repl`). It is type-unsafe
+(`shen.initialise` does `+ - * /` on non-numbers), which is exactly why it is
+interpreted rather than compiled into the guard-free release VM.
 
 Always-on throw sites that are NOT type guards and stay in release: `simple-error`,
 `fail`, `apply`/`appterm` non-callable + too-many-args, `env_pop`, `eval-kl` catch,

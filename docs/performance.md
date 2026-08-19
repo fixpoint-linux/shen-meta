@@ -259,8 +259,10 @@ These are already linear (build via direct conses, not `append`). Once `zinc-c` 
 tail-threaded the whole compile pipeline is O(n). No changes needed.
 
 ### D6. Alternative strategy if D1 alone isn't enough — pre-bundle the OS offline
-Skip runtime compilation of the OS `.kl` files entirely by pre-bundling them via
-`make bundle-full`. AGENTS.md notes the full bundle is type-unsafe and segfaults the
-release VM, but works under `./zincvm-debug`. If the goal is just "load stlib.kl",
-pre-bundling sidesteps the metacircular compile cost. Not needed — D1 already
-cleared the hard limit.
+Skip runtime compilation of the OS `.kl` files entirely by pre-bundling them. The
+full-OS bundle (`make bundle-full`) was removed — the OS now runs at runtime via
+the C VM's `--repl` mode (`interp-load-raw` of `.kl` into the meta-interpreter);
+the full OS is type-unsafe and was never runnable on the release VM. If the goal
+is just "load stlib.kl", a native pre-bundling of the OS would sidestep the
+metacircular compile cost, but it was removed as out of scope. Not needed — D1
+already cleared the hard limit.

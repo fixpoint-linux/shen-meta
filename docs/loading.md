@@ -9,15 +9,14 @@ raw s-expression parser, the bytecode decompiler, and the REPL.
   `global-table` via `defun->lambda → kl->zinc → toplevel-interp`.
 - `interp-load` in `load.shen` reads a file with `read-file`, feeds each `defun`
   through `interp-eval`; errors in individual forms are caught and skipped.
-- `serialize.shen` loads `interp.shen`, calls `interp-load` on `.kl` files to
-  populate `global-table`, then walks the table and serializes all closures.
+- `serialize-reduced.shen` walks the deduped `global-table` and serializes all
+  closures to `globals.csexp` (the reduced self-contained bundle).
 - Output goes to file via `open`/`pr`/`close` — `print` wraps long lines and
   `grep '^"'` truncates multi-line bundles.
 - `pr` writes raw string to a stream; `(stoutput)` is stdout.
-- ~1216 closures in the FULL OS bundle (~1.4MB; ~1.6MB with prefix aliases) —
-  `make bundle-full` → `globals-full.csexp`. The canonical **reduced**
-  self-contained bundle (`make bundle` → `globals.csexp`) is ~786 closures /
-  ~0.5MB.
+- The canonical **reduced** self-contained bundle (`make bundle` →
+  `globals.csexp`) is ~786 closures / ~0.5MB. The full Shen OS is not a second
+  bundle — the C VM's `--repl` mode loads it from `.kl` at runtime.
 - All 24 KLambda files loaded (full bundle): core through shen-scheme-extensions + stlib + init.
 
 ### Module system & package prefixing
@@ -33,16 +32,16 @@ raw s-expression parser, the bytecode decompiler, and the REPL.
      which adds the `shen.` prefix → bytecode references `shen.<e>`.
   2. `.kl` files — loaded via `interp-load`, which stores closures under raw
      names → definitions at `<e>` without prefix.
-- **Fix**: `serialize.shen` runs `shen.add-prefix-aliases` after all interp-loads,
-  creating `shen.<name>` entries for unprefixed closure names. Both `<e>` and
-  `shen.<e>` resolve to the same closure.
+- **Fix**: `serialize-reduced.shen` runs `shen.add-prefix-aliases` after all
+  interp-loads, creating `shen.<name>` entries for unprefixed closure names. Both
+  `<e>` and `shen.<e>` resolve to the same closure.
 - **Do NOT add module prefix aliasing in the C VM** — it belongs at the Shen
   pipeline level, during bundle creation. The C VM should only consume
   correctly-named bundles. This applies especially to `=` and `deep_equal`: never
   make them `shen.`-prefix-aware; prefix consistency is enforced by the pipeline.
 - `interp-load` does NOT apply package prefixing itself (unlike Shen's
   `eval-and-print` which goes through the reader). The post-load aliasing step in
-  `serialize.shen` is the correct place to reconcile the mismatch.
+  `serialize-reduced.shen` is the correct place to reconcile the mismatch.
 
 ### Close-the-loop (runtime `.kl` loading) is PARTIAL
 

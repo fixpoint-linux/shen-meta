@@ -61,8 +61,8 @@
 (shen-load "shen/tc-hm-tests.shen")
 
 \* === Safe-wrapper aliases: point short names to our-compiled safe.N closures ===
-   serialize.shen (full bundle) relies on interp.shen's set-toplevel calls for
-   these toplevel aliases.  Here we OVERWRITE them with our full-arity compiled
+   The full-OS build (removed serialize.shen) relied on interp.shen's set-toplevel
+   calls for these toplevel aliases.  Here we OVERWRITE them with our full-arity compiled
    closures by prepending [Short (lookup-global Safe)] to global-table, so the
    bundle's N resolves to the SAME closure object as safe.N (eliminating the
    host-compiled `(ps X)` path from the reduced bundle).  dedupe-globals keeps

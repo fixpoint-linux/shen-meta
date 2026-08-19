@@ -113,9 +113,10 @@ This design was chosen through a recorded chain of decisions:
 - **Pipeline seam** (`shen/compile.shen:64-66,117`): `zinc->native = nat->csexp ∘
   compile-zinc`. The QBE emitter slots in as a sibling of `nat->csexp` over the
   **same resolved `klambda`** that `nat->csexp` consumes.
-- **Bundle** (`shen/serialize.shen`, `shen/serialize-reduced.shen`): walks
-  `global-table`, emits `(name c(cur-code…))` per closure via `zinc->native`. The
-  reduced bundle is the type-safe subset; the full OS bundle is type-unsafe.
+- **Bundle** (`shen/serialize-reduced.shen`): walks `global-table`, emits
+  `(name c(cur-code…))` per closure via `zinc->native`. The reduced bundle is the
+  type-safe subset; the full Shen OS is not serialized — the C VM's `--repl` mode
+  loads it from `.kl` into the meta-interpreter at runtime.
 
 ---
 
@@ -353,11 +354,13 @@ returns the result `Value`. Both thunks are `@clo` functions. This keeps
 longjmp/setjmp entirely inside trusted C, never in generated QBE (QBE doesn't model
 `setjmp`).
 
-### 4.6 Fallback for the full (type-unsafe) bundle
+### 4.6 Fallback for the full (type-unsafe) OS
 
-If `globals-full.csexp` is ever lowered, static-arity breaks (partial application,
-dynamic `apply`). Fallback keeps a real `Stk` as a `Value*` array (via
-`GC_VALUE_ARRAY`), pushes real marks, and `apply`/`appterm` call a generic
+The full Shen OS is not serialized into `globals-full.csexp` anymore (that bundle
+was removed — the OS runs at runtime via the C VM's `--repl` mode loading `.kl`
+into the meta-interpreter). If the full OS were ever lowered, static-arity breaks
+(partial application, dynamic `apply`). Fallback keeps a real `Stk` as a `Value*`
+array (via `GC_VALUE_ARRAY`), pushes real marks, and `apply`/`appterm` call a generic
 `@apply_dynamic` scanning to the mark — C-VM-equivalent code in QBE, **not covered
 by the proof**, exists only as a differential-test target. Recommend *not* building
 this initially (§8).
@@ -525,9 +528,9 @@ Shen source
 ```
 
 `lower` is a sibling of `nat->csexp`, consuming the same `compile-zinc` output. A
-new `serialize-qbe.shen` (parallel to `serialize.shen`) walks `global-table` and
-emits `lower(Code)` per closure into a `.qbe` file; closures reference each other
-by `@clo_<Name>`; a shared header declares prototypes.
+new `serialize-qbe.shen` (parallel to `serialize-reduced.shen`) walks
+`global-table` and emits `lower(Code)` per closure into a `.qbe` file; closures
+reference each other by `@clo_<Name>`; a shared header declares prototypes.
 
 ### 7.2 Differential testing against `vm_exec_env`
 
@@ -623,7 +626,7 @@ any closure outside it is rejected (not silently admitted). Requires Stage 1.
 *Gate:* no leaks, no missed roots (ASan + `vm/gc.c` assertions).
 
 **Stage 6 (optional) — Full-OS dynamic fallback.** Build §4.6 varargs lowering so
-`qberun` can run `globals-full.csexp` (unproven). *Gate:* `shen.initialise` returns.
+`qberun` can run the full OS natively (unproven). *Gate:* `shen.initialise` returns.
 
 ### Open questions
 
@@ -667,5 +670,5 @@ parity.
 
 **Do not** build the §4.6 full-OS dynamic lowering until Stages 0-5 are done — it
 doubles complexity for a path that's *by construction* unproven. Defer until there's a
-concrete reason to run the full OS natively rather than via `zincvm-debug
-globals-full.csexp`.
+concrete reason to run the full OS natively rather than via the runtime `--repl` path
+(the C VM's `interp-load-raw` of `.kl` into the meta-interpreter).

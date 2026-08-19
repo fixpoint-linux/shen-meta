@@ -74,9 +74,9 @@ enclosing `if (cond) PRIM_TYPE_ERROR(...)` (no comparison, no type check, no
 runtime cost). This is safe ONLY for a type-safe bundle: the canonical bundle
 (`make bundle` → `globals.csexp`) is the **reduced self-contained interpreter**
 (meta-interpreter + safe-subset helpers), which never passes bad types. The full
-Shen OS bundle (`make bundle-full` → `globals-full.csexp`) is type-unsafe
-(`shen.initialise` does `+ - * /` on non-numbers) and CANNOT run on the guard-free
-release VM — it segfaults; run it with `./zincvm-debug globals-full.csexp`.
+Shen OS is not serialized into a second bundle — it runs by loading its `.kl`
+files at **runtime** into the meta-interpreter via `interp-load-raw`
+(`./zincvm globals.csexp --repl`).
 
 Always-on throw sites that are NOT type guards and stay in release: `simple-error`,
 `fail`, `apply`/`appterm` non-callable + too-many-args, `env_pop`, `eval-kl` catch,
@@ -104,7 +104,7 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
 - `shen/compile.shen` — ZINC → canonical s-expression (csexp)
 - `shen/primitives.shen` — 37 type-checked safe wrappers
 - `vm/zincvm.c` — native C parser + VM (~1800 lines, includes GC)
-- `shen/serialize.shen` — compile all closures from global-table to csexp bundle
+- `shen/serialize-reduced.shen` — serialize reduced bundle's global-table to csexp (`globals.csexp`)
 - `shen/toplevel.shen` — `interp-eval` — compiles defun forms through interpreter
 - `shen/load.shen` — `interp-load` / `interp-load-raw` — file loading
 - `shen/util.shen` — `defun->lambda`, `primitive?` (single source of truth), `dedupe-globals`
@@ -225,15 +225,13 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
   `global-table` via `defun->lambda → kl->zinc → toplevel-interp`
 - `interp-load` in `load.shen` reads a file with `read-file`, feeds each `defun`
   through `interp-eval`; errors in individual forms are caught and skipped
-- `serialize.shen` loads `interp.shen`, calls `interp-load` on `.kl` files to
-  populate `global-table`, then walks the table and serializes all closures
-- Output goes to file via `open`/`pr`/`close` — `print` wraps long lines
-  and `grep '^"'` truncates multi-line bundles
-- `pr` writes raw string to a stream; `(stoutput)` is stdout
-- ~1216 closures in the FULL OS bundle (~1.4MB; ~1.6MB with prefix aliases) —
-  `make bundle-full` → `globals-full.csexp`. The canonical **reduced**
-  self-contained bundle (`make bundle` → `globals.csexp`) is ~340 closures / ~0.33MB.
-- All 24 KLambda files loaded (full bundle): core through shen-scheme-extensions + stlib + init
+- The **reduced** self-contained bundle (`make bundle` → `globals.csexp`) is
+  `serialize-reduced.shen` — it walks the deduped `global-table` and serializes
+  all closures (~340 in the reduced build; the QBE build emits 913 `$clo_`).
+  The full Shen OS is NOT a second bundle: it is loaded from `.kl` at **runtime**
+  by the C VM's `--repl` mode (`./zincvm globals.csexp --repl` loads the OS
+  kernel `.kl` into the meta-interpreter via `interp-load-raw`, then runs
+  `shen.initialise`/`shen.repl`).
 
 ### Two global namespaces (critical to understand)
 
@@ -316,9 +314,9 @@ YACC parser, not `read-file-raw`). See the n-ary rules in `normalize.shen`.
      which adds the `shen.` prefix → bytecode references `shen.<e>`
   2. `.kl` files — loaded via `interp-load`, which stores closures under raw
      names → definitions at `<e>` without prefix
-- **Fix**: serialize.shen runs `shen.add-prefix-aliases` after all interp-loads,
-  creating `shen.<name>` entries for unprefixed closure names.  Both `<e>` and
-  `shen.<e>` resolve to the same closure.
+- **Fix**: the bundle serializer runs `shen.add-prefix-aliases` after all
+  interp-loads, creating `shen.<name>` entries for unprefixed closure names.
+  Both `<e>` and `shen.<e>` resolve to the same closure.
 - **Do NOT add module prefix aliasing in the C VM** — it belongs at the Shen
   pipeline level, during bundle creation.  The C VM should only consume
   correctly-named bundles.  This applies especially to `=` and `deep_equal`:
@@ -326,7 +324,8 @@ YACC parser, not `read-file-raw`). See the n-ary rules in `normalize.shen`.
   pipeline (see Primitive semantics above).
 - `interp-load` does NOT apply package prefixing itself (unlike Shen's
   `eval-and-print` which goes through the reader).  The post-load aliasing step
-  in serialize.shen is the correct place to reconcile the mismatch.
+  in the serializer (`serialize-reduced.shen`) is the correct place to reconcile
+  the mismatch.
 
 ## Bytecode decompiler (`zincdec`)
 

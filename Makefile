@@ -1,4 +1,4 @@
-.PHONY: all vm test test-debug debug bundle bundle-full pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test
+.PHONY: all vm test test-debug debug bundle pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -46,7 +46,7 @@ zinctest-asan: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincv
 	$(call compile-vm,$@,$(CFLAGS) -O0 -g -fsanitize=undefined -DZINCTEST,vm/zinctest.c vm/zincvm.c vm/gc.c)
 
 clean:
-	rm -f zincvm zincvm-debug zincdec zincvm-asan zinctest zinctest-debug zinctest-asan *.csexp globals.csexp globals-full.csexp
+	rm -f zincvm zincvm-debug zincdec zincvm-asan zinctest zinctest-debug zinctest-asan *.csexp globals.csexp
 
 test: zinctest
 	./zinctest
@@ -74,7 +74,7 @@ gcdebug: zinctest-debug
 	@echo "  --trace <name>       (existing) trace a closure's bytecode execution"
 	@echo ""
 	@echo "Example: ./zinctest globals.csexp --gc-verbose --gc-check-closures --gc-dump-roots"
-	@echo "         ./zinctest-debug globals-full.csexp --gc-verbose"
+	@echo "         ./zinctest-debug globals.csexp --gc-verbose"
 
 test-asan: zinctest-asan
 	./zinctest-asan
@@ -87,7 +87,7 @@ asan: zinctest-asan
 # gen-prims: generate the Shen primitive?-names list from the single source
 # vm/prims.def (X-macro).  Emits shen/prims-generated.shen:
 #   (set primitive?-names [ name1 name2 ... ])
-# Loaded at bundle-build time (serialize-reduced.shen / serialize.shen) and
+# Loaded at bundle-build time (serialize-reduced.shen) and
 # mirrored into the C VM's value table by vm_load_bundle, so the C primitive
 # set (prim_names[], built from the same prims.def) and Shen's primitive?
 # predicate stay in sync automatically.
@@ -119,14 +119,6 @@ gen-qbe-subset:
 bundle: gen-prims shen/serialize-reduced.shen
 	$(SHEN) script shen/serialize-reduced.shen 2>/dev/null
 	@echo "Bundle written to globals.csexp ($$(wc -c < globals.csexp) bytes)"
-
-# Full Shen OS bundle — type-unsafe, requires a guards-enabled (debug) VM.
-# Written to globals-full.csexp for testing the complete OS.  The release
-# C VM compiles out primitive type guards and CANNOT run this
-# (shen.initialise segfaults); use ./zincvm-debug globals-full.csexp.
-bundle-full: gen-prims shen/serialize.shen
-	$(SHEN) script shen/serialize.shen 2>/dev/null
-	@echo "Full bundle written to globals-full.csexp ($$(wc -c < globals-full.csexp) bytes)"
 
 run-bundle: zinctest globals.csexp
 	./zinctest globals.csexp

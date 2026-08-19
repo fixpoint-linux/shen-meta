@@ -9,7 +9,7 @@
    are shen-scheme HOST-build/bootstrap loaders only.
 
    This file is intentionally NOT loaded by the bundle builders
-   (serialize-reduced.shen / serialize-qbe.shen / serialize.shen).  The
+   (serialize-reduced.shen / serialize-qbe.shen).  The
    self-hosted reduced bundle loads files at runtime via `interp-load-raw` ->
    `read-file-raw` -> `read-file-as-string` (a real primitive), which stays in
    load.shen.  Keeping `interp-load`/`interp-load-safe` OUT of the bundle means
