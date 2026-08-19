@@ -18,7 +18,7 @@
    [string? string_p 1]
    [snd snd 1]
    [- minus 2]
-   [newvar newvar 0]
+   [newvar newvar 1]
    [simple-error simple_error 1]
    [read-byte read_byte 1]
    [write-byte write_byte 2]

@@ -21,7 +21,7 @@ void prim_tl(Value *out, Value *a1) { Value *args[1] = { a1 }; prim_dispatch("tl
 void prim_string_p(Value *out, Value *a1) { Value *args[1] = { a1 }; prim_dispatch("string?", 1, out, args); }
 void prim_snd(Value *out, Value *a1) { Value *args[1] = { a1 }; prim_dispatch("snd", 1, out, args); }
 void prim_minus(Value *out, Value *a1, Value *a2) { Value *args[2] = { a1, a2 }; prim_dispatch("-", 2, out, args); }
-void prim_newvar(Value *out) { prim_dispatch("newvar", 0, out, NULL); }
+void prim_newvar(Value *out, Value *a1) { Value *args[1] = { a1 }; prim_dispatch("newvar", 1, out, args); }
 void prim_simple_error(Value *out, Value *a1) { Value *args[1] = { a1 }; prim_dispatch("simple-error", 1, out, args); }
 void prim_read_byte(Value *out, Value *a1) { Value *args[1] = { a1 }; prim_dispatch("read-byte", 1, out, args); }
 void prim_write_byte(Value *out, Value *a1, Value *a2) { Value *args[2] = { a1, a2 }; prim_dispatch("write-byte", 2, out, args); }

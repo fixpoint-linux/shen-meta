@@ -26,7 +26,7 @@ void prim_tl(Value *out, Value *a1);
 void prim_string_p(Value *out, Value *a1);
 void prim_snd(Value *out, Value *a1);
 void prim_minus(Value *out, Value *a1, Value *a2);
-void prim_newvar(Value *out);
+void prim_newvar(Value *out, Value *a1);
 void prim_simple_error(Value *out, Value *a1);
 void prim_read_byte(Value *out, Value *a1);
 void prim_write_byte(Value *out, Value *a1, Value *a2);

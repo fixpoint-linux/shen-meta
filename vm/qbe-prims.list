@@ -76,7 +76,7 @@ value       value       1
 fst         fst         1
 snd         snd         1
 gensym      gensym      1
-newvar      newvar      0
+newvar      newvar      1
 element?    element_p   2
 fail        fail        1
 shen.fail!  shen_fail_bang 1
