@@ -152,6 +152,13 @@ void init_globals(void);
 int  parse_bundle(const char *str);
 char *read_file_or_stdin(const char *path);
 
+/* Marshal/demarshal between a C Value and the Shen tagged form used by the
+   metacircular extract-kl/kl->zinc/toplevel-interp chain (the eval-kl path).
+   Exposed so a native QBE driver (qberepl.c) can replicate eval-kl against the
+   QBE-compiled closures instead of the C VM interpreter. */
+Value marshal_to_tagged(Value v);
+Value demarshal_from_tagged(Value tagged);
+
 /* vm_load_bundle: parse a bundle string, register ZINC pattern keywords
  * as symbols, set up stdin/stdout/stderr stream variables, and initialise the
  * Shen global-table variable.  Returns the number of closures loaded.

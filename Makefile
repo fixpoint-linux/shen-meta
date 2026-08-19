@@ -1,4 +1,4 @@
-.PHONY: all vm test bundle pipeline interp setup clean gate gcdebug gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test
+.PHONY: all vm test bundle pipeline interp setup clean gate gcdebug gc-verify qbe-gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qberepl qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -148,6 +148,19 @@ gc-verify:
 		$(MAKE) -C tools/gc-verify run; \
 	fi
 
+# qbe-gc-verify: GC-root-safety verifier for the QBE native closures
+# (globals.qbe).  Opt-in, not gating.  Requires souffle (Python stdlib only;
+# no clang — parses the QBE IR text, unlike gc-verify's C AST).  Mirrors
+# tools/gc-verify.  Flags root_miss: live GC-managed Values held in unrooted
+# native-stack slots across a collecting call.  Currently reports ~306K sites
+# across 815/913 closures — the QBE backend emits no shadow-stack roots.
+qbe-gc-verify: globals.qbe
+	@if ! command -v souffle >/dev/null 2>&1; then \
+		echo "qbe-gc-verify: skipping (souffle not found)"; \
+	else \
+		$(MAKE) -C tools/qbe-gc-verify run; \
+	fi
+
 # Bundle safe-subset verifier — opt-in, not gating.  Requires souffle.
 # See docs/bundle-verify.md and tools/bundle-verify/.
 bundle-verify:
@@ -227,6 +240,21 @@ qbe-test: qberun
 # (interp_ref -> defun_get + vm_exec_env with the same args), asserting MATCH.
 diff-test: qberun globals.csexp
 	./qberun
+
+# qberepl: build the Shen REPL on the QBE-NATIVE meta-interpreter.  Same link
+# shape as qberun (QBE objects from globals.qbe against the C runtime), but the
+# driver vm/qberepl.c loads the Shen OS .kl into the meta-interpreter via the
+# native clo_interp_load_raw, then runs (shen.initialise)/(shen.repl) through
+# the native extract-kl/kl->zinc/toplevel-interp closures.  Run: ./qberepl
+# (feed it Shen forms on stdin; EOF exits).
+qberepl: qbe-tool qbe-gen vm/qberepl.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c globals.qbe globals_trap.c
+	@T=$$(mktemp -d /tmp/qberepl.build.XXXXXX) && \
+	vendor/qbe/obj/qbe -t amd64_sysv -o $$T/globals.s globals.qbe && \
+	$(COSMOAS)/x86_64-linux-cosmo-as  -o $$T/globals.o $$T/globals.s && \
+	$(COSMO_CC) -Wall -Wextra -O2 -I vm -DZINCTEST -o $$T/qberepl \
+		vm/qberepl.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c globals_trap.c $$T/globals.o -lm && \
+	cp $$T/qberepl qberepl && chmod 755 qberepl; \
+	st=$$?; rm -rf $$T; exit $$st
 
 # qbe-smoke: Slice-2 (+ 1 2) -> 3 gate (hand-written vm/add12.qbe).
 qbe-smoke: qbe-tool qbe-gen-prims vm/qbesmoke.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c vm/add12.qbe

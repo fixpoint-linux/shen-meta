@@ -4,6 +4,7 @@ zincvm
 zincdec
 zinctest
 qberun
+qberepl
 qbesmoke
 globals.qbe
 globals_trap.c

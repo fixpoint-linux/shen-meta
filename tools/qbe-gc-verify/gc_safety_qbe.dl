@@ -1,0 +1,109 @@
+// gc_safety_qbe.dl — Soufflé Datalog GC-root-safety ruleset for the QBE native
+// closures (globals.qbe).  Mirrors the design intent of tools/gc-verify for the
+// C VM, but over the QBE IR: every `l` temp is a native-stack Value slot, and
+// we flag slots that hold a GC-managed Value and are LIVE across a call that
+// may trigger collection, without being rooted (the QBE backend emits no
+// shadow-stack pushes).
+//
+// Pipeline:  globals.qbe --extract.py--> facts/*.csv --> gc_safety_qbe.dl
+
+// ── Input fact schemas (from extract.py) ──────────────────────────────
+
+.decl function(f:symbol)
+.input function(IO=file, delimiter=",", headers=true, filename="function.csv")
+
+.decl stmt(f:symbol, sid:number)
+.input stmt(IO=file, delimiter=",", headers=true, filename="stmt.csv")
+
+.decl alloc(f:symbol, sid:number, t:symbol)
+.input alloc(IO=file, delimiter=",", headers=true, filename="alloc.csv")
+
+.decl call(f:symbol, sid:number, callee:symbol)
+.input call(IO=file, delimiter=",", headers=true, filename="call.csv")
+
+.decl call_out(f:symbol, sid:number, t:symbol)   // producing call's out slot
+.input call_out(IO=file, delimiter=",", headers=true, filename="call_out.csv")
+
+.decl call_arg(f:symbol, sid:number, t:symbol)   // any l temp used as an arg
+.input call_arg(IO=file, delimiter=",", headers=true, filename="call_arg.csv")
+
+.decl phi_out(f:symbol, sid:number, t:symbol)
+.input phi_out(IO=file, delimiter=",", headers=true, filename="phi_out.csv")
+
+.decl phi_in(f:symbol, sid:number, t:symbol)
+.input phi_in(IO=file, delimiter=",", headers=true, filename="phi_in.csv")
+
+// ═══════════════════════════════════════════════════════════════════════
+// A call MAY trigger collection.  All producing/allocating calls are
+// collecting; the only non-collecting call in the QBE output is is_false
+// (a pure word test).  Over-approximates (some prims don't allocate), which is
+// sound for flagging.
+// ═══════════════════════════════════════════════════════════════════════
+
+.decl collecting_call(f:symbol, sid:number)
+collecting_call(f, sid) :- call(f, sid, callee), callee != "is_false".
+
+// ═══════════════════════════════════════════════════════════════════════
+// A temp HOLDS a GC-managed Value if it is the out of a producing call
+// (prim_* / clo_* / val_*_into / trap_* / copy_value) or a phi joining such.
+// ═══════════════════════════════════════════════════════════════════════
+
+.decl gc_value(f:symbol, t:symbol)
+gc_value(f, t) :- call_out(f, _, t).
+gc_value(f, t) :- phi_out(f, _, t), phi_in(f, _, u), gc_value(f, u).
+
+// A temp is a LOCAL Value slot (alloc8 40).  Params (%out, %aN) are caller-
+// rooted and are NOT local slots, so they are excluded — matching the C VM's
+// param_rooted suppression.
+.decl local_slot(f:symbol, t:symbol)
+local_slot(f, t) :- alloc(f, _, t).
+
+// A def of t is a statement that writes it (producing call out, or phi out).
+.decl def_stmt(f:symbol, sid:number, t:symbol)
+def_stmt(f, sid, t) :- call_out(f, sid, t).
+def_stmt(f, sid, t) :- phi_out(f, sid, t).
+
+// t is DEFINED before sid.
+.decl defined_before(f:symbol, sid:number, t:symbol)
+defined_before(f, sid, t) :- stmt(f, sid), def_stmt(f, s1, t), s1 < sid.
+
+// t is READ (as a call arg or phi input) after sid.
+.decl read_after(f:symbol, sid:number, t:symbol)
+read_after(f, sid, t) :- stmt(f, sid), call_arg(f, s2, t), s2 > sid.
+read_after(f, sid, t) :- stmt(f, sid), phi_in(f, s2, t), s2 > sid.
+
+// t is LIVE at sid: it holds a GC Value in a local slot, defined before sid,
+// and read after sid.  (Linear per-function approximation; over-approximates
+// across branches, which is sound for flagging.)
+.decl live_at(f:symbol, sid:number, t:symbol)
+live_at(f, sid, t) :- gc_value(f, t), local_slot(f, t),
+                      defined_before(f, sid, t), read_after(f, sid, t).
+
+// ═══════════════════════════════════════════════════════════════════════
+// ROOT MISS: a live GC Value in an unrooted local slot across a collecting
+// call.  The QBE backend emits NO shadow-stack pushes, so every such slot is
+// unrooted => the GC may collect it mid-closure.
+// ═══════════════════════════════════════════════════════════════════════
+
+.decl root_miss(f:symbol, sid:number, t:symbol)
+root_miss(f, sid, t) :- live_at(f, sid, t), collecting_call(f, sid).
+
+// ── Summaries ──────────────────────────────────────────────────────────
+
+// Per-function root-miss count.
+.decl rm_per_fn(f:symbol, n:number)
+rm_per_fn(f, n) :- function(f), n = count : { root_miss(f, _, _) }.
+.decl rm_gt0(f:symbol, n:number)
+rm_gt0(f, n) :- rm_per_fn(f, n), n > 0.
+.output rm_gt0
+
+// Number of affected functions + total root_miss sites.
+.decl affected(f:symbol)
+affected(f) :- root_miss(f, _, _).
+.decl n_affected(n:number)
+n_affected(n) :- n = count : affected(_).
+.output n_affected
+
+.decl total_rm(n:number)
+total_rm(n) :- n = count : root_miss(_, _, _).
+.output total_rm

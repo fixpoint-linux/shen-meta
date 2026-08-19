@@ -692,7 +692,7 @@ static jmp_buf repl_exit_jmp;
      mark        = symbol("mark")
    Unmarshallable types (lambdas, prims, errors, vectors, streams)
    pass through unchanged. */
-static Value marshal_to_tagged(Value v) {
+Value marshal_to_tagged(Value v) {
     switch (v.tag) {
     case VAL_NUMBER:
         return val_cons(val_symbol("number"), val_cons(v, val_nil()));
@@ -731,7 +731,7 @@ static Value marshal_to_tagged(Value v) {
 
 /* demarshal_from_tagged: Shen tagged form → C Value.
    Inverse of marshal_to_tagged.  Non-tagged atoms pass through. */
-static Value demarshal_from_tagged(Value tagged) {
+Value demarshal_from_tagged(Value tagged) {
     if (tagged.tag == VAL_NUMBER || tagged.tag == VAL_STRING ||
         tagged.tag == VAL_BOOLEAN) return tagged;
     if (tagged.tag == VAL_SYMBOL) {
