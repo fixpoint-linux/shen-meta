@@ -35,6 +35,9 @@
 (set qbe-block-lines []) \* [ [start lines-reversed] ... ] (reversed) *\
 (set qbe-allocs [])
 (set qbe-temp-names [])  \* bare %tN names of the alloc8 40 slots (for per-frame GC rooting) *\
+(set qbe-free-slots [])   \* L1: dead alloc8 40 slot names available for liveness reuse *\
+(set qbe-pending-copies []) \* L1: [[Dst Src] ...] phi copy_value pairs for the merge in progress *\
+(set qbe-merge-blocked [])  \* L1: names live at any predecessor exit of the merge in progress *\
 (set qbe-wm-temp "")     \* function-entry gc_root_watermark() temp name (read at ret sites) *\
 (set qbe-zero-tmp false)
 (set qbe-zero-init "")
@@ -73,9 +76,9 @@
    This mirrors lookup_env (zincvm.c:2150), which returns a VAL_NUMBER 0 sentinel
    for out-of-bounds access instead of erroring; many bundled closures rely on
    that sentinel (pattern-matching / cond code reads past its bindings). *\
-(define qbe-env-access { number --> (list string) --> string }
-  N Env -> (if (>= N (length Env))
-               (let Z (qbe-slot)
+(define qbe-env-access { number --> (list string) --> (list zinc-value) --> string }
+  N Env Stk -> (if (>= N (length Env))
+               (let Z (qbe-slot Stk Env)
                  (do (qbe-emit (qbe-call "val_number_into" [(cn "l " Z) "l 0"]))
                      Z))
                (qbe-env-ref N Env)))
@@ -253,12 +256,66 @@
        (do (set qbe-wcount (+ N 1))
            (cn "%c" (str N)))))
 
-\* Allocate a 40-byte Value slot, return its temp name. *\
-(define qbe-slot { --> string }
+\* Allocate a 40-byte Value slot, return its temp name.  L1 liveness reuse: a
+   name is recycled from qbe-free-slots only when it is dead on BOTH the
+   current abstract stack (Stk) and the current abstract environment (Env) —
+   a name still in Env stays reachable through a later access N, so reusing
+   it would silently clobber the let-bound value it still names. *\
+(define qbe-slot { (list zinc-value) --> (list zinc-value) --> string }
+  Stk Env -> (let Pick (qbe-pick-free Stk Env (value qbe-free-slots))
+               (if (= Pick "")
+                   (qbe-slot-fresh)
+                   (do (set qbe-free-slots (qbe-remove-one Pick (value qbe-free-slots)))
+                       Pick))))
+
+\* Fresh (never-reused) alloc8 40 slot — also used for phi-copy destinations. *\
+(define qbe-slot-fresh { --> string }
   -> (let T (qbe-fresh)
        (do (set qbe-allocs (cons (qbe-join [T " =l alloc8 40"]) (value qbe-allocs)))
            (set qbe-temp-names (cons T (value qbe-temp-names)))
            T)))
+
+\* First free slot name dead on Stk and Env; "" when none is reusable. *\
+(define qbe-pick-free { (list zinc-value) --> (list zinc-value) --> (list string) --> string }
+  _ _ [] -> ""
+  Stk Env [C | R] -> (qbe-pick-free Stk Env R) where (element? C Stk)
+  Stk Env [C | R] -> (qbe-pick-free Stk Env R) where (element? C Env)
+  _ _ [C | _] -> C)
+
+\* Remove the first occurrence of X from L (free-list entries may duplicate). *\
+(define qbe-remove-one { string --> (list string) --> (list string) }
+  _ [] -> []
+  X [X | R] -> R
+  X [H | R] -> [H | (qbe-remove-one X R)])
+
+\* Return a consumed slot name to the free pool.  Only real alloc8 40 slots
+   (members of qbe-temp-names) are recyclable — phi pointer temps and params
+   %a0..%aN / %out are not.  Names still in Env are skipped: they remain
+   reachable via access N. *\
+(define qbe-free-name { zinc-value --> (list zinc-value) --> symbol }
+  Name Env -> skip where (element? Name Env)
+  Name _ -> (set qbe-free-slots (cons Name (value qbe-free-slots))) where (element? Name (value qbe-temp-names))
+  _ _ -> skip)
+
+(define qbe-free-names { (list zinc-value) --> (list zinc-value) --> symbol }
+  [] _ -> skip
+  [N | R] Env -> (do (qbe-free-name N Env) (qbe-free-names R Env)))
+
+\* Free every temp of a frame-exit state (appterm/return blocks record no CFG
+   successors, so their whole abstract Stk+Env is dead on that path; phi
+   merges never reference these names).  The Env guard is bypassed — the
+   bindings die with the frame — but qbe-free-name's qbe-temp-names check
+   still skips params %a0..%aN/%out and [clo _]/[prim _] zinc-values.
+   Compile-time sound: the pool is shared across all blocks of the function,
+   and a later pick in a sibling block only writes the slot on ITS runtime
+   path, never on this one. *\
+(define qbe-free-exit-state { (list zinc-value) --> (list zinc-value) --> symbol }
+  Stk Env -> (qbe-free-names (append Stk Env) []))
+
+\* Flatten a list of lists (for the merge blocked-set). *\
+(define qbe-concat { (list (list A)) --> (list A) }
+  [] -> []
+  [L | R] -> (append L (qbe-concat R)))
 
 \* Register a string/symbol data literal, return its $dN label. *\
 (define qbe-data { string --> string }
@@ -385,57 +442,63 @@
 (define qbe-step { number --> zinc-code --> (list zinc-value) --> (list symbol) --> (list zinc-value) }
   _ grab [Stk Env Marks] _ -> [Stk Env Marks]
   _ letz [Stk Env Marks] _ -> [(tl Stk) [(hd Stk) | Env] Marks]
-  _ endlet [Stk Env Marks] _ -> [Stk (tl Env) Marks]
-  _ [access N] [Stk Env Marks] _ -> [[(qbe-env-access N Env) | Stk] Env Marks]
+  _ endlet [Stk Env Marks] _ -> [Stk Env Marks] where (empty? Env)
+  _ endlet [Stk Env Marks] _ -> (do (qbe-free-name (hd Env) (tl Env)) [Stk (tl Env) Marks])
+  _ [access N] [Stk Env Marks] _ -> [[(qbe-env-access N Env Stk) | Stk] Env Marks]
   _ [number N] [Stk Env Marks] _ ->
-    (let Out (qbe-slot)
+    (let Out (qbe-slot Stk Env)
       (do (qbe-emit (qbe-call "val_number_into" [(cn "l " Out) (cn "l " (str N))]))
           [[Out | Stk] Env Marks]))
   _ [string S] [Stk Env Marks] _ ->
-    (let Out (qbe-slot)
+    (let Out (qbe-slot Stk Env)
       (let D (qbe-string-lit S)
         (do (qbe-emit (qbe-call "val_string_into" [(cn "l " Out) (cn "l " D) (cn "l " (str (qbe-strlen S)))]))
             [[Out | Stk] Env Marks])))
   _ [symbol S] [Stk Env Marks] _ ->
-    (let Out (qbe-slot)
+    (let Out (qbe-slot Stk Env)
       (let D (qbe-symbol-lit S)
         (do (qbe-emit (qbe-call "val_symbol_into" [(cn "l " Out) (cn "l " D)]))
             [[Out | Stk] Env Marks])))
   _ [boolean B] [Stk Env Marks] _ ->
-    (let Out (qbe-slot)
+    (let Out (qbe-slot Stk Env)
       (do (qbe-emit (qbe-call "val_boolean_into" [(cn "l " Out) (cn "w " (if (= B true) "1" "0"))]))
           [[Out | Stk] Env Marks]))
   _ [prim P] [Stk Env Marks] _ ->
     (let K (qbe-prim-arity P)
       (let R (qbe-pop-k K Stk)
-        (let Out (qbe-slot)
-          (do (qbe-emit (qbe-call (cn "prim_" (qbe-prim-mangled P)) (cons (cn "l " Out) (qbe-l-args (hd R)))))
-              [[Out | (hd (tl R))] Env Marks]))))
+        (do (qbe-free-names (hd R) Env)
+          (let Out (qbe-slot Stk Env)
+            (do (qbe-emit (qbe-call (cn "prim_" (qbe-prim-mangled P)) (cons (cn "l " Out) (qbe-l-args (hd R)))))
+                [[Out | (hd (tl R))] Env Marks])))))
   _ [global G] [Stk Env Marks] ClosureSet ->
     (if (qbe-prim? G)
         [[[prim G] | Stk] Env Marks]
         (if (element? G ClosureSet)
             [[[clo G] | Stk] Env Marks]
-            (let Out (qbe-slot)
+            (let Out (qbe-slot Stk Env)
               (let D (qbe-symbol-lit (str G))
                 (do (qbe-emit (qbe-call "global_get_into" [(cn "l " Out) (cn "l " D)]))
                     [[Out | Stk] Env Marks])))))
   _ pushmark [Stk Env Marks] _ -> [Stk Env [(length Stk) | Marks]]
   _ apply [Stk Env Marks] ClosureSet ->
     (let R (qbe-pop-k (- (length (tl Stk)) (hd Marks)) (tl Stk))
-      (let Out (qbe-slot)
-        (do (qbe-emit (qbe-do-call (hd Stk) Out (hd R) ClosureSet))
-            [[Out | (hd (tl R))] Env (tl Marks)])))
+      (do (qbe-free-names (hd R) Env)
+          (qbe-free-name (hd Stk) Env)
+          (let Out (qbe-slot Stk Env)
+            (do (qbe-emit (qbe-do-call (hd Stk) Out (hd R) ClosureSet))
+                [[Out | (hd (tl R))] Env (tl Marks)]))))
   _ appterm [Stk Env Marks] ClosureSet ->
     (let R (qbe-pop-k (- (length (tl Stk)) (hd Marks)) (tl Stk))
       (do (qbe-emit (qbe-do-tail (hd Stk) (hd R) ClosureSet))
           (qbe-emit (qbe-call "gc_root_pop_to" [(cn "l " (value qbe-wm-temp))]))
           (qbe-emit "ret")
+          (qbe-free-exit-state Stk Env)
           [(hd (tl R)) Env (tl Marks)]))
   _ return [Stk Env Marks] _ ->
     (do (qbe-emit (qbe-call "copy_value" ["l %out" (cn "l " (hd Stk))]))
         (qbe-emit (qbe-call "gc_root_pop_to" [(cn "l " (value qbe-wm-temp))]))
         (qbe-emit "ret")
+        (qbe-free-exit-state Stk Env)
         [Stk Env Marks])
   _ [jmp L] State _ ->
     (do (qbe-emit (qbe-join ["jmp @b" (str L)]))
@@ -445,6 +508,7 @@
       (let C (qbe-c-fresh)
         (do (qbe-emit (qbe-join [C " =w call $is_false(" (cn "l " Cond) ")"]))
             (qbe-emit (qbe-join ["jnz " C ", @b" (str L) ", @b" (str (+ N 1))]))
+            (qbe-free-name Cond Env)
             [(tl Stk) Env Marks])))
   _ [trap C1 C2] [Stk Env Marks] ClosureSet ->
     \* C1 = HANDLER (first cur), C2 = BODY (second cur): trap-error pops the
@@ -452,10 +516,10 @@
     (let Ncap (qbe-max2 (qbe-max-access C1) (qbe-max-access C2))
       (let TB (qbe-fresh-tag)
         (let TH (qbe-fresh-tag)
-          (let Caps (qbe-trap-caps Ncap Env)
+          (let Caps (qbe-trap-caps Ncap Env Stk)
             (let FnH (qbe-lower-cur TH C1 Ncap ClosureSet)
               (let FnB (qbe-lower-cur TB C2 Ncap ClosureSet)
-                (let Out (qbe-slot)
+                (let Out (qbe-slot Stk Env)
                   (do
                     (set qbe-extra-fns (cons FnB (cons FnH (value qbe-extra-fns))))
                     \* [body_tag handler_tag Ncap]: the C shim runs b_TB (body)
@@ -521,10 +585,15 @@
 
 (define qbe-merge { (list (list number (list zinc-value))) --> (list zinc-value) }
   Preds -> (let Starts (qbe-pred-starts Preds)
-             (let Stk (qbe-reconcile (qbe-pred-stks Preds) Starts)
-               (let Env (qbe-reconcile (qbe-pred-envs Preds) Starts)
-                 (let Marks (qbe-marks (hd (tl (hd Preds))))
-                   [Stk Env Marks])))))
+             (let Stks (qbe-pred-stks Preds)
+               (let Envs (qbe-pred-envs Preds)
+                 (do (set qbe-merge-blocked (append (qbe-concat Stks) (qbe-concat Envs)))
+                   (let Stk (qbe-reconcile (qbe-pred-stks Preds) Starts)
+                     (let Env (qbe-reconcile (qbe-pred-envs Preds) Starts)
+                       (let Marks (qbe-marks (hd (tl (hd Preds))))
+                         (do (qbe-copy-lines (reverse (value qbe-pending-copies)))
+                           (set qbe-pending-copies [])
+                           [Stk Env Marks])))))))))
 
 \* qbe-max-length: the longest predecessor slot-list length, so the reconcile
    iterates over the LONGEST pred (every real slot gets a phi) and shorter preds
@@ -562,13 +631,38 @@
   [_] -> true
   [X Y | R] -> (and (= X Y) (qbe-all-eq [Y | R])))
 
+\* Merge one slot position across predecessors.  All-equal names need no phi.
+   Otherwise a POINTER phi T is emitted and immediately copied into an
+   independent rooted slot T2 (copy_value right after the phi section): T2
+   owns its value from block entry on, so the phi's inputs stay recyclable
+   later in the function without corrupting the merged value.  T itself is an
+   unrooted pointer temp whose live range spans only the phi and the copy
+   (copy_value does not allocate, so no GC can run in between).  The copy
+   lines are emitted by qbe-merge AFTER both the Stk and Env phi sections
+   (QBE requires all phis before regular instructions).  T2 is picked with
+   the merge-blocked set (every name live at ANY predecessor exit) so it can
+   never alias a live phi input or another T2 of the same merge.  Finally the
+   phi INPUT names are returned to the free pool: the copy has captured their
+   values, they are no longer in the merged Stk/Env (a name replaced by a phi
+   cannot appear live past this join — every block on its live path carried
+   it in its abstract Stk, which blocked any pick), and a later endlet
+   re-frees them harmlessly if they were also Env-bound. *\
 (define qbe-slot-phi { (list (list zinc-value)) --> (list number) --> number --> zinc-value }
   Slots Starts J -> (let Temps (qbe-col Slots J)
                       (if (qbe-all-eq Temps)
                           (hd Temps)
                           (let T (qbe-fresh)
-                            (do (qbe-emit (qbe-join [T " =l phi " (qbe-phi-inputs Starts Temps)]))
-                                T)))))
+                            (let T2 (qbe-slot (value qbe-merge-blocked) [])
+                              (do (qbe-emit (qbe-join [T " =l phi " (qbe-phi-inputs Starts Temps)]))
+                                  (set qbe-pending-copies (cons [T2 T] (value qbe-pending-copies)))
+                                  (set qbe-merge-blocked (cons T2 (value qbe-merge-blocked)))
+                                  (qbe-free-names Temps [])
+                                  T2))))))
+
+(define qbe-copy-lines { (list (list string string)) --> symbol }
+  [] -> skip
+  [[Dst Src] | R] -> (do (qbe-emit (qbe-call "copy_value" [(cn "l " Dst) (cn "l " Src)]))
+                         (qbe-copy-lines R)))
 
 (define qbe-phi-inputs { (list number) --> (list zinc-value) --> string }
   [P] [T] -> (qbe-join ["@b" (str P) " " T])
@@ -729,6 +823,9 @@
       [preds (value qbe-preds)]
       [allocs (value qbe-allocs)]
       [temp-names (value qbe-temp-names)]
+      [free-slots (value qbe-free-slots)]
+      [pending-copies (value qbe-pending-copies)]
+      [merge-blocked (value qbe-merge-blocked)]
       [wm-temp (value qbe-wm-temp)]
       [zero-tmp (value qbe-zero-tmp)]
       [zero-init (value qbe-zero-init)]
@@ -747,6 +844,9 @@
     (set qbe-preds (qbe-cur-get preds Saved))
     (set qbe-allocs (qbe-cur-get allocs Saved))
     (set qbe-temp-names (qbe-cur-get temp-names Saved))
+    (set qbe-free-slots (qbe-cur-get free-slots Saved))
+    (set qbe-pending-copies (qbe-cur-get pending-copies Saved))
+    (set qbe-merge-blocked (qbe-cur-get merge-blocked Saved))
     (set qbe-wm-temp (qbe-cur-get wm-temp Saved))
     (set qbe-zero-tmp (qbe-cur-get zero-tmp Saved))
     (set qbe-zero-init (qbe-cur-get zero-init Saved))
@@ -766,6 +866,9 @@
         (set qbe-preds [])
         (set qbe-allocs [])
         (set qbe-temp-names [])
+        (set qbe-free-slots [])
+        (set qbe-pending-copies [])
+        (set qbe-merge-blocked [])
         (set qbe-wm-temp (qbe-fresh))
         (set qbe-zero-tmp false)
         (set qbe-zero-init "")
@@ -784,14 +887,14 @@
 
 \* cap_j for the shim call: the enclosing closure's access j, or a fresh 0 slot
    if j is past the enclosing env (mirrors lookup_env's OOB number-0 sentinel). *\
-(define qbe-trap-cap { number --> (list string) --> string }
-  J Env -> (qbe-env-access J Env))
+(define qbe-trap-cap { number --> (list string) --> (list zinc-value) --> string }
+  J Env Stk -> (qbe-env-access J Env Stk))
 
-(define qbe-trap-caps { number --> (list string) --> (list string) }
-  N Env -> (qbe-trap-caps-h N 0 Env))
-(define qbe-trap-caps-h { number --> number --> (list string) --> (list string) }
-  N J Env -> [] where (>= J N)
-  N J Env -> [(qbe-trap-cap J Env) | (qbe-trap-caps-h N (+ J 1) Env)])
+(define qbe-trap-caps { number --> (list string) --> (list zinc-value) --> (list string) }
+  N Env Stk -> (qbe-trap-caps-h N 0 Env Stk))
+(define qbe-trap-caps-h { number --> number --> (list string) --> (list zinc-value) --> (list string) }
+  N J Env Stk -> [] where (>= J N)
+  N J Env Stk -> [(qbe-trap-cap J Env Stk) | (qbe-trap-caps-h N (+ J 1) Env Stk)])
 
 (define qbe-trap-shim-name { number --> number --> string }
   T1 T2 -> (cn "trap_" (cn (str T1) (cn "_" (str T2)))))
@@ -809,6 +912,9 @@
       (set qbe-preds [])
       (set qbe-allocs [])
       (set qbe-temp-names [])
+      (set qbe-free-slots [])
+      (set qbe-pending-copies [])
+      (set qbe-merge-blocked [])
       (set qbe-wm-temp (qbe-fresh))
       (set qbe-zero-tmp false)
       (set qbe-zero-init "")
