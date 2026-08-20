@@ -39,6 +39,8 @@
 (set qbe-pending-copies []) \* L1: [[Dst Src] ...] phi copy_value pairs for the merge in progress *\
 (set qbe-merge-blocked [])  \* L1: names live at any predecessor exit of the merge in progress *\
 (set qbe-wm-temp "")     \* function-entry gc_root_watermark() temp name (read at ret sites) *\
+(set qbe-loop-slots [])  \* L3-T2: dedicated loop-carried alloc-slot names for self-jump TCO (never freed) *\
+(set qbe-tco-enabled false) \* L3-T2: this closure self-references at top level; appterm-to-self self-jumps *\
 (set qbe-zero-tmp false)
 (set qbe-zero-init "")
 (set qbe-preds [])       \* [ [target pred state] ... ] CFG edges *\
@@ -280,6 +282,7 @@
   _ _ [] -> ""
   Stk Env [C | R] -> (qbe-pick-free Stk Env R) where (element? C Stk)
   Stk Env [C | R] -> (qbe-pick-free Stk Env R) where (element? C Env)
+  Stk Env [C | R] -> (qbe-pick-free Stk Env R) where (element? C (value qbe-loop-slots))
   _ _ [C | _] -> C)
 
 \* Remove the first occurrence of X from L (free-list entries may duplicate). *\
@@ -293,6 +296,7 @@
    %a0..%aN / %out are not.  Names still in Env are skipped: they remain
    reachable via access N. *\
 (define qbe-free-name { zinc-value --> (list zinc-value) --> symbol }
+  Name _ -> skip where (element? Name (value qbe-loop-slots))
   Name Env -> skip where (element? Name Env)
   Name _ -> (set qbe-free-slots (cons Name (value qbe-free-slots))) where (element? Name (value qbe-temp-names))
   _ _ -> skip)
@@ -489,11 +493,15 @@
                 [[Out | (hd (tl R))] Env (tl Marks)]))))
   _ appterm [Stk Env Marks] ClosureSet ->
     (let R (qbe-pop-k (- (length (tl Stk)) (hd Marks)) (tl Stk))
-      (do (qbe-emit (qbe-do-tail (hd Stk) (hd R) ClosureSet))
-          (qbe-emit (qbe-call "gc_root_pop_to" [(cn "l " (value qbe-wm-temp))]))
-          (qbe-emit "ret")
-          (qbe-free-exit-state Stk Env)
-          [(hd (tl R)) Env (tl Marks)]))
+      (if (qbe-self-tail? (hd Stk))
+          (do (qbe-emit-self-jump (hd R))
+              (qbe-free-exit-state Stk Env)
+              [(hd (tl R)) Env (tl Marks)])
+          (do (qbe-emit (qbe-do-tail (hd Stk) (hd R) ClosureSet))
+              (qbe-emit (qbe-call "gc_root_pop_to" [(cn "l " (value qbe-wm-temp))]))
+              (qbe-emit "ret")
+              (qbe-free-exit-state Stk Env)
+              [(hd (tl R)) Env (tl Marks)])))
   _ return [Stk Env Marks] _ ->
     (do (qbe-emit (qbe-call "copy_value" ["l %out" (cn "l " (hd Stk))]))
         (qbe-emit (qbe-call "gc_root_pop_to" [(cn "l " (value qbe-wm-temp))]))
@@ -542,6 +550,75 @@
   [clo G] Args _ -> (qbe-call (qbe-clo-name G) (cons "l %out" (qbe-l-args Args)))
   [prim P] Args _ -> (qbe-call (cn "prim_" (qbe-prim-mangled P)) (cons "l %out" (qbe-l-args Args)))
   _ _ _ -> (simple-error "qbe: dynamic appterm not supported"))
+
+\* L3-T2: is the appterm target a tail-call to THIS function?  Only self-jumps
+   when TCO is enabled for the current closure (cur/trap bodies are lowered with
+   qbe-tco-enabled reset to false, so a stale qbe-cur-name never self-jumps). *\
+(define qbe-self-tail? { zinc-value --> boolean }
+  [clo G] -> (and (value qbe-tco-enabled) (= G (value qbe-cur-name)))
+  _ -> false)
+
+\* L3-T2: emit the loop-carried copies + backward jump for an appterm-to-self.
+   Each positional arg is copied into its dedicated loop slot; a self-copy (arg
+   already IS the loop slot, e.g. an unchanged pass-through) emits nothing.  The
+   jump transfers to @loop (the prologue-injected loop head) WITHOUT re-running
+   the prologue / re-rooting / popping the watermark.  The arity must equal the
+   function's own (the number of loop slots); mismatch is a safe loud error. *\
+(define qbe-emit-self-jump { (list zinc-value) --> symbol }
+  Args -> (if (not (= (length Args) (length (value qbe-loop-slots))))
+              (simple-error (cn "qbe: self-jump arity mismatch in " (str (value qbe-cur-name))))
+              (do (qbe-self-jump-copies Args (value qbe-loop-slots))
+                  (qbe-emit "jmp @loop"))))
+
+\* L3-T2: loop-carried copies for an appterm-to-self.  Plain in-order
+   emission (copy %L0<-A0, %L1<-A1, ...) is only sound when no argument
+   READS a loop slot that an earlier copy of the same run WRITES (a
+   cross-position pass-through or a swap cycle would silently read the
+   already-overwritten value).  The current bundle contains no such site
+   (every changed argument lives in a regular temp; self-position args are
+   skipped), but a future interp.shen edit could introduce one and it would
+   mis-compile silently.  Detect the case and route through scratch temps:
+   phase A copies every changed argument into a fresh rooted alloc8 scratch
+   (qbe-slot-fresh => in qbe-allocs + qbe-temp-names, so alloc8'd in the
+   prologue and gc-rooted) — ALL loop-slot reads happen before ANY loop-slot
+   write; phase B then moves scratches -> loop slots.  copy_value never
+   allocates, so no GC can intervene. *\
+(define qbe-self-jump-copies { (list zinc-value) --> (list string) --> symbol }
+  Args Slots ->
+    (if (qbe-self-jump-cross? Args Slots)
+        (qbe-self-jump-stage-b (qbe-self-jump-stage-a Args Slots []))
+        (qbe-self-jump-copies-simple Args Slots)))
+
+(define qbe-self-jump-copies-simple { (list zinc-value) --> (list string) --> symbol }
+  [] _ -> skip
+  [A | AR] [L | LR] -> (if (= A L)
+                         (qbe-self-jump-copies-simple AR LR)
+                         (do (qbe-emit (qbe-call "copy_value" [(cn "l " L) (cn "l " A)]))
+                             (qbe-self-jump-copies-simple AR LR))))
+
+\* true iff some argument IS a loop slot at a different position — the only
+   inputs in-order emission could clobber. *\
+(define qbe-self-jump-cross? { (list zinc-value) --> (list string) --> boolean }
+  [] _ -> false
+  [A | AR] [L | LR] -> (or (and (element? A (value qbe-loop-slots)) (not (= A L)))
+                           (qbe-self-jump-cross? AR LR)))
+
+\* phase A: copy every changed argument into a fresh rooted scratch, pairing
+   each scratch with its target loop slot; returns the [scratch slot] pairs. *\
+(define qbe-self-jump-stage-a { (list zinc-value) --> (list string) --> (list (list string string)) --> (list (list string string)) }
+  [] _ Acc -> Acc
+  [A | AR] [L | LR] Acc -> (if (= A L)
+                             (qbe-self-jump-stage-a AR LR Acc)
+                             (let S (qbe-slot-fresh)
+                               (do (qbe-emit (qbe-call "copy_value" [(cn "l " S) (cn "l " A)]))
+                                   (qbe-self-jump-stage-a AR LR (cons [S L] Acc))))))
+
+\* phase B: move each scratch -> its loop slot.  All loop-slot reads were done
+   in phase A, so no write here can clobber a still-needed source. *\
+(define qbe-self-jump-stage-b { (list (list string string)) --> symbol }
+  [] -> skip
+  [[S L] | R] -> (do (qbe-emit (qbe-call "copy_value" [(cn "l " L) (cn "l " S)]))
+                     (qbe-self-jump-stage-b R)))
 
 \* -------------------------- CFG edge recording -------------------------- *\
 
@@ -748,13 +825,26 @@
 (define qbe-inject-allocs { (list (list number (list string))) --> (list (list number (list string))) }
   [] -> []
   [[0 Lines] | R] ->
-    [[0 (append Lines
-              (append (qbe-push-lines (value qbe-temp-names))
+    (let Base (append (qbe-push-lines (value qbe-temp-names))
                 (append [(qbe-wm-line)]
                   (append (if (= (value qbe-zero-init) "") [] [(value qbe-zero-init)])
                     (append (qbe-nil-lines (value qbe-temp-names))
-                      (value qbe-allocs))))))] | R]
+                      (value qbe-allocs)))))
+      (if (value qbe-tco-enabled)
+          \* L3-T2: after rooting (push-lines) emit the init copies %aN->%L{N},
+             then jmp @loop, then the @loop label, then the body.  In the reversed
+             representation this is: [@loop] [jmp] (reverse copies) BEFORE Base. *\
+          (let Copies (reverse (qbe-init-copies (value qbe-loop-slots) (qbe-arg-temps (length (value qbe-loop-slots)))))
+            (cons [0 (append Lines (append ["@loop"] (append ["jmp @loop"] (append Copies Base))))] R))
+          (cons [0 (append Lines Base)] R)))
   [B | R] -> [B | (qbe-inject-allocs R)])
+
+\* L3-T2: loop-head init copies %L{i} <- %a{i} for every loop slot (prologue only —
+   args are never loop slots here, so no self-skip).  Returns the lines in
+   %L0..%L{arity-1} order. *\
+(define qbe-init-copies { (list string) --> (list string) --> (list string) }
+  [] _ -> []
+  [L | LR] [A | AR] -> (cons (qbe-call "copy_value" [(cn "l " L) (cn "l " A)]) (qbe-init-copies LR AR)))
 
 (define qbe-fn-string { symbol --> number --> string }
   Name Arity ->
@@ -824,6 +914,8 @@
       [allocs (value qbe-allocs)]
       [temp-names (value qbe-temp-names)]
       [free-slots (value qbe-free-slots)]
+      [loop-slots (value qbe-loop-slots)]
+      [tco-enabled (value qbe-tco-enabled)]
       [pending-copies (value qbe-pending-copies)]
       [merge-blocked (value qbe-merge-blocked)]
       [wm-temp (value qbe-wm-temp)]
@@ -845,6 +937,8 @@
     (set qbe-allocs (qbe-cur-get allocs Saved))
     (set qbe-temp-names (qbe-cur-get temp-names Saved))
     (set qbe-free-slots (qbe-cur-get free-slots Saved))
+    (set qbe-loop-slots (qbe-cur-get loop-slots Saved))
+    (set qbe-tco-enabled (qbe-cur-get tco-enabled Saved))
     (set qbe-pending-copies (qbe-cur-get pending-copies Saved))
     (set qbe-merge-blocked (qbe-cur-get merge-blocked Saved))
     (set qbe-wm-temp (qbe-cur-get wm-temp Saved))
@@ -867,6 +961,8 @@
         (set qbe-allocs [])
         (set qbe-temp-names [])
         (set qbe-free-slots [])
+        (set qbe-loop-slots [])
+        (set qbe-tco-enabled false)
         (set qbe-pending-copies [])
         (set qbe-merge-blocked [])
         (set qbe-wm-temp (qbe-fresh))
@@ -901,6 +997,24 @@
 
 \* -------------------------- top-level lower -------------------------- *\
 
+\* L3-T2: does this closure's top-level body reference itself as [global <own-name>]?
+   Scans ONLY the top level (a [trap C1 C2] body is lowered as a separate
+   $b_tag function and must NOT enable TCO for the parent). *\
+(define qbe-self-ref? { (list zinc-code) --> boolean }
+  [] -> false
+  [[global G] | R] -> (or (= G (value qbe-cur-name)) (qbe-self-ref? R))
+  [[trap _ _] | R] -> (qbe-self-ref? R)
+  [_ | R] -> (qbe-self-ref? R))
+
+\* L3-T2: allocate Arity dedicated loop-carried slots via qbe-slot-fresh (they land
+   in qbe-allocs + qbe-temp-names -> rooted + alloc8).  Returns [L0 .. L{Arity-1}]
+   in arg order (L0 carries %a0, ...). *\
+(define qbe-make-loop-slots { number --> (list string) }
+  N -> (reverse (qbe-make-loop-slots-h N 0 [])))
+(define qbe-make-loop-slots-h { number --> number --> (list string) --> (list string) }
+  N J Acc -> Acc where (= J N)
+  N J Acc -> (qbe-make-loop-slots-h N (+ J 1) (cons (qbe-slot-fresh) Acc)))
+
 (define lower { symbol --> klambda --> (list symbol) --> string }
   Name Body ClosureSet ->
     (do
@@ -913,6 +1027,8 @@
       (set qbe-allocs [])
       (set qbe-temp-names [])
       (set qbe-free-slots [])
+      (set qbe-loop-slots [])
+      (set qbe-tco-enabled false)
       (set qbe-pending-copies [])
       (set qbe-merge-blocked [])
       (set qbe-wm-temp (qbe-fresh))
@@ -925,9 +1041,12 @@
       (set qbe-cur-name Name)
       (let Arity (qbe-arity Body)
         (let Nested (qbe-renumber (qbe-pair-traps (qbe-nest Body)))
-          (let Env0 (qbe-env0 (qbe-arg-temps Arity))
-            (let Indexed (qbe-index Nested 0)
-              (let Total (length Indexed)
-                (let Blocks (qbe-make-blocks Indexed (qbe-leaders Indexed) Total)
-                  (do (qbe-lower-blocks Blocks [[] Env0 []] ClosureSet)
-                      (qbe-fn-string Name Arity))))))))))
+          (do
+            (set qbe-tco-enabled (qbe-self-ref? Nested))
+            (set qbe-loop-slots (if (value qbe-tco-enabled) (qbe-make-loop-slots Arity) []))
+            (let Env0 (if (value qbe-tco-enabled) (reverse (value qbe-loop-slots)) (qbe-env0 (qbe-arg-temps Arity)))
+              (let Indexed (qbe-index Nested 0)
+                (let Total (length Indexed)
+                  (let Blocks (qbe-make-blocks Indexed (qbe-leaders Indexed) Total)
+                    (do (qbe-lower-blocks Blocks [[] Env0 []] ClosureSet)
+                        (qbe-fn-string Name Arity)))))))))))
