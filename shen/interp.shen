@@ -265,6 +265,19 @@
   \* element?: deep_equal list membership (matches C primitive).  Leftmost arg
      (needle) is the accumulator, rightmost (list) is on the stack. *\
   [prim element? | C] X E [L | S] R                            -> (interp C [boolean (element?-h X L)] E S R)
+  \* empty?: true iff the arg is the tagged empty list [cons] (= VAL_NIL).  A
+     non-empty semantic list (a) is [cons a [cons]].  Mirrors C VM empty?. *\
+  [prim empty? | C] [cons] E S R                                 -> (interp C [boolean true] E S R)
+  [prim empty? | C] A E S R                                      -> (interp C [boolean false] E S R)
+  \* reverse / append / assoc: OS-runtime prims (also OS defuns in sys.kl, but
+     kept as C prims because the bundle calls them as [prim X]).  Call the
+     plain Shen names (which compile to [prim X] since they are in
+     primitive?-names) so the metacircular interp matches the C VM.
+     reverse: unary (arg in A).  append/assoc: binary (A = leftmost, A1 on
+     stack = rightmost, matching the RTL argument order). *\
+  [prim reverse | C] A E S R                                     -> (interp C (reverse A) E S R)
+  [prim append | C] A1 E [A2 | S] R                              -> (interp C (append A1 A2) E S R)
+  [prim assoc | C] K E [L | S] R                                 -> (interp C (assoc K L) E S R)
   [prim absvector | C] [number A] E S R                         -> (interp C [absvector (absvector A)] E S R)
   [prim absvector? | C] [absvector _] E S R                     -> (interp C [boolean true] E S R)
   [prim absvector? | C] A E S R                                 -> (interp C [boolean false] E S R)
@@ -296,6 +309,12 @@
   [prim error-to-string | C] [error A] E S R                    -> (interp C [string (error-to-string A)] E S R)
   [prim simple-error | C] [string A] E S R                      -> (simple-error A)
   [prim trap-error | C] [lambda C1 E1] E S R                 -> (interp C (interp-trap-body C1 E1 S R) E S R)
+  \* shen.fail!: the fail sentinel primitive (fail is a DEFUN in sys.kl, not a
+     primitive).  Mirrors the C VM (zincvm.c): with >=1 arg returns the
+     [fail arg] sentinel value; with 0 args throws.  The OS `fail` defun body
+     is (shen.fail!), which compiles to [prim shen.fail!]. *\
+  [prim shen.fail! | C] A E [A1 | S] R                          -> (interp C [cons [symbol fail] [cons A1 []]] E S R)
+  [prim shen.fail! | C] A E [] R                                 -> (simple-error "fail")
   [prim = | C] A E [A1 | S] R                                   -> (interp C [boolean (= A A1)] E S R)
   [prim open | C] [string A] E [[symbol in] | S] R              -> (interp C [stream in (open A in)] E S R)
   [prim open | C] [string A] E [[symbol out] | S] R             -> (interp C [stream out (open A out)] E S R)
@@ -306,6 +325,8 @@
   [prim fst | C] [cons A _] E S R                               -> (interp C A E S R)
   [prim snd | C] [cons _ A] E S R                               -> (interp C A E S R)
   [prim gensym | C] [symbol A] E S R                            -> (interp C [symbol (fresh-var A)] E S R)
+  \* newvar: fresh symbol (C VM arity 0, pops a spurious arg if present). *\
+  [prim newvar | C] A E S R                                      -> (interp C [symbol (newvar)] E S R)
   [prim variable? | C] [symbol A] E S R                         -> (interp C [boolean (variable? A)] E S R)
   [prim variable? | C] A E S R                                  -> (interp C [boolean false] E S R)
   [prim <-address | C] [absvector A] E [[number A1] | S] R      -> (interp C (<-address A A1) E S R)
@@ -327,7 +348,9 @@
   [prim + | C] [number A] E [[number A1] | S] R                 -> (interp C [number (+ A A1)] E S R)
   [prim address-> | C] [absvector A] E [[number A1] A2 | S] R   -> (interp C [absvector (address-> A A1 A2)] E S R)
   [] A E S R                                                    -> A
-  [prim P | _] _ _ _ _                                          -> (simple-error (cn "interp: unknown prim - " (str P)))
+  [prim P | C] A E S R                                          -> (simple-error (cn "interp: unknown prim - " (cn (str P) (cn " CODE=" (str C)))))
+
+  \* DIAG: dump caller chain on unknown prim (temporary) *\
   [Op | _] _ _ _ _                                              -> (simple-error (str Op))
   _ _ _ _ _                                                     -> (simple-error "interp: unknown expression"))
 

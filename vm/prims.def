@@ -20,15 +20,20 @@
  * lists.  assoc/empty?/length/nth/reverse/append are the hot list ops.
  */
 
-/* ---- hot list ops + the interp-internal hot prims ---- */
+/* ---- hot list ops + the interp-internal hot prims ----
+   reverse/append/assoc/empty?/newvar are ALSO OS defuns (sys.kl) but the
+   reduced bundle's own bytecode calls them as [prim X] (e.g. shen.fresh-var,
+   shen.interp), so they MUST stay C primitives; the metacircular interp
+   mirrors them with [prim X] rules.  length/nth are NOT used as prims by the
+   bundle and are plain OS defuns -> removed (resolve via namespace 2).
+   fail was a defun-shadowing bug (reference treats fail as a defun; bundle
+   never emits [prim fail]) -> removed; shen.fail! is the real primitive. */
 PRIM("assoc",2)
 PRIM("cons",2)
 PRIM("hd",1)
 PRIM("tl",1)
 PRIM("=",2)
 PRIM("empty?",1)
-PRIM("length",1)
-PRIM("nth",2)
 PRIM("reverse",1)
 PRIM("append",2)
 
@@ -81,8 +86,6 @@ PRIM("read-byte",1)
 PRIM("read-file-as-string",1)
 PRIM("open",2)
 PRIM("close",1)
-PRIM("stinput",0)
-PRIM("stoutput",0)
 
 /* ---- control / eval ---- */
 PRIM("trap-error",2)
@@ -101,5 +104,4 @@ PRIM("snd",1)
 PRIM("gensym",1)
 PRIM("newvar",0)
 PRIM("element?",2)
-PRIM("fail",1)
 PRIM("shen.fail!",1)
