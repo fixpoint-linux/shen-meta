@@ -672,8 +672,8 @@ static void vm_throw(const char *msg) {
 
 /* alarm_jmp and test_timed_out moved to zinctest.c (test binary) */
 
-static int repl_mode = 0;
-static jmp_buf repl_exit_jmp;
+int repl_mode = 0;
+jmp_buf repl_exit_jmp;
 
 /* (vm_exec / vm_exec_env now declared in zincvm.h) */
 

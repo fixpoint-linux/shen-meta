@@ -258,8 +258,13 @@ int main(int argc, char **argv) {
     printf("Shen ready.\n\n");
     fflush(stdout);
 
-    /* 3. (shen.repl) through the native interp.  Reads stdin; EOF exits. */
-    {
+    /* 3. (shen.repl) through the native interp.  Reads stdin; EOF exits.
+       Intercept "error: empty stream" (EOF) to exit cleanly — the same
+       repl_mode + repl_exit_jmp mechanism as zincvm.c's --repl.  Without it,
+       shen.repl catches the EOF simple-error via trap-error and re-prompts
+       forever on an empty stdin. */
+    repl_mode = 1;
+    if (setjmp(repl_exit_jmp) == 0) {
         Value repl_form = val_cons(val_symbol("shen.repl"), val_nil());
         gc_root_push_value(&repl_form);
         Value rr = eval_native(repl_form);
@@ -267,6 +272,7 @@ int main(int argc, char **argv) {
         gc_root_pop();  /* rr */
         gc_root_pop();  /* repl_form */
     }
+    repl_mode = 0;
 
     printf("\nGoodbye.\n");
     return 0;

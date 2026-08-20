@@ -145,6 +145,34 @@
                 (trap-error (interp C1 [lambda C1 E1] [cons | E1] S [])
                             (lambda Err (interp-apply-handler H Err)))))
 
+\* interp-reverse / interp-append / interp-assoc: SEMANTIC (tagged-list)
+   helpers for the [prim reverse] / [prim append] / [prim assoc] interp rules.
+   The OS-runtime names reverse/append/assoc are ALSO C primitives (in
+   primitive?-names), so calling e.g. (reverse A) in a rule RHS compiles to
+   [prim reverse] -> the C raw cdr-spine reversal primitive, which corrupts the
+   TAGGED accumulator (the leaked 'cons' symbol surfaced by map-h's base case:
+   the tagged list [cons 116 [cons 114 ...]] has a 3-element raw C spine
+   [cons-sym 116 <rest>], and raw reversal turns it into (<rest> 116 cons-sym)).
+   These helpers pattern-match the TAGGED representation directly and mirror
+   shen.reverse / shen.append / shen.assoc (sys.kl) semantics.  The apply and
+   appterm rules' INTERNAL (reverse Args) / (append (reverse Args) E1) on the
+   RAW arg list are untouched and keep using the C primitives. *\
+(define interp-reverse { zinc-value --> zinc-value --> zinc-value }
+  [cons] Acc -> Acc
+  [cons H T] Acc -> (interp-reverse T [cons H Acc])
+  _ _ -> (simple-error "reverse: non-list"))
+
+(define interp-append { zinc-value --> zinc-value --> zinc-value }
+  [cons] A2 -> A2
+  [cons H T] A2 -> [cons H (interp-append T A2)]
+  _ _ -> (simple-error "append: non-list"))
+
+(define interp-assoc { zinc-value --> zinc-value --> zinc-value }
+  K [cons] -> [cons]
+  K [cons [cons K1 Rest] T] -> [cons K1 Rest] where (= K K1)
+  K [cons _ T] -> (interp-assoc K T)
+  _ _ -> (simple-error "assoc: non-list"))
+
 (define interp { zinc-code --> zinc-value --> (list zinc-value) --> (list zinc-value) --> (list zinc-value) --> zinc-value }
   [access N | C] A E S R                                        -> (interp C (lookup N E) E [A | S] R)
   [global G | C] A E S R                                        -> (interp C (lookup-global G) E [A | S] R)
@@ -270,14 +298,16 @@
   [prim empty? | C] [cons] E S R                                 -> (interp C [boolean true] E S R)
   [prim empty? | C] A E S R                                      -> (interp C [boolean false] E S R)
   \* reverse / append / assoc: OS-runtime prims (also OS defuns in sys.kl, but
-     kept as C prims because the bundle calls them as [prim X]).  Call the
-     plain Shen names (which compile to [prim X] since they are in
-     primitive?-names) so the metacircular interp matches the C VM.
+     kept as C prims because the bundle calls them as [prim X]).  The plain
+     Shen names reverse/append/assoc compile to [prim X] (they are in
+     primitive?-names) — so calling them directly would hit the C raw
+     primitives and corrupt the TAGGED values.  Route through the semantic
+     helpers interp-reverse / interp-append / interp-assoc instead.
      reverse: unary (arg in A).  append/assoc: binary (A = leftmost, A1 on
      stack = rightmost, matching the RTL argument order). *\
-  [prim reverse | C] A E S R                                     -> (interp C (reverse A) E S R)
-  [prim append | C] A1 E [A2 | S] R                              -> (interp C (append A1 A2) E S R)
-  [prim assoc | C] K E [L | S] R                                 -> (interp C (assoc K L) E S R)
+  [prim reverse | C] A E S R                                     -> (interp C (interp-reverse A [cons]) E S R)
+  [prim append | C] A1 E [A2 | S] R                              -> (interp C (interp-append A1 A2) E S R)
+  [prim assoc | C] K E [L | S] R                                 -> (interp C (interp-assoc K L) E S R)
   [prim absvector | C] [number A] E S R                         -> (interp C [absvector (absvector A)] E S R)
   [prim absvector? | C] [absvector _] E S R                     -> (interp C [boolean true] E S R)
   [prim absvector? | C] A E S R                                 -> (interp C [boolean false] E S R)

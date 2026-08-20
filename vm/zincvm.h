@@ -92,6 +92,8 @@ extern int trace_limit;
 extern int num_traced;
 #define MAX_TRACED 32
 extern Instr *traced_code[MAX_TRACED];
+extern int repl_mode;
+extern jmp_buf repl_exit_jmp;
 
 /* ------------------------------------------------------------------ */
 /*  Value constructors                                                 */
