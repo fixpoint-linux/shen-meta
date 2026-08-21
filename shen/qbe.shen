@@ -42,7 +42,7 @@
 (set qbe-loop-slots [])  \* L3-T2: dedicated loop-carried alloc-slot names for self-jump TCO (never freed) *\
 (set qbe-tco-enabled false) \* L3-T2: this closure self-references at top level; appterm-to-self self-jumps *\
 (set qbe-zero-tmp false)
-(set qbe-zero-init "")
+(set qbe-zero-init [])
 (set qbe-inl-count 0)    \* next @.iN internal reconvergence-label index (GLOBAL, monotonic — see qbe-data-count) *\
 (set qbe-block-label "") \* current QBE basic-block label (reset to @b<Start> per block; advanced to @.iN by inline prim reconvergence) — used as the phi predecessor *\
 (set qbe-preds [])       \* [ [target pred state] ... ] CFG edges *\
@@ -83,7 +83,7 @@
 (define qbe-env-access { number --> (list string) --> (list zinc-value) --> string }
   N Env Stk -> (if (>= N (length Env))
                (let Z (qbe-slot Stk Env)
-                 (do (qbe-emit (qbe-call "val_number_into" [(cn "l " Z) "l 0"]))
+                 (do (qbe-emit-number Z "0")
                      Z))
                (qbe-env-ref N Env)))
 
@@ -352,10 +352,10 @@
                     (qbe-emit Lcar)
                     (qbe-emit (qbe-join [AP " =l add " Arg ", " (str Off)]))
                     (qbe-emit (qbe-join [Val " =l loadl " AP]))
-                    (qbe-emit (qbe-join ["call $copy_value(l " Out ", l " Val ")"]))
+                    (qbe-emit-copy Out Val)
                     (qbe-emit (qbe-join ["jmp " Ldone]))
                     (qbe-emit Lnil)
-                    (qbe-emit (qbe-join ["call $val_nil_into(l " Out ")"]))
+                    (qbe-emit-nil Out)
                     (qbe-emit Ldone)
                     (set qbe-block-label Ldone)
                     skip)))))))))
@@ -464,6 +464,104 @@
                                     (qbe-emit Ldone)
                                     (set qbe-block-label Ldone)
                                     skip)))))))))))))))))
+
+\* -------------------------- leaf-shim inlining -------------------------- *\
+
+\* Extend the manual inlining to the 5 PURE leaf shims (val_number_into,
+   val_boolean_into, val_nil_into, copy_value, is_false) by emitting raw QBE
+   reading/writing the Value struct directly instead of `call $val_*_into` /
+   `call $copy_value` / `call $is_false`.  Value = 40B: tag 4B enum@0
+   (VAL_NUMBER=0 VAL_BOOLEAN=3 VAL_NIL=5), union@8.  Every tag constant and
+   store/load offset is pinned to vm/zinctypes.h; diff-test 8/8 is the oracle
+   that catches any divergence (a wrong offset yields a silently-wrong
+   GC-visible Value with no crash).  These sequences allocate NOTHING, so no
+   GC can intervene mid-sequence and Out (a rooted qbe-slot, or the
+   caller-rooted %out / loop slot) never needs re-rooting — the frame rooting
+   is done once at function entry (gc_root_push_value per live slot).  The
+   out-of-line `call $prim_X` / `call $val_*_into` fallbacks are left intact
+   everywhere else. *\
+
+\* Emit a pre-built list of lines (used by the prologue / init-copy line lists). *\
+(define qbe-emit-lines { (list string) --> symbol }
+  [] -> skip
+  [L | R] -> (do (qbe-emit L) (qbe-emit-lines R)))
+
+\* val_number_into(Out,N): tag=VAL_NUMBER(0), number@8.  N is a bare long value. *\
+(define qbe-number-into-lines { string --> string --> (list string) }
+  Out N ->
+    (let P (qbe-fresh)
+      [(cn "storew 0, " Out)
+       (qbe-join [P " =l add " Out ", 8"])
+       (qbe-join ["storel " N ", " P])]))
+
+(define qbe-emit-number { string --> string --> symbol }
+  Out N -> (qbe-emit-lines (qbe-number-into-lines Out N)))
+
+\* val_boolean_into(Out,B): tag=VAL_BOOLEAN(3), boolean@8 (4B int).  B is a bare word. *\
+(define qbe-emit-boolean { string --> string --> symbol }
+  Out B ->
+    (let P (qbe-fresh)
+      (do (qbe-emit (cn "storew 3, " Out))
+          (qbe-emit (qbe-join [P " =l add " Out ", 8"]))
+          (qbe-emit (qbe-join ["storew " B ", " P]))
+          skip)))
+
+\* val_nil_into(Out): tag=VAL_NIL(5).  The plan's zero-union form (storel 0 at
+   +8/+16/+24/+32) needs QBE `%mem+off` store operands, which this pinned QBE
+   does not parse; a nil Value's payload is never read and GC ignores tag 5
+   (gc_scan_value on VAL_NIL is a no-op), so `storew 5, %Out` alone is
+   behaviorally identical to val_nil's memset+tag — the diff-test oracle
+   confirms. *\
+(define qbe-nil-into-lines { string --> (list string) }
+  Out -> [(cn "storew 5, " Out)])
+
+(define qbe-emit-nil { string --> symbol }
+  Out -> (qbe-emit-lines (qbe-nil-into-lines Out)))
+
+\* copy_value(Dst,Src): full 40B struct copy.  QBE loads/stores take a bare
+   temp (NO `%mem+off` operands in this pinned QBE), so each non-zero offset is
+   reached via an explicit `add` pointer temp.  Offset 0 loads/stores directly.
+   QBE memopt/loadopt coalesces where profitable. *\
+(define qbe-copy-off-lines { string --> string --> (list number) --> (list string) }
+  _ _ [] -> []
+  Src Dst [Off | R] ->
+    (let SO (qbe-fresh)
+      (let V (qbe-fresh)
+        (let DO (qbe-fresh)
+          (append [(qbe-join [SO " =l add " Src ", " (str Off)])
+                   (qbe-join [V " =l loadl " SO])
+                   (qbe-join [DO " =l add " Dst ", " (str Off)])
+                   (qbe-join ["storel " V ", " DO])]
+            (qbe-copy-off-lines Src Dst R))))))
+
+(define qbe-copy-value-lines { string --> string --> (list string) }
+  Dst Src ->
+    (let A0 (qbe-fresh)
+      (append [(qbe-join [A0 " =l loadl " Src])
+               (qbe-join ["storel " A0 ", " Dst])]
+        (qbe-copy-off-lines Src Dst [8 16 24 32]))))
+
+(define qbe-emit-copy { string --> string --> symbol }
+  Dst Src -> (qbe-emit-lines (qbe-copy-value-lines Dst Src)))
+
+\* is_false(V) -> word result temp: (tag==VAL_BOOLEAN(3) && boolean@8==0).
+   BOTH conjuncts — the repo-root leaf_test.s dropped the boolean==0 check
+   (that buggy probe is NOT to be copied; the lowerer is diff-tested). *\
+(define qbe-emit-is-false { string --> string }
+  Cond ->
+    (let T (qbe-c-fresh)
+      (let BO (qbe-fresh)
+        (let B (qbe-c-fresh)
+          (let X (qbe-c-fresh)
+            (let Y (qbe-c-fresh)
+              (let C (qbe-c-fresh)
+                (do (qbe-emit (qbe-join [T " =w loadw " Cond]))
+                    (qbe-emit (qbe-join [BO " =l add " Cond ", 8"]))
+                    (qbe-emit (qbe-join [B " =w loadw " BO]))
+                    (qbe-emit (qbe-join [X " =w ceqw " T ", 3"]))
+                    (qbe-emit (qbe-join [Y " =w ceqw " B ", 0"]))
+                    (qbe-emit (qbe-join [C " =w and " X ", " Y]))
+                    C))))))))
 
 \* -------------------------- emit machinery -------------------------- *\
 
@@ -673,7 +771,7 @@
   _ [access N] [Stk Env Marks] _ -> [[(qbe-env-access N Env Stk) | Stk] Env Marks]
   _ [number N] [Stk Env Marks] _ ->
     (let Out (qbe-slot Stk Env)
-      (do (qbe-emit (qbe-call "val_number_into" [(cn "l " Out) (cn "l " (str N))]))
+      (do (qbe-emit-number Out (str N))
           [[Out | Stk] Env Marks]))
   _ [string S] [Stk Env Marks] _ ->
     (let Out (qbe-slot Stk Env)
@@ -687,7 +785,7 @@
             [[Out | Stk] Env Marks])))
   _ [boolean B] [Stk Env Marks] _ ->
     (let Out (qbe-slot Stk Env)
-      (do (qbe-emit (qbe-call "val_boolean_into" [(cn "l " Out) (cn "w " (if (= B true) "1" "0"))]))
+      (do (qbe-emit-boolean Out (if (= B true) "1" "0"))
           [[Out | Stk] Env Marks]))
   _ [prim P] [Stk Env Marks] _ ->
     (let K (qbe-prim-arity P)
@@ -725,7 +823,7 @@
               (qbe-free-exit-state Stk Env)
               [(hd (tl R)) Env (tl Marks)])))
   _ return [Stk Env Marks] _ ->
-    (do (qbe-emit (qbe-call "copy_value" ["l %out" (cn "l " (hd Stk))]))
+    (do (qbe-emit-copy "%out" (hd Stk))
         (qbe-emit (qbe-call "gc_root_pop_to" [(cn "l " (value qbe-wm-temp))]))
         (qbe-emit "ret")
         (qbe-free-exit-state Stk Env)
@@ -735,9 +833,8 @@
         State)
   N [jmpf L] [Stk Env Marks] _ ->
     (let Cond (hd Stk)
-      (let C (qbe-c-fresh)
-        (do (qbe-emit (qbe-join [C " =w call $is_false(" (cn "l " Cond) ")"]))
-            (qbe-emit (qbe-join ["jnz " C ", @b" (str L) ", @b" (str (+ N 1))]))
+      (let C (qbe-emit-is-false Cond)
+        (do (qbe-emit (qbe-join ["jnz " C ", @b" (str L) ", @b" (str (+ N 1))]))
             (qbe-free-name Cond Env)
             [(tl Stk) Env Marks])))
   _ [trap C1 C2] [Stk Env Marks] ClosureSet ->
@@ -817,7 +914,7 @@
   [] _ -> skip
   [A | AR] [L | LR] -> (if (= A L)
                          (qbe-self-jump-copies-simple AR LR)
-                         (do (qbe-emit (qbe-call "copy_value" [(cn "l " L) (cn "l " A)]))
+                         (do (qbe-emit-copy L A)
                              (qbe-self-jump-copies-simple AR LR))))
 
 \* true iff some argument IS a loop slot at a different position — the only
@@ -834,14 +931,14 @@
   [A | AR] [L | LR] Acc -> (if (= A L)
                              (qbe-self-jump-stage-a AR LR Acc)
                              (let S (qbe-slot-fresh)
-                               (do (qbe-emit (qbe-call "copy_value" [(cn "l " S) (cn "l " A)]))
+                               (do (qbe-emit-copy S A)
                                    (qbe-self-jump-stage-a AR LR (cons [S L] Acc))))))
 
 \* phase B: move each scratch -> its loop slot.  All loop-slot reads were done
    in phase A, so no write here can clobber a still-needed source. *\
 (define qbe-self-jump-stage-b { (list (list string string)) --> symbol }
   [] -> skip
-  [[S L] | R] -> (do (qbe-emit (qbe-call "copy_value" [(cn "l " L) (cn "l " S)]))
+  [[S L] | R] -> (do (qbe-emit-copy L S)
                      (qbe-self-jump-stage-b R)))
 
 \* -------------------------- CFG edge recording -------------------------- *\
@@ -916,7 +1013,7 @@
          (let T (qbe-fresh)
            (do (set qbe-allocs (cons (qbe-join [T " =l alloc8 40"]) (value qbe-allocs)))
                (set qbe-temp-names (cons T (value qbe-temp-names)))
-               (set qbe-zero-init (qbe-call "val_number_into" [(cn "l " T) "l 0"]))
+               (set qbe-zero-init (reverse (qbe-number-into-lines T "0")))
                (set qbe-zero-tmp T)
                T))
          (value qbe-zero-tmp)))
@@ -967,7 +1064,7 @@
 
 (define qbe-copy-lines { (list (list string string)) --> symbol }
   [] -> skip
-  [[Dst Src] | R] -> (do (qbe-emit (qbe-call "copy_value" [(cn "l " Dst) (cn "l " Src)]))
+  [[Dst Src] | R] -> (do (qbe-emit-copy Dst Src)
                          (qbe-copy-lines R)))
 
 (define qbe-phi-inputs { (list string) --> (list zinc-value) --> string }
@@ -1043,7 +1140,7 @@
    per-frame pushes done by the cur bodies they run. *\
 (define qbe-nil-lines { (list string) --> (list string) }
   [] -> []
-  [T | R] -> [(qbe-call "val_nil_into" [(cn "l " T)]) | (qbe-nil-lines R)])
+  [T | R] -> (append (qbe-nil-into-lines T) (qbe-nil-lines R)))
 
 (define qbe-push-lines { (list string) --> (list string) }
   [] -> []
@@ -1057,7 +1154,7 @@
   [[0 Lines] | R] ->
     (let Base (append (qbe-push-lines (value qbe-temp-names))
                 (append [(qbe-wm-line)]
-                  (append (if (= (value qbe-zero-init) "") [] [(value qbe-zero-init)])
+                  (append (value qbe-zero-init)
                     (append (qbe-nil-lines (value qbe-temp-names))
                       (value qbe-allocs)))))
       (if (value qbe-tco-enabled)
@@ -1074,7 +1171,7 @@
    %L0..%L{arity-1} order. *\
 (define qbe-init-copies { (list string) --> (list string) --> (list string) }
   [] _ -> []
-  [L | LR] [A | AR] -> (cons (qbe-call "copy_value" [(cn "l " L) (cn "l " A)]) (qbe-init-copies LR AR)))
+  [L | LR] [A | AR] -> (append (qbe-copy-value-lines L A) (qbe-init-copies LR AR)))
 
 (define qbe-fn-string { symbol --> number --> string }
   Name Arity ->
@@ -1197,7 +1294,7 @@
         (set qbe-merge-blocked [])
         (set qbe-wm-temp (qbe-fresh))
         (set qbe-zero-tmp false)
-        (set qbe-zero-init "")
+        (set qbe-zero-init [])
         (set qbe-block-lines [])
         (set qbe-lines [])
         (let Env0 (qbe-cur-env0 Ncap)
@@ -1263,7 +1360,7 @@
       (set qbe-merge-blocked [])
       (set qbe-wm-temp (qbe-fresh))
       (set qbe-zero-tmp false)
-      (set qbe-zero-init "")
+      (set qbe-zero-init [])
       (set qbe-block-lines [])
       (set qbe-lines [])
       (set qbe-extra-fns [])
