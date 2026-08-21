@@ -43,6 +43,8 @@
 (set qbe-tco-enabled false) \* L3-T2: this closure self-references at top level; appterm-to-self self-jumps *\
 (set qbe-zero-tmp false)
 (set qbe-zero-init "")
+(set qbe-inl-count 0)    \* next @.iN internal reconvergence-label index (GLOBAL, monotonic — see qbe-data-count) *\
+(set qbe-block-label "") \* current QBE basic-block label (reset to @b<Start> per block; advanced to @.iN by inline prim reconvergence) — used as the phi predecessor *\
 (set qbe-preds [])       \* [ [target pred state] ... ] CFG edges *\
 (set qbe-cur-tag-count 0) \* next cur-body tag (GLOBAL, monotonic) *\
 (set qbe-extra-fns [])     \* cur-body fn strings (per closure) *\
@@ -242,6 +244,226 @@
 
 (define qbe-prim-arity { symbol --> number }
   P -> (hd (tl (tl (assoc P (value qbe-prim-info))))))
+
+\* -------------------------- GC-pure primitive inlining -------------------------- *\
+
+\* Whitelist of GC-pure, NON-allocating primitives that are emitted as inline
+   QBE reading the Value struct directly instead of `call $prim_X`.  Each entry
+   is [symbol arity].  NEVER add an allocating primitive here (cons/@p/set/value/
+   address->/append/reverse/assoc need the write barrier, shadow stack or side
+   effects and MUST stay as out-of-line calls).  The inline sequences contain no
+   allocating call, so no GC can intervene mid-sequence and Out (a rooted
+   qbe-slot, or the caller-rooted %out for appterm) never needs re-rooting. *\
+(set qbe-inl-prims [
+   [hd 1] [tl 1]
+   [cons? 1] [empty? 1] [number? 1] [symbol? 1] [string? 1] [boolean? 1]
+   [= 2] [+ 2] [- 2] [* 2] [/ 2] [< 2] [<= 2] [> 2] [>= 2] ])
+
+\* Fresh internal reconvergence label @.i<N>.  qbe-inl-count is GLOBAL and never
+   reset per closure (like qbe-data-count), so labels stay unique across the whole
+   generated globals.qbe.  These are block-local labels inside a ZINC block — they
+   reconverge with identical abstract (Stk, Env, Marks) on all arms, so they never
+   touch qbe-preds/qbe-merge/phi. *\
+(define qbe-inl-label { --> string }
+  -> (let N (value qbe-inl-count)
+       (do (set qbe-inl-count (+ N 1))
+           (cn "@.i" (str N)))))
+
+(define qbe-inl-prim? { symbol --> boolean }
+  P -> (not (empty? (assoc P (value qbe-inl-prims)))))
+
+\* Arity of a whitelisted prim (only valid when qbe-inl-prim? is true). *\
+(define qbe-inl-arity { symbol --> number }
+  P -> (hd (tl (assoc P (value qbe-inl-prims)))))
+
+(define qbe-inl-all-strings? { (list string) --> boolean }
+  [] -> true
+  [A | R] -> (and (string? A) (qbe-inl-all-strings? R)))
+
+\* Single side-effecting emitter hooked into ALL THREE prim-call sites ([prim P]
+   step, qbe-do-call, qbe-do-tail).  Inlines the GC-pure whitelist; everything
+   else (and any arg-shape anomaly) falls back to `call $prim_X`.  Args is
+   top-first: Args[0]=leftmost, Args[1]=rightmost — matching the C shim
+   convention (va_pop pops top=leftmost first).  Out is a rooted slot name. *\
+(define qbe-emit-prim { symbol --> string --> (list string) --> symbol }
+  P Out Args ->
+    (if (qbe-inl-prim? P)
+        (if (and (= (length Args) (qbe-inl-arity P)) (qbe-inl-all-strings? Args))
+            (qbe-inl-emit P Out Args)
+            (qbe-emit-prim-call P Out Args))
+        (qbe-emit-prim-call P Out Args)))
+
+\* Fallback: the out-of-line shim call (exactly the pre-inline emission). *\
+(define qbe-emit-prim-call { symbol --> string --> (list string) --> symbol }
+  P Out Args -> (do (qbe-emit (qbe-call (cn "prim_" (qbe-prim-mangled P)) (cons (cn "l " Out) (qbe-l-args Args)))) skip))
+
+\* Dispatch the whitelist by prim name (unary => (hd Args), binary => hd+hd tl). *\
+(define qbe-inl-emit { symbol --> string --> (list string) --> symbol }
+  hd Out Args -> (qbe-emit-hd-tl Out (hd Args) 8)     \* cons.car @8 *\
+  tl Out Args -> (qbe-emit-hd-tl Out (hd Args) 16)    \* cons.cdr @16 *\
+  cons? Out Args -> (qbe-emit-pred Out (hd Args) 4)   \* VAL_CONS=4 *\
+  empty? Out Args -> (qbe-emit-pred Out (hd Args) 5)  \* VAL_NIL=5 *\
+  number? Out Args -> (qbe-emit-pred Out (hd Args) 0) \* VAL_NUMBER=0 *\
+  string? Out Args -> (qbe-emit-pred Out (hd Args) 1) \* VAL_STRING=1 *\
+  symbol? Out Args -> (qbe-emit-pred Out (hd Args) 2) \* VAL_SYMBOL=2 *\
+  boolean? Out Args -> (qbe-emit-pred Out (hd Args) 3) \* VAL_BOOLEAN=3 *\
+  + Out Args -> (qbe-emit-arith Out (hd Args) (hd (tl Args)) "add")
+  - Out Args -> (qbe-emit-arith Out (hd Args) (hd (tl Args)) "sub")
+  * Out Args -> (qbe-emit-arith Out (hd Args) (hd (tl Args)) "mul")
+  / Out Args -> (qbe-emit-arith Out (hd Args) (hd (tl Args)) "div")
+  < Out Args -> (qbe-emit-cmp Out (hd Args) (hd (tl Args)) "csltl")
+  <= Out Args -> (qbe-emit-cmp Out (hd Args) (hd (tl Args)) "cslel")
+  > Out Args -> (qbe-emit-cmp Out (hd Args) (hd (tl Args)) "csgtl")
+  >= Out Args -> (qbe-emit-cmp Out (hd Args) (hd (tl Args)) "csgel")
+  = Out Args -> (qbe-emit-eq Out (hd Args) (hd (tl Args)))
+  P Out Args -> (qbe-emit-prim-call P Out Args))
+
+\* tag-predicate tag == T -> boolean: %c =w loadw %arg / %r =w ceqw %c, T /
+   storew 3, %out / %p =l add %out, 8 / storew %r, %p.  Matches prim_*_p
+   (val_boolean(a.tag == T)). *\
+(define qbe-emit-pred { string --> string --> number --> symbol }
+  Out Arg T ->
+    (let C (qbe-c-fresh)
+      (let R (qbe-c-fresh)
+        (let P (qbe-fresh)
+          (do (qbe-emit (qbe-join [C " =w loadw " Arg]))
+              (qbe-emit (qbe-join [R " =w ceqw " C ", " (str T)]))
+              (qbe-emit (qbe-join ["storew 3, " Out]))
+              (qbe-emit (qbe-join [P " =l add " Out ", 8"]))
+              (qbe-emit (qbe-join ["storew " R ", " P]))
+              skip)))))
+
+\* hd/tl: NIL (tag 5) -> val_nil_into; else copy_value(car@8/cdr@16) into the
+   rooted Out.  copy_value is non-allocating and always copies the heap field,
+   so Out NEVER aliases a live heap cons cell. *\
+(define qbe-emit-hd-tl { string --> string --> number --> symbol }
+  Out Arg Off ->
+    (let C (qbe-c-fresh)
+      (let IsNil (qbe-c-fresh)
+        (let Lnil (qbe-inl-label)
+          (let Lcar (qbe-inl-label)
+            (let Ldone (qbe-inl-label)
+              (let AP (qbe-fresh)
+                (let Val (qbe-fresh)
+                  (do
+                    (qbe-emit (qbe-join [C " =w loadw " Arg]))
+                    (qbe-emit (qbe-join [IsNil " =w ceqw " C ", 5"]))
+                    (qbe-emit (qbe-join ["jnz " IsNil ", " Lnil ", " Lcar]))
+                    (qbe-emit Lcar)
+                    (qbe-emit (qbe-join [AP " =l add " Arg ", " (str Off)]))
+                    (qbe-emit (qbe-join [Val " =l loadl " AP]))
+                    (qbe-emit (qbe-join ["call $copy_value(l " Out ", l " Val ")"]))
+                    (qbe-emit (qbe-join ["jmp " Ldone]))
+                    (qbe-emit Lnil)
+                    (qbe-emit (qbe-join ["call $val_nil_into(l " Out ")"]))
+                    (qbe-emit Ldone)
+                    (set qbe-block-label Ldone)
+                    skip)))))))))
+
+\* Arith +,-,*,/ on a1,a2 numbers (NO tag check — matches C val_number at
+   zincvm.c:1631; the type-safe bundle never passes non-numbers).  RTL:
+   sub/div are NON-commutative: a1=leftmost, a2=rightmost.  QBE div on signed
+   longs truncates toward zero = C /. *\
+(define qbe-emit-arith { string --> string --> string --> string --> symbol }
+  Out A1 A2 Op ->
+    (let O1 (qbe-fresh)
+      (let N1 (qbe-fresh)
+        (let O2 (qbe-fresh)
+          (let N2 (qbe-fresh)
+            (let R (qbe-fresh)
+              (let P (qbe-fresh)
+                (do
+                  (qbe-emit (qbe-join [O1 " =l add " A1 ", 8"]))
+                  (qbe-emit (qbe-join [N1 " =l loadl " O1]))
+                  (qbe-emit (qbe-join [O2 " =l add " A2 ", 8"]))
+                  (qbe-emit (qbe-join [N2 " =l loadl " O2]))
+                  (qbe-emit (qbe-join [R " =l " Op " " N1 ", " N2]))
+                  (qbe-emit (qbe-join ["storew 0, " Out]))
+                  (qbe-emit (qbe-join [P " =l add " Out ", 8"]))
+                  (qbe-emit (qbe-join ["storel " R ", " P]))
+                  skip))))))))
+
+\* Comparison <,<=,>,>= WITH the C tag check (a1.tag==NUMBER && a2.tag==NUMBER
+   && a1.number OP a2.number, zincvm.c:1683): result = both-number AND cmp. *\
+(define qbe-emit-cmp { string --> string --> string --> string --> symbol }
+  Out A1 A2 Cmp ->
+    (let T1 (qbe-c-fresh)
+      (let T2 (qbe-c-fresh)
+        (let M1 (qbe-c-fresh)
+          (let M2 (qbe-c-fresh)
+            (let BN (qbe-c-fresh)
+              (let O1 (qbe-fresh)
+                (let N1 (qbe-fresh)
+                  (let O2 (qbe-fresh)
+                    (let N2 (qbe-fresh)
+                      (let C (qbe-c-fresh)
+                        (let R (qbe-c-fresh)
+                          (let P (qbe-fresh)
+                            (do
+                              (qbe-emit (qbe-join [T1 " =w loadw " A1]))
+                              (qbe-emit (qbe-join [T2 " =w loadw " A2]))
+                              (qbe-emit (qbe-join [M1 " =w ceqw " T1 ", 0"]))
+                              (qbe-emit (qbe-join [M2 " =w ceqw " T2 ", 0"]))
+                              (qbe-emit (qbe-join [BN " =w and " M1 ", " M2]))
+                              (qbe-emit (qbe-join [O1 " =l add " A1 ", 8"]))
+                              (qbe-emit (qbe-join [N1 " =l loadl " O1]))
+                              (qbe-emit (qbe-join [O2 " =l add " A2 ", 8"]))
+                              (qbe-emit (qbe-join [N2 " =l loadl " O2]))
+                              (qbe-emit (qbe-join [C " =w " Cmp " " N1 ", " N2]))
+                              (qbe-emit (qbe-join [R " =w and " BN ", " C]))
+                              (qbe-emit (qbe-join ["storew 3, " Out]))
+                              (qbe-emit (qbe-join [P " =l add " Out ", 8"]))
+                              (qbe-emit (qbe-join ["storew " R ", " P]))
+                              skip))))))))))))))
+
+\* `=`: inline ONLY the scalar same-tag symbol==symbol fast path via pointer
+   equality (val_symbol interns names — one canonical char* per name — so
+   ceql of the two .name@8 pointers == strcmp==0).  EVERYTHING else — strings,
+   conses, vectors, lambdas, prims, errors, streams AND all mismatched-tag
+   cases (sym-vs-prim returns true via strcmp) — falls back to call $prim_eq.
+   NEVER shortcut mismatched tags to false. *\
+(define qbe-emit-eq { string --> string --> string --> symbol }
+  Out A1 A2 ->
+    (let C1 (qbe-c-fresh)
+      (let C2 (qbe-c-fresh)
+        (let Same (qbe-c-fresh)
+          (let IsSym (qbe-c-fresh)
+            (let Lsame (qbe-inl-label)
+              (let Lsym (qbe-inl-label)
+                (let Lcall (qbe-inl-label)
+                  (let Lout (qbe-inl-label)
+                    (let Ldone (qbe-inl-label)
+                      (let S1O (qbe-fresh)
+                        (let S2O (qbe-fresh)
+                          (let S1 (qbe-fresh)
+                            (let S2 (qbe-fresh)
+                              (let EqR (qbe-c-fresh)
+                                (let EP (qbe-fresh)
+                                  (do
+                                    (qbe-emit (qbe-join [C1 " =w loadw " A1]))
+                                    (qbe-emit (qbe-join [C2 " =w loadw " A2]))
+                                    (qbe-emit (qbe-join [Same " =w ceqw " C1 ", " C2]))
+                                    (qbe-emit (qbe-join ["jnz " Same ", " Lsame ", " Lcall]))
+                                    (qbe-emit Lsame)
+                                    (qbe-emit (qbe-join [IsSym " =w ceqw " C1 ", 2"]))
+                                    (qbe-emit (qbe-join ["jnz " IsSym ", " Lsym ", " Lcall]))
+                                    (qbe-emit Lsym)
+                                    (qbe-emit (qbe-join [S1O " =l add " A1 ", 8"]))
+                                    (qbe-emit (qbe-join [S2O " =l add " A2 ", 8"]))
+                                    (qbe-emit (qbe-join [S1 " =l loadl " S1O]))
+                                    (qbe-emit (qbe-join [S2 " =l loadl " S2O]))
+                                    (qbe-emit (qbe-join [EqR " =w ceql " S1 ", " S2]))
+                                    (qbe-emit (qbe-join ["jmp " Lout]))
+                                    (qbe-emit Lcall)
+                                    (qbe-emit (qbe-join ["call $prim_eq(l " Out ", l " A1 ", l " A2 ")"]))
+                                    (qbe-emit (qbe-join ["jmp " Ldone]))
+                                    (qbe-emit Lout)
+                                    (qbe-emit (qbe-join ["storew 3, " Out]))
+                                    (qbe-emit (qbe-join [EP " =l add " Out ", 8"]))
+                                    (qbe-emit (qbe-join ["storew " EqR ", " EP]))
+                                    (qbe-emit Ldone)
+                                    (set qbe-block-label Ldone)
+                                    skip)))))))))))))))))
 
 \* -------------------------- emit machinery -------------------------- *\
 
@@ -472,7 +694,7 @@
       (let R (qbe-pop-k K Stk)
         (do (qbe-free-names (hd R) Env)
           (let Out (qbe-slot Stk Env)
-            (do (qbe-emit (qbe-call (cn "prim_" (qbe-prim-mangled P)) (cons (cn "l " Out) (qbe-l-args (hd R)))))
+            (do (qbe-emit-prim P Out (hd R))
                 [[Out | (hd (tl R))] Env Marks])))))
   _ [global G] [Stk Env Marks] ClosureSet ->
     (if (qbe-prim? G)
@@ -489,7 +711,7 @@
       (do (qbe-free-names (hd R) Env)
           (qbe-free-name (hd Stk) Env)
           (let Out (qbe-slot Stk Env)
-            (do (qbe-emit (qbe-do-call (hd Stk) Out (hd R) ClosureSet))
+            (do (qbe-do-call (hd Stk) Out (hd R) ClosureSet)
                 [[Out | (hd (tl R))] Env (tl Marks)]))))
   _ appterm [Stk Env Marks] ClosureSet ->
     (let R (qbe-pop-k (- (length (tl Stk)) (hd Marks)) (tl Stk))
@@ -497,7 +719,7 @@
           (do (qbe-emit-self-jump (hd R))
               (qbe-free-exit-state Stk Env)
               [(hd (tl R)) Env (tl Marks)])
-          (do (qbe-emit (qbe-do-tail (hd Stk) (hd R) ClosureSet))
+          (do (qbe-do-tail (hd Stk) (hd R) ClosureSet)
               (qbe-emit (qbe-call "gc_root_pop_to" [(cn "l " (value qbe-wm-temp))]))
               (qbe-emit "ret")
               (qbe-free-exit-state Stk Env)
@@ -539,16 +761,18 @@
   _ [Op | _] _ _ -> (simple-error (cn "qbe: unsupported op " (str Op)))
   _ X _ _ -> (simple-error (cn "qbe: unknown instruction " (str X))))
 
-\* Direct-call for apply (non-tail): result into fresh %out slot. *\
-(define qbe-do-call { zinc-value --> string --> (list zinc-value) --> (list symbol) --> string }
-  [clo G] Out Args _ -> (qbe-call (qbe-clo-name G) (cons (cn "l " Out) (qbe-l-args Args)))
-  [prim P] Out Args _ -> (qbe-call (cn "prim_" (qbe-prim-mangled P)) (cons (cn "l " Out) (qbe-l-args Args)))
+\* Direct-call for apply (non-tail): result into fresh %out slot.  Emits inline
+   for GC-pure whitelisted prims via qbe-emit-prim; everything else and clo
+   calls are emitted here directly (callers no longer wrap in qbe-emit). *\
+(define qbe-do-call { zinc-value --> string --> (list zinc-value) --> (list symbol) --> symbol }
+  [clo G] Out Args _ -> (do (qbe-emit (qbe-call (qbe-clo-name G) (cons (cn "l " Out) (qbe-l-args Args)))) skip)
+  [prim P] Out Args _ -> (qbe-emit-prim P Out Args)
   _ _ _ _ -> (simple-error "qbe: dynamic apply not supported"))
 
 \* Tail-call for appterm: result goes to the current function's %out. *\
-(define qbe-do-tail { zinc-value --> (list zinc-value) --> (list symbol) --> string }
-  [clo G] Args _ -> (qbe-call (qbe-clo-name G) (cons "l %out" (qbe-l-args Args)))
-  [prim P] Args _ -> (qbe-call (cn "prim_" (qbe-prim-mangled P)) (cons "l %out" (qbe-l-args Args)))
+(define qbe-do-tail { zinc-value --> (list zinc-value) --> (list symbol) --> symbol }
+  [clo G] Args _ -> (do (qbe-emit (qbe-call (qbe-clo-name G) (cons "l %out" (qbe-l-args Args)))) skip)
+  [prim P] Args _ -> (qbe-emit-prim P "%out" Args)
   _ _ _ -> (simple-error "qbe: dynamic appterm not supported"))
 
 \* L3-T2: is the appterm target a tail-call to THIS function?  Only self-jumps
@@ -622,33 +846,38 @@
 
 \* -------------------------- CFG edge recording -------------------------- *\
 
-(define qbe-record-pred { number --> number --> (list zinc-value) --> symbol }
-  Target Pred State -> (set qbe-preds (cons [Target Pred State] (value qbe-preds))))
+(define qbe-record-pred { number --> string --> (list zinc-value) --> symbol }
+  Target Label State -> (set qbe-preds (cons [Target Label State] (value qbe-preds))))
 
 (define qbe-record-succs { number --> (list (list number zinc-code)) --> (list zinc-value) --> symbol }
   Start Instrs Out ->
     (let Last (qbe-last-instr Instrs)
       (qbe-record-succs2 Start Instrs Out Last)))
 
+\* The pred's label is the CURRENT QBE basic-block label (qbe-block-label): @b<Start>
+   normally, but an inline prim (hd/tl/=) may have split the block into internal
+   @.iN sub-blocks, in which case the phi predecessor must be the reconvergence
+   @.iN — QBE rejects phi predecessors that are not real CFG predecessors. *\
 (define qbe-record-succs2 { number --> (list (list number zinc-code)) --> (list zinc-value) --> zinc-code --> symbol }
   _ _ _ return -> skip
   _ _ _ appterm -> skip
-  Start _ Out [jmp L] -> (qbe-record-pred L Start Out)
-  Start Instrs Out [jmpf L] -> (do (qbe-record-pred L Start Out)
-                                   (qbe-record-pred (qbe-block-end Instrs) Start Out))
-  Start Instrs Out _ -> (qbe-record-pred (qbe-block-end Instrs) Start Out))
+  _ _ Out [jmp L] -> (qbe-record-pred L (value qbe-block-label) Out)
+  _ Instrs Out [jmpf L] -> (do (qbe-record-pred L (value qbe-block-label) Out)
+                               (qbe-record-pred (qbe-block-end Instrs) (value qbe-block-label) Out))
+  _ Instrs Out _ -> (qbe-record-pred (qbe-block-end Instrs) (value qbe-block-label) Out))
 
 \* -------------------------- phi reconciliation -------------------------- *\
 
-(define qbe-preds-of { number --> (list (list number (list zinc-value))) }
+(define qbe-preds-of { number --> (list (list string (list zinc-value))) }
   L -> (qbe-preds-of-h L (value qbe-preds) []))
 
-(define qbe-preds-of-h { number --> (list (list number (list zinc-value))) --> (list (list number (list zinc-value))) --> (list (list number (list zinc-value))) }
+(define qbe-preds-of-h { number --> (list (list number (list zinc-value))) --> (list (list string (list zinc-value))) --> (list (list string (list zinc-value))) }
   _ [] Acc -> Acc
   L [[T P S] | R] Acc -> (qbe-preds-of-h L R (cons [P S] Acc)) where (= L T)
   L [_ | R] Acc -> (qbe-preds-of-h L R Acc))
 
-(define qbe-pred-starts { (list (list number (list zinc-value))) --> (list number) }
+\* Predecessor exit labels (@b<Start> or an inline @.iN reconvergence). *\
+(define qbe-pred-starts { (list (list string (list zinc-value))) --> (list string) }
   [] -> []
   [[P _] | R] -> [P | (qbe-pred-starts R)])
 
@@ -660,7 +889,7 @@
   [] -> []
   [[_ S] | R] -> [(qbe-env S) | (qbe-pred-envs R)])
 
-(define qbe-merge { (list (list number (list zinc-value))) --> (list zinc-value) }
+(define qbe-merge { (list (list string (list zinc-value))) --> (list zinc-value) }
   Preds -> (let Starts (qbe-pred-starts Preds)
              (let Stks (qbe-pred-stks Preds)
                (let Envs (qbe-pred-envs Preds)
@@ -692,10 +921,10 @@
                T))
          (value qbe-zero-tmp)))
 
-(define qbe-reconcile { (list (list zinc-value)) --> (list number) --> (list zinc-value) }
+(define qbe-reconcile { (list (list zinc-value)) --> (list string) --> (list zinc-value) }
   Slots Starts -> (qbe-reconcile-h Slots Starts 0 (qbe-max-length Slots)))
 
-(define qbe-reconcile-h { (list (list zinc-value)) --> (list number) --> number --> number --> (list zinc-value) }
+(define qbe-reconcile-h { (list (list zinc-value)) --> (list string) --> number --> number --> (list zinc-value) }
   Slots Starts J Max -> [] where (= J Max)
   Slots Starts J Max -> [(qbe-slot-phi Slots Starts J) | (qbe-reconcile-h Slots Starts (+ J 1) Max)])
 
@@ -724,7 +953,7 @@
    cannot appear live past this join — every block on its live path carried
    it in its abstract Stk, which blocked any pick), and a later endlet
    re-frees them harmlessly if they were also Env-bound. *\
-(define qbe-slot-phi { (list (list zinc-value)) --> (list number) --> number --> zinc-value }
+(define qbe-slot-phi { (list (list zinc-value)) --> (list string) --> number --> zinc-value }
   Slots Starts J -> (let Temps (qbe-col Slots J)
                       (if (qbe-all-eq Temps)
                           (hd Temps)
@@ -741,9 +970,9 @@
   [[Dst Src] | R] -> (do (qbe-emit (qbe-call "copy_value" [(cn "l " Dst) (cn "l " Src)]))
                          (qbe-copy-lines R)))
 
-(define qbe-phi-inputs { (list number) --> (list zinc-value) --> string }
-  [P] [T] -> (qbe-join ["@b" (str P) " " T])
-  [P | PR] [T | TR] -> (qbe-join ["@b" (str P) " " T ", " (qbe-phi-inputs PR TR)]))
+(define qbe-phi-inputs { (list string) --> (list zinc-value) --> string }
+  [P] [T] -> (qbe-join [P " " T])
+  [P | PR] [T | TR] -> (qbe-join [P " " T ", " (qbe-phi-inputs PR TR)]))
 
 \* -------------------------- block execution -------------------------- *\
 
@@ -759,6 +988,7 @@
         (if (or (= Start 0) (not (empty? Preds)))
             (do
               (set qbe-lines [])
+              (set qbe-block-label (cn "@b" (str Start)))
               (let Entry (if (empty? Preds) Entry0 (qbe-merge Preds))
                 (let Out (qbe-exec Instrs Entry ClosureSet)
                   (do (qbe-record-succs Start Instrs Out)

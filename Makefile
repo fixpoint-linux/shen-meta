@@ -1,4 +1,4 @@
-.PHONY: all vm test bundle pipeline interp setup clean gate gcdebug gc-verify qbe-gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qberepl qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test
+.PHONY: all vm test bundle pipeline interp setup clean gate gcdebug gc-verify qbe-gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qberepl qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test gen-symbol-static
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -18,26 +18,37 @@ define compile-vm
 	st=$$?; rm -rf $$T; exit $$st
 endef
 
-zincvm: vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
-	$(call compile-vm,$@,$(CFLAGS),vm/zincvm.c vm/gc.c)
+# gen-symbol-static: generate the static symbol intern table (vm/symbol_static.{h,c})
+# from the reduced bundle's symbol literals, using a minimal perfect hash.  The
+# output is COMMITTED so `make zincvm` builds standalone; it is regenerated only
+# when globals.csexp is present and newer (mirrors gen-qbe-subset).
+gen-symbol-static: tools/gen-symbol-static.py globals.csexp
+	@if [ globals.csexp -nt vm/symbol_static.c ]; then \
+		python3 tools/gen-symbol-static.py; \
+	else \
+		echo "symbol_static.c up to date"; \
+	fi
 
-zincvm-asan: vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
-	$(call compile-vm,$@,$(CFLAGS) -O0 -g -fsanitize=undefined,vm/zincvm.c vm/gc.c)
+zincvm: vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h vm/symbol_static.c vm/symbol_static.h
+	$(call compile-vm,$@,$(CFLAGS),vm/zincvm.c vm/gc.c vm/symbol_static.c)
+
+zincvm-asan: vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h vm/symbol_static.c vm/symbol_static.h
+	$(call compile-vm,$@,$(CFLAGS) -O0 -g -fsanitize=undefined,vm/zincvm.c vm/gc.c vm/symbol_static.c)
 
 zincdec: vm/zincdec.c
 	$(call compile-vm,$@,$(CFLAGS),vm/zincdec.c)
 
-zinctest: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
-	$(call compile-vm,$@,$(CFLAGS) -DZINCTEST,vm/zinctest.c vm/zincvm.c vm/gc.c)
+zinctest: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h vm/symbol_static.c vm/symbol_static.h
+	$(call compile-vm,$@,$(CFLAGS) -DZINCTEST,vm/zinctest.c vm/zincvm.c vm/gc.c vm/symbol_static.c)
 
 # GC-observable test binary: -O0 -g with no optimization so GC diag flags
 # (--gc-verbose etc.) show addresses/backtraces usefully.  The guard-enabled
 # debug build was removed, so this is a plain -O0 -g build of the same code.
-zinctest-gc: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
-	$(call compile-vm,$@,-Wall -Wextra -O0 -g -DZINCTEST -I vm,vm/zinctest.c vm/zincvm.c vm/gc.c)
+zinctest-gc: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h vm/symbol_static.c vm/symbol_static.h
+	$(call compile-vm,$@,-Wall -Wextra -O0 -g -DZINCTEST -I vm,vm/zinctest.c vm/zincvm.c vm/gc.c vm/symbol_static.c)
 
-zinctest-asan: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h
-	$(call compile-vm,$@,$(CFLAGS) -O0 -g -fsanitize=undefined -DZINCTEST,vm/zinctest.c vm/zincvm.c vm/gc.c)
+zinctest-asan: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h vm/symbol_static.c vm/symbol_static.h
+	$(call compile-vm,$@,$(CFLAGS) -O0 -g -fsanitize=undefined -DZINCTEST,vm/zinctest.c vm/zincvm.c vm/gc.c vm/symbol_static.c)
 
 clean:
 	rm -f zincvm zincdec zincvm-asan zinctest zinctest-gc zinctest-asan *.csexp globals.csexp
@@ -220,12 +231,12 @@ qbe-gen: gen-prims gen-qbe-subset qbe-gen-prims shen/serialize-qbe.shen shen/qbe
 # QBE output is deferred (needs QBE arm64 large-frame support or lowerer
 # frame-size reduction).  qbe-smoke still builds the dual-arch fat APE (its
 # small add12.qbe has no large frames).
-qberun: qbe-tool qbe-gen vm/qberun.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c globals.qbe globals_trap.c
+qberun: qbe-tool qbe-gen vm/qberun.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c vm/symbol_static.c vm/symbol_static.h globals.qbe globals_trap.c
 	@T=$$(mktemp -d /tmp/qberun.build.XXXXXX) && \
 	vendor/qbe/obj/qbe -t amd64_sysv -o $$T/globals.s globals.qbe && \
 	$(COSMOAS)/x86_64-linux-cosmo-as  -o $$T/globals.o $$T/globals.s && \
 	$(COSMO_CC) -Wall -Wextra -O2 -I vm -DZINCTEST -o $$T/qberun \
-		vm/qberun.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c globals_trap.c $$T/globals.o -lm && \
+		vm/qberun.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c vm/symbol_static.c globals_trap.c $$T/globals.o -lm && \
 	cp $$T/qberun qberun && chmod 755 qberun; \
 	st=$$?; rm -rf $$T; exit $$st
 
@@ -247,17 +258,17 @@ diff-test: qberun globals.csexp
 # native clo_interp_load_raw, then runs (shen.initialise)/(shen.repl) through
 # the native extract-kl/kl->zinc/toplevel-interp closures.  Run: ./qberepl
 # (feed it Shen forms on stdin; EOF exits).
-qberepl: qbe-tool qbe-gen vm/qberepl.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c globals.qbe globals_trap.c
+qberepl: qbe-tool qbe-gen vm/qberepl.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c vm/symbol_static.c vm/symbol_static.h globals.qbe globals_trap.c
 	@T=$$(mktemp -d /tmp/qberepl.build.XXXXXX) && \
 	vendor/qbe/obj/qbe -t amd64_sysv -o $$T/globals.s globals.qbe && \
 	$(COSMOAS)/x86_64-linux-cosmo-as  -o $$T/globals.o $$T/globals.s && \
 	$(COSMO_CC) -Wall -Wextra -O2 -I vm -DZINCTEST -o $$T/qberepl \
-		vm/qberepl.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c globals_trap.c $$T/globals.o -lm && \
+		vm/qberepl.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c vm/symbol_static.c globals_trap.c $$T/globals.o -lm && \
 	cp $$T/qberepl qberepl && chmod 755 qberepl; \
 	st=$$?; rm -rf $$T; exit $$st
 
 # qbe-smoke: Slice-2 (+ 1 2) -> 3 gate (hand-written vm/add12.qbe).
-qbe-smoke: qbe-tool qbe-gen-prims vm/qbesmoke.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c vm/add12.qbe
+qbe-smoke: qbe-tool qbe-gen-prims vm/qbesmoke.c vm/qbe_shims.c vm/qbe_shims.h vm/qbe_prims_gen.c vm/qbe_prims_gen.h vm/zincvm.c vm/gc.c vm/symbol_static.c vm/symbol_static.h vm/add12.qbe
 	@T=$$(mktemp -d /tmp/qbesmoke.build.XXXXXX) && \
 	mkdir -p $$T/.aarch64 && \
 	vendor/qbe/obj/qbe -t amd64_sysv -o $$T/add12.s vm/add12.qbe && \
@@ -266,7 +277,7 @@ qbe-smoke: qbe-tool qbe-gen-prims vm/qbesmoke.c vm/qbe_shims.c vm/qbe_shims.h vm
 	$(COSMOAS)/aarch64-linux-cosmo-as -o $$T/.aarch64/add12.o $$T/.aarch64/add12.s && \
 	$(COSMOCC) -Wall -Wextra -O2 -I vm -DZINCTEST \
 		-o $$T/out.ape \
-		vm/qbesmoke.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c $$T/add12.o && \
+		vm/qbesmoke.c vm/qbe_shims.c vm/qbe_prims_gen.c vm/zincvm.c vm/gc.c vm/symbol_static.c $$T/add12.o && \
 	cp $$T/out.ape.com.dbg qbesmoke && chmod 755 qbesmoke; \
 	st=$$?; rm -rf $$T; exit $$st
 	@echo "=== QBE slice 2 smoke: (+ 1 2) -> 3 ==="
