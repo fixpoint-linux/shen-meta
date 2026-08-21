@@ -1241,7 +1241,17 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             }
             gc_root_pop_to(eval_kl_wm);
             vm_catch_chain = cf.parent;
-            *acc = result;
+            /* Fix the error path: eval-kl previously echoed the raw input form
+               (*acc = result = a), but `a` is NOT GC-rooted across the compile
+               + interp, so the Cheney collector can move its cons cells and the
+               echoed value then reads as garbage (e.g. (reverse [1 2 3]) ->
+               [reverse [1 2 75]).  Instead propagate the real error
+               (cf.error_val, a GC-allocated VAL_ERROR set by vm_throw).  This
+               also matches the OS --repl path, which checks for VAL_ERROR. */
+            Value errv = cf.error_val;
+            gc_root_push_value(&errv);   /* S3: root error value across transfer */
+            *acc = errv;
+            gc_root_pop();
             return 0;
         }
         if (strcmp(name, "emptylist") == 0) {
