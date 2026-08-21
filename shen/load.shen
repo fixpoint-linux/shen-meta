@@ -139,6 +139,8 @@
         (if (or (ws-int? N)
                 (= N 40)  \* ( *\
                 (= N 41)  \* ) *\
+                (= N 91)  \* [ *\
+                (= N 93)  \* ] *\
                 (= N 34)  \* " *\
                 (= N 92)) \* \ *\
             Pos
@@ -177,6 +179,21 @@
                       (let AfterRest (hd (tl Pair2))
                         [[First | Rest] AfterRest]))))))))))
 
+(define parse-list-literal
+  Str Pos Len ->
+  (let P (skip-ws Str Pos Len)
+    (if (>= P Len)
+        (simple-error "unterminated list literal")
+        (if (= (char-code Str P) 93)  \* ] *\
+            [[] (+ P 1)]
+            (let Pair1 (parse-expr Str P Len)
+              (let First (hd Pair1)
+                (let AfterFirst (hd (tl Pair1))
+                  (let Pair2 (parse-list-literal Str AfterFirst Len)
+                    (let Rest (hd Pair2)
+                      (let AfterRest (hd (tl Pair2))
+                        [[cons First Rest] AfterRest]))))))))))
+
 (define parse-list
   Str Pos Len -> (parse-list-tail Str Pos Len))
 
@@ -192,7 +209,9 @@
                   (simple-error "unexpected )")
                   (if (= N 34)  \* " *\
                       (parse-string Str (+ P 1) Len)
-                      (parse-atom Str P Len))))))))
+                      (if (= N 91)  \* [ *\
+                          (parse-list-literal Str (+ P 1) Len)
+                          (parse-atom Str P Len)))))))))
 
 (define parse-exprs
   Str Pos Len ->
