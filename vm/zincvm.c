@@ -26,6 +26,7 @@
  */
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -875,58 +876,74 @@ static int deep_equal(Value a, Value b) {
 
 /* Build string representation of any Value into buf (matching shen-scheme's
    put-datum behaviour: full printed form for all types).  Used by str primitive. */
+
+/* Bounds-safe append for str_value: vsnprintf into the remaining space and
+   CLAMP pos (snprintf returns the would-be length; unclamped, pos runs past
+   bufsize once the buffer fills and the next buf+*pos write is OOB with a
+   negative->huge size — the meta-repl heap smash on results > ~4090 chars). */
+static void sv_append(char *buf, int *pos, int bufsize, const char *fmt, ...) {
+    if (bufsize <= 0 || *pos >= bufsize - 1) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *pos, bufsize - *pos, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    int room = bufsize - 1 - *pos;
+    *pos += (n > room) ? room : n;
+}
+
 static void str_value(Value v, char *buf, int *pos, int bufsize, int depth) {
-    if (depth > 100) { *pos += snprintf(buf + *pos, bufsize - *pos, "..."); return; }
+    if (depth > 100) { sv_append(buf, pos, bufsize, "..."); return; }
     switch (v.tag) {
         case VAL_SYMBOL:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "%s", v.sym.name);
+            sv_append(buf, pos, bufsize, "%s", v.sym.name);
             break;
         case VAL_STRING:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "\"%.*s\"", v.str.len, v.str.data);
+            sv_append(buf, pos, bufsize, "\"%.*s\"", v.str.len, v.str.data);
             break;
         case VAL_NUMBER:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "%ld", v.number);
+            sv_append(buf, pos, bufsize, "%ld", v.number);
             break;
         case VAL_BOOLEAN:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "%s", v.boolean ? "true" : "false");
+            sv_append(buf, pos, bufsize, "%s", v.boolean ? "true" : "false");
             break;
         case VAL_NIL:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "[]");
+            sv_append(buf, pos, bufsize, "[]");
             break;
         case VAL_CONS: {
             Value *cur = &v;
             int first = 1;
-            *pos += snprintf(buf + *pos, bufsize - *pos, "[");
+            sv_append(buf, pos, bufsize, "[");
             while (cur->tag == VAL_CONS && *pos < bufsize - 1) {
-                if (!first) *pos += snprintf(buf + *pos, bufsize - *pos, " ");
+                if (!first) sv_append(buf, pos, bufsize, " ");
                 first = 0;
                 str_value(*cur->cons.car, buf, pos, bufsize, depth + 1);
                 cur = cur->cons.cdr;
             }
             if (cur->tag != VAL_NIL && *pos < bufsize - 1) {
-                *pos += snprintf(buf + *pos, bufsize - *pos, " . ");
+                sv_append(buf, pos, bufsize, " . ");
                 str_value(*cur, buf, pos, bufsize, depth + 1);
             }
-            *pos += snprintf(buf + *pos, bufsize - *pos, "]");
+            sv_append(buf, pos, bufsize, "]");
             break;
         }
         case VAL_ERROR:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<error %s>", v.error.message);
+            sv_append(buf, pos, bufsize, "<error %s>", v.error.message);
             break;
         case VAL_LAMBDA:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<lambda>");
+            sv_append(buf, pos, bufsize, "<lambda>");
             break;
         case VAL_PRIM:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<prim %s>", v.prim.name);
+            sv_append(buf, pos, bufsize, "<prim %s>", v.prim.name);
             break;
         case VAL_VECTOR:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<vector %d>", v.vector.len);
+            sv_append(buf, pos, bufsize, "<vector %d>", v.vector.len);
             break;
         case VAL_STREAM:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<stream>");
+            sv_append(buf, pos, bufsize, "<stream>");
             break;
         default:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<unknown>");
+            sv_append(buf, pos, bufsize, "<unknown>");
             break;
     }
 }
@@ -1480,7 +1497,25 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             else if (a.tag == VAL_NUMBER) { char buf[64]; int len = snprintf(buf, sizeof(buf), "%ld", a.number); *acc = val_string(buf, len); }
             else if (a.tag == VAL_BOOLEAN) *acc = val_string(a.boolean ? "true" : "false",
                                                              a.boolean ? 4 : 5);
-            else { static char buf[4096]; int pos = 0; str_value(a, buf, &pos, sizeof(buf), 0); *acc = val_string(buf, pos); }
+            else {
+                /* Grow-until-fits (was static char buf[4096] — same overflow
+                   as print_shen; (str bigstring) smashed the static buffer). */
+                int cap = 4096;
+                char *buf = malloc(cap);
+                if (!buf) vm_throw("str: out of memory");
+                int pos = 0;
+                for (;;) {
+                    pos = 0;
+                    str_value(a, buf, &pos, cap, 0);
+                    if (pos < cap - 1) break;
+                    cap *= 2;
+                    char *nb = realloc(buf, cap);
+                    if (!nb) { free(buf); vm_throw("str: out of memory"); }
+                    buf = nb;
+                }
+                *acc = val_string(buf, pos);
+                free(buf);
+            }
             return 0;
         }
         if (strcmp(name, "stream?") == 0) {
@@ -2555,8 +2590,22 @@ static char *read_stdin_line(void) {
 
 /* Print a Shen-style representation of a value (uses str_value). */
 static void print_shen(Value v) {
-    char *pbuf = malloc(4096); int pos = 0;
-    str_value(v, pbuf, &pos, 4096, 0);
+    /* Grow-until-fits: str_value clamps pos at bufsize-1 when truncated,
+       so pos < cap-1 means the full representation fit.  Shell output can
+       be arbitrarily large (file dumps), so no fixed cap. */
+    int cap = 4096;
+    char *pbuf = malloc(cap);
+    if (!pbuf) { printf("<oom>\n"); fflush(stdout); return; }
+    int pos = 0;
+    for (;;) {
+        pos = 0;
+        str_value(v, pbuf, &pos, cap, 0);
+        if (pos < cap - 1) break;
+        cap *= 2;
+        char *nb = realloc(pbuf, cap);
+        if (!nb) { free(pbuf); printf("<oom>\n"); fflush(stdout); return; }
+        pbuf = nb;
+    }
     pbuf[pos] = '\0';
     printf("%s\n", pbuf);
     fflush(stdout);
