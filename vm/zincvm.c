@@ -2593,12 +2593,28 @@ static void meta_repl(void) {
         Value Str = val_string(line, n);
         Value Zero = val_number(0);
         Value Len = val_number((long)n);
-        Value parsed = call_closure3("parse-exprs", Str, Zero, Len);
-        if (parsed.tag != VAL_CONS || parsed.cons.car->tag != VAL_CONS) {
-            printf("parse error\n"); free(line); continue;
+
+        CatchFrame cf_parse;
+        cf_parse.parent = vm_catch_chain; cf_parse.in_trap_error = 0;
+        vm_catch_chain = &cf_parse;
+        volatile Value parsed; memset((void*)&parsed, 0, sizeof(parsed));
+        parsed.tag = VAL_NIL;
+        gc_root_push_value_volatile(&parsed);
+        int parse_err = 0;
+        if (setjmp(cf_parse.buf) == 0) {
+            parsed = call_closure3("parse-exprs", Str, Zero, Len);
+        } else {
+            parse_err = 1;
+            parsed = cf_parse.error_val;
+        }
+        vm_catch_chain = cf_parse.parent;
+        gc_root_pop();
+
+        if (parse_err || parsed.tag != VAL_CONS || parsed.cons.car->tag != VAL_CONS) {
+            printf("parse error: "); print_shen(parsed); printf("\n");
+            free(line); continue;
         }
         Value exprs = *parsed.cons.car;  /* hd of [[Expr|Rest] FinalPos] */
-
         Value cur = exprs;
         while (cur.tag == VAL_CONS) {
             Value expr = *cur.cons.car;
