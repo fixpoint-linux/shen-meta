@@ -105,3 +105,18 @@ PRIM("gensym",1)
 PRIM("newvar",0)
 PRIM("element?",2)
 PRIM("shen.fail!",1)
+
+/* ---- shensh process primitives (exec_primitive; each needs a matching
+   [prim X] rule in shen/interp.shen or interpreted code cannot call it).
+   exec-command/shell-pipe/glob return TAGGED values (interp-compatible);
+   the rest return raw values wrapped by their interp rules. ---- */
+PRIM("exec-command",1)   /* Cmd -> [exit-code stdout stderr]            */
+PRIM("shell-pipe",1)     /* [Cmd1 Cmd2 ...] -> [exit output]           */
+PRIM("spawn",1)          /* Cmd -> pid (child inherits stdio)          */
+PRIM("wait",1)           /* Pid -> exit status                         */
+PRIM("kill",2)           /* Pid Sig -> true                            */
+PRIM("cd",1)             /* Path -> true/false                         */
+PRIM("getcwd",0)         /* -> cwd string (mirror newvar arity-0 pops)  */
+PRIM("getenv",1)         /* Name -> value or ""                        */
+PRIM("setenv",2)         /* Name Val -> true                           */
+PRIM("glob",1)           /* Pattern -> sorted list of path strings     */

@@ -36,6 +36,11 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <sys/wait.h>
+#include <poll.h>
+#include <dirent.h>
+#include <fnmatch.h>
+#include <limits.h>
 
 #include <stdint.h>
 #include "gc.h"
@@ -967,6 +972,153 @@ static int exec_primitive_valid(const char *name) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/*  shensh process-primitive helpers                                    */
+/* ------------------------------------------------------------------ */
+
+/* qsort comparator for C string arrays (glob). */
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Drain a single fd to EOF into a growing malloc buffer.
+ * Used by shell-pipe for the capture pipe (single fd, no poll needed). */
+static int drain_fd(int fd, char **out, size_t *outlen) {
+    size_t cap = 8192, n = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) return -1;
+    for (;;) {
+        if (n + 4096 >= cap) {
+            size_t nc = cap * 2;
+            char *nb = (char *)realloc(buf, nc);
+            if (!nb) { free(buf); return -1; }
+            buf = nb; cap = nc;
+        }
+        ssize_t r = read(fd, buf + n, 4096);
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        if (r == 0) break;
+        n += (size_t)r;
+    }
+    buf[n] = '\0';
+    *out = buf; *outlen = n;
+    return 0;
+}
+
+/* Run `/bin/sh -c cmd`; capture stdout AND stderr to EOF via poll().
+ * MUST poll both fds simultaneously: draining one pipe fully before the
+ * other DEADLOCKS when the first pipe fills (64KB) while the child blocks
+ * writing the other.  Returns exit status (or 128+signal on abnormal exit),
+ * -1 on fork/pipe failure.  out/err are malloc'd (caller frees). */
+static int run_capture(const char *cmd, char **out, size_t *outlen,
+                       char **err, size_t *errlen) {
+    int po[2], pe[2];
+    if (pipe(po) < 0) return -1;
+    if (pipe(pe) < 0) { close(po[0]); close(po[1]); return -1; }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(po[0]); close(po[1]); close(pe[0]); close(pe[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        /* Child: NO malloc, NO GC, NO stdio.  Only dup2/close/execl/_exit. */
+        dup2(po[1], STDOUT_FILENO);
+        dup2(pe[1], STDERR_FILENO);
+        close(po[0]); close(po[1]); close(pe[0]); close(pe[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    close(po[1]); close(pe[1]);
+
+    size_t ocap = 8192, ecap = 8192, on = 0, en = 0;
+    char *ob = (char *)malloc(ocap), *eb = (char *)malloc(ecap);
+    if (!ob || !eb) {
+        free(ob); free(eb);
+        close(po[0]); close(pe[0]);
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+    struct pollfd pf[2] = { { po[0], POLLIN, 0 }, { pe[0], POLLIN, 0 } };
+    int openfds = 2;
+    while (openfds > 0) {
+        int rv = poll(pf, 2, -1);
+        if (rv < 0) { if (errno == EINTR) continue; break; }
+        for (int i = 0; i < 2; i++) {
+            if (pf[i].fd < 0) continue;
+            if (!(pf[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            char **bp  = i == 0 ? &ob : &eb;
+            size_t *cp  = i == 0 ? &ocap : &ecap;
+            size_t *np  = i == 0 ? &on  : &en;
+            if (*np + 4096 >= *cp) {
+                size_t nc = *cp * 2;
+                char *nb = (char *)realloc(*bp, nc);
+                if (!nb) { close(pf[i].fd); pf[i].fd = -1; openfds--; continue; }
+                *bp = nb; *cp = nc;
+            }
+            ssize_t r = read(pf[i].fd, *bp + *np, 4096);
+            if (r <= 0) { close(pf[i].fd); pf[i].fd = -1; openfds--; continue; }
+            *np += (size_t)r;
+        }
+    }
+    /* Close any fds still open (poll error exit path). */
+    if (pf[0].fd >= 0) close(pf[0].fd);
+    if (pf[1].fd >= 0) close(pf[1].fd);
+    int st = 0; waitpid(pid, &st, 0);
+    ob[on] = '\0'; eb[en] = '\0';
+    *out = ob; *outlen = on; *err = eb; *errlen = en;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+}
+
+/* ---- Tagged-value builders (for exec-command/shell-pipe/glob results) ----
+ * The metacircular interp works with TAGGED values: a list (a b) is
+ * [cons [.. a ..] [cons [.. b ..] [cons]]].  These helpers build the tagged
+ * forms with correct GC rooting (each intermediate Value is pushed onto the
+ * shadow stack across the val_cons allocations).  The caller is responsible
+ * for rooting the RETURNED Value across any subsequent GC-allocating call. */
+
+/* [cons] = empty tagged list */
+static Value make_tagged_nil(void) {
+    return val_cons(val_symbol("cons"), val_nil());
+}
+
+/* [string S] from raw C data+len.  Roots s across the val_cons allocs. */
+static Value make_tagged_string(const char *data, int len) {
+    Value s = val_string(data, len);
+    gc_root_push_value(&s);
+    Value inner = val_cons(s, val_nil());
+    gc_root_push_value(&inner);
+    Value result = val_cons(val_symbol("string"), inner);
+    gc_root_pop(); gc_root_pop();
+    return result;
+}
+
+/* [number N] */
+static Value make_tagged_number(long n) {
+    Value inner = val_cons(val_number(n), val_nil());
+    gc_root_push_value(&inner);
+    Value result = val_cons(val_symbol("number"), inner);
+    gc_root_pop();
+    return result;
+}
+
+/* [boolean B] */
+
+/* [cons H T] from two tagged values.  Roots car and cdr copies across the
+ * val_cons allocs.  The caller's originals become stale (may move) — do not
+ * use them after this call. */
+static Value make_tagged_cons(Value car, Value cdr) {
+    gc_root_push_value(&car);
+    gc_root_push_value(&cdr);
+    /* [cons Car Cdr] is a 3-element list (cons . (Car . (Cdr . nil))),
+       NOT a dotted pair (cons . (Car . Cdr)).  The interp builds it this
+       way and demarshal_from_tagged expects tagged_cdr to be a singleton
+       list so it can unwrap the actual cdr. */
+    Value inner = val_cons(car, val_cons(cdr, val_nil()));
+    gc_root_push_value(&inner);
+    Value result = val_cons(val_symbol("cons"), inner);
+    gc_root_pop(); gc_root_pop(); gc_root_pop();
+    return result;
+}
+
 /* exec_primitive: dispatch a C primitive by name.
  *
  * Audit note (4a.6): several primitives here pop a Value from the stack,
@@ -1151,6 +1303,15 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
                 *acc = val_number(-1);
             return 0;
         }
+        /* cd: chdir to Path.  Returns raw boolean (interp rule wraps [boolean ...]). */
+        if (strcmp(name, "cd") == 0) {
+            Value path = va_pop(stack);
+            if (path.tag != VAL_STRING) vm_throw("cd: path must be a string");
+            char *p = strndup(path.str.data, path.str.len);
+            int rc = chdir(p);
+            free(p);
+            *acc = val_boolean(rc == 0); return 0;
+        }
         break;
 
     /* ---- 'e': error?, error-to-string, eval-kl, emptylist ---- */
@@ -1280,6 +1441,39 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             Value a = va_pop(stack);
             *acc = val_boolean(a.tag == VAL_NIL); return 0;
         }
+        /* exec-command: run `/bin/sh -c Cmd`, capture stdout+stderr to EOF.
+           Returns a TAGGED list [exit-code stdout stderr] for the interp.
+           Uses poll() to drain both pipes simultaneously — sequential reads
+           deadlock when one pipe fills (64KB) while the child blocks on the
+           other.  Result is built with make_tagged_* helpers; the 6 outer
+           roots keep each tagged piece alive across the next helper's
+           allocations. */
+        if (strcmp(name, "exec-command") == 0) {
+            Value cmd = va_pop(stack);
+            if (cmd.tag != VAL_STRING) vm_throw("exec-command: command must be a string");
+            char *c = strndup(cmd.str.data, cmd.str.len);
+            char *out, *err; size_t ol, el;
+            int code = run_capture(c, &out, &ol, &err, &el);
+            free(c);
+            if (code < 0) vm_throw("exec-command: fork/pipe failed");
+            Value tag_out = make_tagged_string(out, (int)ol);
+            gc_root_push_value(&tag_out);
+            Value tag_err = make_tagged_string(err, (int)el);
+            gc_root_push_value(&tag_err);
+            Value empty = make_tagged_nil();
+            gc_root_push_value(&empty);
+            Value err_list = make_tagged_cons(tag_err, empty);
+            gc_root_push_value(&err_list);
+            Value out_list = make_tagged_cons(tag_out, err_list);
+            gc_root_push_value(&out_list);
+            Value tag_code = make_tagged_number(code);
+            gc_root_push_value(&tag_code);
+            Value final = make_tagged_cons(tag_code, out_list);
+            gc_root_pop(); gc_root_pop(); gc_root_pop();
+            gc_root_pop(); gc_root_pop(); gc_root_pop();
+            free(out); free(err);
+            *acc = final; return 0;
+        }
         break;
 
     /* ---- 'f': fst, function?, fail ---- */
@@ -1316,6 +1510,74 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
                 { *acc = val_number((long)time(NULL)); return 0; }
             if (strcmp(mode.sym.name, "run") == 0) { *acc = val_number((long)clock()); return 0; }
         }
+        /* getcwd: return current working directory (raw string; interp rule
+           wraps [string ...]).  Arity 0 — pop spurious arg if present (newvar
+           precedent). */
+        if (strcmp(name, "getcwd") == 0) {
+            if (stack->len > 0) va_pop(stack);
+            char buf[PATH_MAX];
+            if (getcwd(buf, sizeof(buf)))
+                *acc = val_string(buf, (int)strlen(buf));
+            else
+                *acc = val_string("", 0);
+            return 0;
+        }
+        /* getenv: return value or "" (raw string; interp rule wraps [string ...]). */
+        if (strcmp(name, "getenv") == 0) {
+            Value name_v = va_pop(stack);
+            if (name_v.tag != VAL_STRING) vm_throw("getenv: name must be a string");
+            char *n = strndup(name_v.str.data, name_v.str.len);
+            const char *v = getenv(n);
+            free(n);
+            *acc = val_string(v ? v : "", v ? (int)strlen(v) : 0);
+            return 0;
+        }
+        /* glob: Pattern -> sorted TAGGED list of matching path strings.
+           Splits pattern into dirname + basename; opendir/readdir/fnmatch;
+           qsort; builds the tagged list inside-out (each make_tagged_cons
+           roots its args; `result` is rooted across iterations). */
+        if (strcmp(name, "glob") == 0) {
+            Value pat = va_pop(stack);
+            if (pat.tag != VAL_STRING) vm_throw("glob: pattern must be a string");
+            char pattern[PATH_MAX];
+            int pl = pat.str.len < PATH_MAX - 1 ? (int)pat.str.len : PATH_MAX - 1;
+            memcpy(pattern, pat.str.data, pl); pattern[pl] = '\0';
+            char dir[PATH_MAX], base[PATH_MAX];
+            char *slash = strrchr(pattern, '/');
+            if (slash) {
+                int dlen = (int)(slash - pattern);
+                if (dlen >= PATH_MAX) dlen = PATH_MAX - 1;
+                memcpy(dir, pattern, dlen); dir[dlen] = '\0';
+                strncpy(base, slash + 1, PATH_MAX - 1); base[PATH_MAX - 1] = '\0';
+            } else {
+                strcpy(dir, ".");
+                strncpy(base, pattern, PATH_MAX - 1); base[PATH_MAX - 1] = '\0';
+            }
+            DIR *d = opendir(dir);
+            if (!d) { *acc = make_tagged_nil(); return 0; }
+            char *matches[1024];
+            int nmatch = 0;
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL && nmatch < 1024) {
+                if (fnmatch(base, ent->d_name, 0) == 0) {
+                    if ((strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) &&
+                        fnmatch(base, ".", 0) != 0 && fnmatch(base, "..", 0) != 0)
+                        continue;
+                    matches[nmatch++] = strdup(ent->d_name);
+                }
+            }
+            closedir(d);
+            qsort(matches, nmatch, sizeof(char *), cmp_str);
+            Value result = make_tagged_nil();
+            gc_root_push_value(&result);
+            for (int i = nmatch - 1; i >= 0; i--) {
+                Value s = make_tagged_string(matches[i], (int)strlen(matches[i]));
+                result = make_tagged_cons(s, result);
+            }
+            gc_root_pop();
+            for (int i = 0; i < nmatch; i++) free(matches[i]);
+            *acc = result; return 0;
+        }
         break;
 
     /* ---- 'h': hd, hdstr ---- */
@@ -1338,6 +1600,17 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             char buf[256]; int n = a.str.len < 255 ? a.str.len : 255;
             memcpy(buf, a.str.data, n); buf[n] = '\0';
             *acc = val_symbol(buf); return 0;
+        }
+        break;
+
+    /* ---- 'k': kill ---- */
+    case 'k':
+        /* ZINC RTL: a1 = leftmost = Pid (popped FIRST), a2 = Sig. */
+        if (strcmp(name, "kill") == 0) {
+            Value pidv = va_pop(stack);
+            Value sigv = va_pop(stack);
+            kill((pid_t)pidv.number, (int)sigv.number);
+            *acc = val_boolean(true); return 0;
         }
         break;
 
@@ -1617,6 +1890,151 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             result.tag = VAL_STRING; result.str.data = buf; result.str.len = n;
             *acc = result; return 0;
         }
+        /* shell-pipe: [Cmd1 Cmd2 ...] -> [exit output] (TAGGED). N children,
+           N-1 pipes, each stage `/bin/sh -c` so per-stage redirects come free.
+           Exit = LAST stage (POSIX). Walks the tagged list extracting C
+           strings (no GC during extraction — strndup is C-heap), then forks
+           the pipeline.  The capture pipe (last stage stdout) is drained via
+           drain_fd (single fd, no poll needed). */
+        if (strcmp(name, "shell-pipe") == 0) {
+            Value lst = va_pop(stack);
+            /* Extract C strings from the tagged list [cons [string S] ... [cons]].
+               The interp builds [cons A B] as a 3-element list (cons . (A . (B . nil))),
+               so the cdr tail is val_cons(next_tagged, nil) — a singleton we must
+               unwrap to continue.  The built-in test uses the older dotted format
+               (cons . (A . B)) where tail IS the next tagged cons directly.  Handle
+               both by checking whether the tail's car is itself a [cons ...] form. */
+            char *cmds[64]; int n = 0;
+            Value cur = lst;
+            while (cur.tag == VAL_CONS && n < 64) {
+                Value *car = cur.cons.car;
+                if (car->tag != VAL_SYMBOL || strcmp(car->sym.name, "cons") != 0) break;
+                Value cdr = *cur.cons.cdr;
+                if (cdr.tag == VAL_NIL) break;  /* [cons] = empty list, done */
+                if (cdr.tag != VAL_CONS) break;
+                Value elem = *cdr.cons.car;      /* [string S] */
+                Value tail = *cdr.cons.cdr;      /* singleton-wrapped rest, or rest directly */
+                if (elem.tag != VAL_CONS) break;
+                Value *etag = elem.cons.car;
+                if (etag->tag != VAL_SYMBOL || strcmp(etag->sym.name, "string") != 0)
+                    vm_throw("shell-pipe: list elements must be strings");
+                Value ecdr = *elem.cons.cdr;
+                Value s = *ecdr.cons.car;
+                if (s.tag != VAL_STRING) vm_throw("shell-pipe: list elements must be strings");
+                cmds[n++] = strndup(s.str.data, s.str.len);
+                if (tail.tag == VAL_NIL) break;
+                if (tail.tag != VAL_CONS) break;
+                /* Interp format: tail = val_cons(next_tagged_cons, nil) — unwrap it.
+                   Old format:    tail = next_tagged_cons directly. */
+                Value nxt = *tail.cons.car;
+                if (nxt.tag == VAL_CONS && nxt.cons.car->tag == VAL_SYMBOL &&
+                    strcmp(nxt.cons.car->sym.name, "cons") == 0)
+                    cur = nxt;
+                else
+                    cur = tail;
+            }
+            if (n == 0) {
+                vm_throw("shell-pipe: empty command list");
+            }
+            /* Set up pipeline: N-1 stage pipes + 1 capture pipe */
+            int stage_pipes[128];  /* n-1 pipes, 2 fds each */
+            int cap[2];
+            int n_pipes = n - 1;
+            int pipe_ok = 1;
+            for (int i = 0; i < n_pipes && pipe_ok; i++) {
+                if (pipe(&stage_pipes[2*i]) < 0) pipe_ok = 0;
+            }
+            if (pipe_ok && pipe(cap) < 0) pipe_ok = 0;
+            if (!pipe_ok) {
+                for (int i = 0; i < n_pipes; i++) {
+                    close(stage_pipes[2*i]); close(stage_pipes[2*i+1]);
+                }
+                for (int i = 0; i < n; i++) free(cmds[i]);
+                vm_throw("shell-pipe: pipe failed");
+            }
+            pid_t pids[64];
+            int fork_fail = 0;
+            for (int i = 0; i < n; i++) {
+                pid_t pid = fork();
+                if (pid < 0) { fork_fail = 1; break; }
+                if (pid == 0) {
+                    /* Child: NO malloc, NO GC, NO stdio. */
+                    if (i > 0) dup2(stage_pipes[2*(i-1)], STDIN_FILENO);
+                    if (i < n - 1) dup2(stage_pipes[2*i + 1], STDOUT_FILENO);
+                    else dup2(cap[1], STDOUT_FILENO);
+                    for (int j = 0; j < 2*n_pipes; j++) close(stage_pipes[j]);
+                    close(cap[0]); close(cap[1]);
+                    execl("/bin/sh", "sh", "-c", cmds[i], (char *)NULL);
+                    _exit(127);
+                }
+                pids[i] = pid;
+            }
+            /* Parent: close all pipe ends */
+            for (int i = 0; i < 2*n_pipes; i++) close(stage_pipes[i]);
+            close(cap[1]);
+            if (fork_fail) {
+                close(cap[0]);
+                for (int i = 0; i < n; i++) {
+                    if (pids[i] > 0) { kill(pids[i], SIGKILL); waitpid(pids[i], NULL, 0); }
+                }
+                for (int i = 0; i < n; i++) free(cmds[i]);
+                vm_throw("shell-pipe: fork failed");
+            }
+            /* Drain capture pipe */
+            char *out = NULL; size_t ol = 0;
+            drain_fd(cap[0], &out, &ol);
+            close(cap[0]);
+            /* Wait for all children; exit = LAST stage */
+            int exit_code = 0;
+            for (int i = 0; i < n; i++) {
+                int st;
+                waitpid(pids[i], &st, 0);
+                if (i == n - 1)
+                    exit_code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+            }
+            for (int i = 0; i < n; i++) free(cmds[i]);
+            /* Build tagged result: [cons [number exit] [cons [string out] [cons]]] */
+            Value tag_out = make_tagged_string(out, (int)ol);
+            gc_root_push_value(&tag_out);
+            Value empty = make_tagged_nil();
+            gc_root_push_value(&empty);
+            Value out_list = make_tagged_cons(tag_out, empty);
+            gc_root_push_value(&out_list);
+            Value tag_code = make_tagged_number(exit_code);
+            gc_root_push_value(&tag_code);
+            Value final = make_tagged_cons(tag_code, out_list);
+            gc_root_pop(); gc_root_pop(); gc_root_pop(); gc_root_pop();
+            free(out);
+            *acc = final; return 0;
+        }
+        /* spawn: Cmd -> pid (raw number; interp rule wraps [number ...]).
+           Child inherits stdio.  No allocations between fork and execl. */
+        if (strcmp(name, "spawn") == 0) {
+            Value cmd = va_pop(stack);
+            if (cmd.tag != VAL_STRING) vm_throw("spawn: command must be a string");
+            char *c = strndup(cmd.str.data, cmd.str.len);
+            pid_t pid = fork();
+            if (pid < 0) { free(c); vm_throw("spawn: fork failed"); }
+            if (pid == 0) {
+                execl("/bin/sh", "sh", "-c", c, (char *)NULL);
+                _exit(127);
+            }
+            free(c);
+            *acc = val_number(pid); return 0;
+        }
+        /* setenv: Name Val -> true (raw boolean; interp rule wraps [boolean ...]).
+           ZINC RTL: a1 = leftmost = Name (popped FIRST), a2 = Val. */
+        if (strcmp(name, "setenv") == 0) {
+            Value name_v = va_pop(stack);
+            Value val_v = va_pop(stack);
+            if (name_v.tag != VAL_STRING) vm_throw("setenv: name must be a string");
+            if (val_v.tag != VAL_STRING) vm_throw("setenv: value must be a string");
+            char *n = strndup(name_v.str.data, name_v.str.len);
+            char *v = strndup(val_v.str.data, val_v.str.len);
+            setenv(n, v, 1);
+            free(n); free(v);
+            *acc = val_boolean(true); return 0;
+        }
         break;
 
     /* ---- 't': tl, trap-error, tlstr ---- */
@@ -1717,6 +2135,15 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             fputc((int)byte.number, s.stream.file);
             if (s.stream.file == stdout) fflush(stdout);
             *acc = val_number(byte.number); return 0;
+        }
+        /* wait: Pid -> exit status (raw number; interp rule wraps [number ...]). */
+        if (strcmp(name, "wait") == 0) {
+            Value pidv = va_pop(stack);
+            if (pidv.tag != VAL_NUMBER) vm_throw("wait: pid must be a number");
+            int st;
+            waitpid((pid_t)pidv.number, &st, 0);
+            *acc = val_number(WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
+            return 0;
         }
         break;
 

@@ -2335,7 +2335,7 @@ int main(int argc, char **argv) {
     }
 
     /* No args: built-in bytecode tests */
-    printf("=== ZINC Bytecode VM with 37 Primitives ===\n\n");
+    printf("=== ZINC Bytecode VM with 47 Primitives ===\n\n");
 
     /* GC Phase 4a: precise-root missed-root churn detector (nursery path).
        Runs here on a FRESH nursery (before the built-in tests allocate), so
@@ -2417,7 +2417,62 @@ int main(int argc, char **argv) {
        but no pushmark; arg gets collected, then stack empty → error    */
     run_test("38. appterm: missing mark", "(n[2:n]42c(a[1:n]0v)t)", 0);
 
-    printf("=== All 34 tests done ===\n");
+    /* === shensh process-primitive tests (inline OP_PRIM / global+apply) === */
+
+    /* 39. exec-command "echo hello" → tagged [0 "hello\n" ""] */
+    run_test("39. exec-command echo hello",
+        "(mS[10:S]echo hellog[12:s]exec-commandp)", 1);
+
+    /* 40. shell-pipe ["echo hello" "wc -c"] → tagged [0 "6\n"].
+       Build the tagged argument list in C (same pattern as eval-kl tests
+       that store a pre-built KLambda form in a global), then load it via
+       OP_GLOBAL and call the primitive via OP_PRIM.  Strings are rooted
+       across the val_cons calls to keep str.data pointers valid. */
+    {
+        Value nil = val_nil();
+        Value s1 = val_string("echo hello", 10);
+        gc_root_push_value(&s1);
+        Value s2 = val_string("wc -c", 5);
+        gc_root_push_value(&s2);
+        /* [string "echo hello"] */
+        Value e1 = val_cons(val_symbol("string"), val_cons(s1, nil));
+        gc_root_push_value(&e1);
+        /* [string "wc -c"] */
+        Value e2 = val_cons(val_symbol("string"), val_cons(s2, nil));
+        gc_root_push_value(&e2);
+        /* terminator [cons] = val_cons(sym("cons"), nil) */
+        Value term = val_cons(val_symbol("cons"), nil);
+        gc_root_push_value(&term);
+        /* [cons [string "wc -c"] [cons]] */
+        Value c2 = val_cons(val_symbol("cons"), val_cons(e2, term));
+        gc_root_push_value(&c2);
+        /* [cons [string "echo hello"] [...]] */
+        Value lst = val_cons(val_symbol("cons"), val_cons(e1, c2));
+        defun_set("*sp1*", lst);
+        gc_root_pop(); gc_root_pop(); gc_root_pop(); gc_root_pop();
+        gc_root_pop(); gc_root_pop();
+    }
+    run_test("40. shell-pipe echo|wc",
+        "(g[5:s]*sp1*P[10:s]shell-pipe)", 1);
+
+    /* 41. getcwd → current directory string */
+    run_test("41. getcwd", "(mg[6:s]getcwdp)", 1);
+
+    /* 42. cd /tmp + getcwd roundtrip → "/tmp" */
+    run_test("42. cd+getcwd roundtrip",
+        "(mS[4:S]/tmpg[2:s]cdpmg[6:s]getcwdp)", 1);
+
+    /* 43. glob *.c → sorted tagged list of matching path strings */
+    run_test("43. glob *.c", "(mS[3:S]*.cg[4:s]globp)", 1);
+
+    /* 44. getenv PATH → path string (or "" if unset) */
+    run_test("44. getenv PATH", "(mS[4:S]PATHg[6:s]getenvp)", 1);
+
+    /* 45. setenv FOO=bar → true  (RTL: bar pushed first, FOO last) */
+    run_test("45. setenv FOO=bar",
+        "(mS[3:S]barS[3:S]FOOg[6:s]setenvp)", 1);
+
+    printf("=== All 41 tests done ===\n");
 
     return 0;
 }
