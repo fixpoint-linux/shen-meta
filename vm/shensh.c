@@ -272,21 +272,69 @@ static Value eval_kl_form(Value form) {
  *
  *      shen-load Path = (shen-eval-forms (shen->kl-forms (shen-read-file Path)))
  *
- *   All three stages are BUNDLED closures in namespace 1 (C defun_table),
- *   reached via call_bundled_1 (NOT eval-kl, which resolves namespace 2 and
- *   would say 'global not found').  shen-read-file parses .shen source into
- *   forms; shen->kl-forms compiles each form (define/pattern/guards/cond) to
- *   KLambda defuns; interp-eval registers each into the interp's namespace-2
+ *   All stages are BUNDLED closures in namespace 1 (C defun_table), reached
+ *   via call_bundled_1 (NOT eval-kl, which resolves namespace 2 and would say
+ *   'global not found').  shen-read-file parses .shen source into forms;
+ *   shen->kl-forms compiles each form (define/pattern/guards/cond) to KLambda
+ *   defuns; interp-eval registers each into the interp's namespace-2
  *   global-table so eval-kl can call them.  This is how the shell runs actual
  *   Shen source, not just flat KLambda.
+ *
+ *   TYPE-CHECK BY DEFAULT: before compiling, the bundled Hindley-Milner
+ *   checker (tc-hm-file Path -> (list tc-result)) is run on the source.  Each
+ *   define's result is [ok Name] (pass) or [fail Reason] (fail).  Any FAIL
+ *   aborts the load (returns the fail reason) — the shell refuses to load
+ *   ill-typed source rather than relying on runtime catch-alls.  Defines
+ *   without a { ... --> ... } signature report "no type signature, skipping"
+ *   as a fail (the checker does not infer top-level sigs yet).
  *
  *   Returns a symbol result ('loaded' on success, or an error symbol/Value);
  *   individual form failures are tolerated (each interp-eval is independent). */
 static Value shen_load_source(const char *path) {
-    /* stage 1: read the file into forms */
+    /* stage 0: type-check the whole file (type-check by default).  tc-hm-file
+       re-reads via shen-read-file internally; we just call it with the path. */
     Value p = val_string(path, (long)strlen(path));
     gc_root_push_value(&p);
-    Value forms = call_bundled_1("read-file-raw", p);
+    Value tcs = call_bundled_1("tc-hm-file", p);
+    gc_root_push_value(&tcs);
+    Value fail_res = val_nil();
+    gc_root_push_value(&fail_res);
+    if (tcs.tag == VAL_CONS) {
+        Value r = tcs;
+        int any_fail = 0;
+        while (r.tag == VAL_CONS) {
+            Value res = *r.cons.car;
+            /* res is [ok Name] or [fail Reason] */
+            int is_fail = 0;
+            if (res.tag == VAL_CONS) {
+                Value h = *res.cons.car;
+                if (h.tag == VAL_SYMBOL && strcmp(h.sym.name, "fail") == 0) {
+                    is_fail = 1;
+                    fail_res = *(*res.cons.cdr).cons.car;
+                }
+            }
+            print_shen(res);
+            if (is_fail) any_fail = 1;
+            r = *r.cons.cdr;
+        }
+        if (any_fail) {
+            gc_root_pop();  /* fail_res */
+            gc_root_pop();  /* tcs */
+            gc_root_pop();  /* p */
+            return fail_res;
+        }
+    }
+    gc_root_pop();  /* fail_res */
+    gc_root_pop();  /* tcs */
+    gc_root_pop();  /* p */
+
+    /* stage 1: read the file into forms.  Use shen-read-file (the .shen
+       extended reader) — it groups { A --> B } type sigs into one element so
+       shen->kl's strip-sig can remove them, and handles [X | Rest] list
+       syntax.  read-file-raw is only for .kl files and would break sigs. */
+    p = val_string(path, (long)strlen(path));
+    gc_root_push_value(&p);
+    Value forms = call_bundled_1("shen-read-file", p);
     gc_root_pop();
     if (forms.tag != VAL_CONS) {
         return val_symbol("shen-load: read failed");
