@@ -226,6 +226,41 @@ static Value call_bundled_1(const char *name, Value arg) {
     return result;
 }
 
+/* ---- call_bundled_0: call a nullary BUNDLED closure by name -----------------
+ * Same namespace-1 defun_get + vm_exec_env convention as call_bundled_1, but
+ * for { --> T } nullary closures (e.g. tc-hm-init).  Mirrors the --tc-hm driver
+ * in zincvm.c (defun_get, VAL_LAMBDA check, env_len+1 slot with a val_number(0)
+ * dummy operand, CatchFrame around vm_exec_env).  On a throw the error value is
+ * caught and returned (caller decides whether to warn/abort).  If the named
+ * closure is missing from the bundle, returns val_nil() (tag != VAL_LAMBDA and
+ * != VAL_SYMBOL), so callers can distinguish "missing" from "returned done". */
+static Value call_bundled_0(const char *name) {
+    Value fn = defun_get(name);
+    if (fn.tag != VAL_LAMBDA) return val_nil();
+    gc_root_push_value(&fn);
+    Value *env = GC_VALUE_ARRAY(fn.lambda.env_len + 1);
+    if (fn.lambda.env_len > 0)
+        memcpy(env, fn.lambda.env, fn.lambda.env_len * sizeof(Value));
+    env[fn.lambda.env_len] = val_number(0);   /* dummy slot, see --tc-hm driver */
+    CatchFrame cf;
+    cf.parent = vm_catch_chain;
+    cf.in_trap_error = 0;
+    vm_catch_chain = &cf;
+    Value result;
+    if (setjmp(cf.buf)) {
+        vm_catch_chain = cf.parent;
+        gc_root_push_value(&cf.error_val);
+        result = cf.error_val;
+        gc_root_pop();
+        gc_root_pop();  /* fn */
+        return result;
+    }
+    result = vm_exec_env(fn.lambda.code, fn.lambda.code_len, env, fn.lambda.env_len + 1);
+    vm_catch_chain = cf.parent;
+    gc_root_pop();  /* fn */
+    return result;
+}
+
 /* ---- call_closure3: call a bundled closure with three args (parse-exprs
  *      Str Pos Len).  Same namespace-1 defun_get convention as the others. */
 static Value call_closure3(const char *name, Value a, Value b, Value c) {
@@ -465,6 +500,23 @@ int main(int argc, char **argv) {
         fprintf(stderr, "shensh: warning: failed to load shell/shell.kl (got ");
         print_shen(boot);
         fprintf(stderr, ") — continuing without shell\n");
+    }
+
+    /* Initialise the HM type-checker state ONCE at boot so every subsequent
+       shen-load's tc-hm-file actually checks.  tc-hm-init (shen/tc-hm-runtime.shen)
+       builds tc-prim-table (via tc-build-prim-table) and zeroes the tc-* counters
+       and tc-global-sig-table.  Without this, tc-prim-lookup returns a fresh
+       unknown tvar for every prim and body/arg type errors silently pass (only
+       direct-return mismatches are caught).  This lives at startup, NOT inside
+       shen_load_source, so tc-global-sig-table accumulates across shen-load
+       calls (cross-file sigs — see tc-hm.shen:277).  tc-hm-init is a nullary
+       { --> symbol } bundled closure returning `done`; a missing/failed init
+       is non-fatal — warn and continue (do not abort the shell). */
+    Value tcinit = call_bundled_0("tc-hm-init");
+    if (tcinit.tag != VAL_SYMBOL || strcmp(tcinit.sym.name, "done") != 0) {
+        fprintf(stderr, "shensh: warning: tc-hm-init did not complete (got ");
+        print_shen(tcinit);
+        fprintf(stderr, ") — type-checker may be uninitialised; continuing\n");
     }
 
     /* REPL loop: prompt via eval_form1("sh-prompt", val_string("",0)) → print + read_stdin_line();
