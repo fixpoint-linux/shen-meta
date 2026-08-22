@@ -226,6 +226,118 @@ static Value call_bundled_1(const char *name, Value arg) {
     return result;
 }
 
+/* ---- call_closure3: call a bundled closure with three args (parse-exprs
+ *      Str Pos Len).  Same namespace-1 defun_get convention as the others. */
+static Value call_closure3(const char *name, Value a, Value b, Value c) {
+    Value g = defun_get(name);
+    if (g.tag != VAL_LAMBDA) return val_nil();
+    gc_root_push_value(&g);
+    gc_root_push_value(&a);
+    gc_root_push_value(&b);
+    gc_root_push_value(&c);
+    int env_len = g.lambda.env_len;
+    Value *env = GC_VALUE_ARRAY(env_len + 3);
+    if (env_len > 0) memcpy(env, g.lambda.env, env_len * sizeof(Value));
+    env[env_len] = a; env[env_len+1] = b; env[env_len+2] = c;
+    if (gc_in_oldgen(env)) {
+        if (value_references_nursery(&a)) gc_dirty_vectors_add(env);
+        if (value_references_nursery(&b)) gc_dirty_vectors_add(env);
+        if (value_references_nursery(&c)) gc_dirty_vectors_add(env);
+    }
+    gc_root_pop();  /* c */
+    gc_root_pop();  /* b */
+    gc_root_pop();  /* a */
+    gc_root_pop();  /* g */
+    return vm_exec_env(g.lambda.code, g.lambda.code_len, env, env_len + 3);
+}
+
+/* Is a parsed form a (defun ...) definition? */
+static int is_defun_form(Value f) {
+    if (f.tag != VAL_CONS) return 0;
+    Value h = *f.cons.car;
+    return h.tag == VAL_SYMBOL && strcmp(h.sym.name, "defun") == 0;
+}
+
+/* Evaluate a KLambda form via the eval-kl primitive (namespace 2 resolution). */
+static Value eval_kl_form(Value form) {
+    ValueArray s; s.data = GC_VALUE_ARRAY(1); s.len = 0; s.cap = 1;
+    va_push(&s, form);
+    Value acc; memset(&acc, 0, sizeof(acc));
+    exec_primitive("eval-kl", &acc, &s);
+    return acc;
+}
+
+/* Does the line (after leading whitespace) start with '(' ?  If so it is a
+ * KLambda expression and shensh evaluates it through parse-exprs + eval-kl
+ * (the meta_repl path, in C) rather than treating it as a shell command. */
+static int line_is_klambda(const char *line) {
+    while (*line && isspace((unsigned char)*line)) line++;
+    return *line == '(';
+}
+
+/* Evaluate a whole KLambda line (possibly several forms) via parse-exprs +
+ * eval-kl, printing each form's result.  Returns 1 if the line was handled. */
+static void eval_klambda_line(const char *line, int linelen) {
+    Value Str = val_string(line, linelen);
+    Value Zero = val_number(0);
+    Value Len = val_number((long)linelen);
+
+    CatchFrame cf_parse;
+    cf_parse.parent = vm_catch_chain; cf_parse.in_trap_error = 0;
+    vm_catch_chain = &cf_parse;
+    volatile Value parsed; memset((void*)&parsed, 0, sizeof(parsed));
+    parsed.tag = VAL_NIL;
+    gc_root_push_value_volatile(&parsed);
+    int parse_err = 0;
+    if (setjmp(cf_parse.buf) == 0) {
+        parsed = call_closure3("parse-exprs", Str, Zero, Len);
+    } else {
+        parse_err = 1;
+        parsed = cf_parse.error_val;
+    }
+    vm_catch_chain = cf_parse.parent;
+    gc_root_pop();
+
+    if (parse_err || parsed.tag != VAL_CONS || parsed.cons.car->tag != VAL_CONS) {
+        printf("parse error: "); print_shen(parsed); printf("\n");
+        return;
+    }
+    Value exprs = *parsed.cons.car;  /* hd of [[Expr|Rest] FinalPos] */
+    Value cur = exprs;
+    while (cur.tag == VAL_CONS) {
+        Value expr = *cur.cons.car;
+        volatile int is_defun = is_defun_form(expr);
+
+        CatchFrame cf;
+        cf.parent = vm_catch_chain; cf.in_trap_error = 0;
+        vm_catch_chain = &cf;
+        volatile Value result; memset((void*)&result, 0, sizeof(result));
+        result.tag = VAL_NIL;
+        gc_root_push_value_volatile(&result);
+        int err = 0;
+        if (setjmp(cf.buf) == 0) {
+            if (is_defun) {
+                result = call_bundled_1("interp-eval", expr);
+            } else {
+                result = eval_kl_form(expr);
+            }
+        } else {
+            err = 1;
+            result = cf.error_val;
+        }
+        vm_catch_chain = cf.parent;
+
+        if (is_defun) {
+            if (!err && result.tag == VAL_SYMBOL) { printf("; registered "); print_shen(result); }
+            else { printf("; defun registration failed: "); print_shen(result); }
+        } else {
+            printf("=> "); print_shen(result);
+        }
+        gc_root_pop();  /* result */
+        cur = *cur.cons.cdr;
+    }
+}
+
 /* ---- main() ----------------------------------------------------------- */
 int main(int argc, char **argv) {
     volatile char stack_top_marker;
@@ -282,6 +394,16 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* KLambda expression lines (start with '(') go through the C
+           parse-exprs + eval-kl path (meta_repl style) — parse-exprs is a
+           namespace-1 bundled closure, unreachable from interpreted code. */
+        if (line_is_klambda(line)) {
+            eval_klambda_line(line, (int)strlen(line));
+            free(line);
+            continue;
+        }
+
+        /* Otherwise: a shell command line, handled by shell.kl. */
         Value result = eval_form1("shell-eval-line", val_string(line, (long)strlen(line)));
         free(line);
 
@@ -290,6 +412,15 @@ int main(int argc, char **argv) {
             print_shen(result);
         } else {
             print_shen(result);
+            /* Check if result signals exit to terminate the shell (either the
+               symbol `exit` or the string "exit", returned by sh-builtin's
+               exit branch after setting *sh-exit*). */
+            int is_exit = (result.tag == VAL_SYMBOL && strcmp(result.sym.name, "exit") == 0) ||
+                          (result.tag == VAL_STRING && result.str.len == 4 &&
+                           memcmp(result.str.data, "exit", 4) == 0);
+            if (is_exit) {
+                break;
+            }
         }
     }
 

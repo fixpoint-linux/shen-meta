@@ -1,7 +1,134 @@
-;; Minimal shell.kl stub for shensh frontend
-;; Loaded at boot via interp-load-raw (namespace 2).
-;; Phase 3b will replace this with the full shell loop.
+;; shell.kl - shensh shell command handling (flat KLambda).
+;; Loaded at boot via interp-load-raw (namespace 2); reachable only via eval-kl.
+;; shensh.c routes KLambda-expression lines (first non-ws char is open-paren)
+;; through parse-exprs + eval-kl in C; this file handles COMMAND lines only.
+;;
+;; FLAT KLambda rules (hard-won, do not break):
+;;  - interp-load-raw does NOT run kmacros: use if/let/lambda/cond only, with
+;;    2-arg and/or/plus/minus.  No multi-arg and/or/do, no `not`.
+;;  - No escaped string literals: the double-quote char is (n->string 34).
+;;  - pos OOB returns empty string normally BUT THROWS "pos out of bounds"
+;;    inside trap-error.  shell-eval-line wraps in trap-error, so never call
+;;    pos OOB: use sh-ch (guards with sh-len) instead.
+;;  - No length primitive: sh-len walks tlstr.
+;;  - exec-command/shell-pipe return a PLAIN list [exit out ...] through
+;;    eval-kl (not the C tagged form): destructure with hd/tl directly.
+;;  - shell-pipe wants a plain list of plain strings.
 
 (defun sh-prompt () (cn (getcwd 0) "> "))
 
-(defun shell-eval-line (S) S)
+(defun sh-len (S) (if (= S "") 0 (+ 1 (sh-len (tlstr S)))))
+(defun sh-ch (S I)
+  (if (< I (sh-len S)) (pos S I) ""))
+
+(defun sh-at-end (S I) (>= I (sh-len S)))
+(defun sh-is-space (S I)
+  (let C (sh-ch S I)
+    (or (= C " ") (= C "\t") (= C "\n") (= C "\r"))))
+(defun sh-skipws (S I)
+  (if (sh-is-space S I) (sh-skipws S (+ I 1)) I))
+(defun sh-substr (S Start End)
+  (if (or (sh-at-end S Start)
+          (if (= End -1) false (>= Start End)))
+    ""
+    (cn (sh-ch S Start) (sh-substr S (+ Start 1) End))))
+(defun sh-trim (S Start) (sh-substr S Start -1))
+(defun sh-find-ch (S From C)
+  (if (sh-at-end S From)
+    -1
+    (if (= (string->n (sh-ch S From)) C)
+      From
+      (sh-find-ch S (+ From 1) C))))
+(defun sh-prefix (S P) (sh-prefix-1 S P 0))
+(defun sh-prefix-1 (S P I)
+  (if (sh-at-end P I)
+    true
+    (if (sh-at-end S I)
+      false
+      (if (= (sh-ch S I) (sh-ch P I))
+        (sh-prefix-1 S P (+ I 1))
+        false))))
+
+(defun sh-cd (S)
+  (let I (sh-skipws S 3)
+    (if (cd (sh-trim S I)) "" "cd failed")))
+(defun sh-echo (S) (sh-trim S (sh-skipws S 5)))
+(defun sh-pwd () (str (getcwd 0)))
+;; token: substring from Start up to (not incl) the first space; "" if none
+(defun sh-token (S Start)
+  (let Sp (sh-find-ch S Start 32)
+    (if (= Sp -1) (sh-trim S Start) (sh-substr S Start Sp))))
+;; setenv NAME=VALUE  OR  setenv NAME VALUE
+(defun sh-setenv (S Start)
+  (let I (sh-find-ch S Start 61)
+    (if (= I -1)
+      (let Sp (sh-find-ch S Start 32)
+        (if (= Sp -1)
+          "usage: setenv NAME VALUE or NAME=VALUE"
+          (if (setenv (sh-token S Start) (sh-trim S (+ Sp 1)))
+            "" "setenv failed")))
+      (if (setenv (sh-token S Start) (sh-trim S (+ I 1)))
+        "" "setenv failed"))))
+
+(defun sh-run-command (Cmd)
+  (let Res (exec-command Cmd)
+    (let Exit (hd Res)
+      (let Out (hd (tl Res))
+        (if (= Exit 0) (str Out) (cn "exit " (str Exit)))))))
+(defun sh-run-pipe (Stages)
+  (let Res (shell-pipe Stages)
+    (let Exit (hd Res)
+      (let Out (hd (tl Res))
+        (if (= Exit 0) (str Out) (cn "exit " (str Exit)))))))
+
+(defun sh-split-pipe (S) (sh-split-pipe-1 S 0 nil "" false (n->string 34)))
+(defun sh-split-pipe-1 (S I Acc Cur InQuote Q)
+  (if (sh-at-end S I)
+    (sh-append-stage Acc Cur)
+    (let C (sh-ch S I)
+      (if InQuote
+        (if (= C Q)
+          (sh-split-pipe-1 S (+ I 1) Acc (cn Cur C) false Q)
+          (sh-split-pipe-1 S (+ I 1) Acc (cn Cur C) true Q))
+        (if (= C Q)
+          (sh-split-pipe-1 S (+ I 1) Acc (cn Cur C) true Q)
+          (if (= C "|")
+            (sh-split-pipe-1 S (+ I 1) (sh-append-stage Acc Cur) "" false Q)
+            (sh-split-pipe-1 S (+ I 1) Acc (cn Cur C) false Q)))))))
+;; append stage Cur to the END of the forward-order Acc list
+(defun sh-append-stage (Acc Cur)
+  (if (= Acc nil)
+    (cons Cur nil)
+    (cons (hd Acc) (sh-append-stage (tl Acc) Cur))))
+;; raw stage strings (reversed) -> plain cons list for shell-pipe,
+;; trimming each stage's leading whitespace
+(defun sh-tag-stages (S)
+  (if (= S nil) nil (cons (sh-trim (hd S) (sh-skipws (hd S) 0)) (sh-tag-stages (tl S)))))
+
+(defun sh-run-external (S)
+  (let I (sh-skipws S 0)
+    (let Line (sh-trim S I)
+      (let PipeI (sh-find-ch Line 0 124)
+        (if (= PipeI -1)
+          (sh-run-command Line)
+          (sh-run-pipe (sh-tag-stages (sh-split-pipe Line))))))))
+
+(defun sh-builtin (S)
+  (let I (sh-skipws S 0)
+    (let Cmd (sh-ch S I)
+      (if (= Cmd "c")
+        (if (sh-prefix S "cd ") (sh-cd S) (sh-run-external S))
+        (if (= Cmd "p")
+          (if (sh-prefix S "pwd") (sh-pwd) (sh-run-external S))
+          (if (= Cmd "s")
+            (if (sh-prefix S "setenv ") (sh-setenv S 7) (sh-run-external S))
+            (if (= Cmd "e")
+              (if (sh-prefix S "exit")
+                (if (set *sh-exit* true) "exit" "exit")
+                (if (sh-prefix S "echo ")
+                  (sh-echo S)
+                  (if (sh-prefix S "export ") (sh-setenv S 7) (sh-run-external S))))
+              (sh-run-external S))))))))
+
+(defun shell-eval-line (S)
+  (trap-error (sh-builtin S) (lambda E (cn "error: " (str E)))))
