@@ -2923,7 +2923,7 @@ Value vm_exec(Instr *code, int code_len) {
 /* ------------------------------------------------------------------ */
 /*  Meta REPL                                                          */
 /* ------------------------------------------------------------------ */
-#ifndef ZINCTEST
+#if !defined(ZINCTEST) && !defined(SHELL)
 /* Call a bundled lambda closure by name with a single argument.
    Mirrors the convention used in eval-kl: the arg is placed after the
    closure's captured env, and the closure reads its param via `access N`. */
@@ -3528,7 +3528,7 @@ int vm_load_bundle(const char *buf) {
 /* ------------------------------------------------------------------ */
 /*  run_bytecode_file: execute a single csexp bytecode file             */
 /* ------------------------------------------------------------------ */
-#ifndef ZINCTEST
+#if !defined(ZINCTEST) && !defined(SHELL)
 static void run_bytecode_file(const char *label, const char *src) {
     (void)label;  /* label is informational; not printed in production mode */
     Instr *code = NULL;
@@ -3555,7 +3555,7 @@ static void run_bytecode_file(const char *label, const char *src) {
 }
 #endif /* !ZINCTEST */
 
-#ifndef ZINCTEST
+#if !defined(ZINCTEST) && !defined(SHELL)
 int main(int argc, char **argv) {
     volatile char stack_top_marker;
     gc_set_stack_top(((uintptr_t)&stack_top_marker + GC_PAGEBYTES - 1) & ~(GC_PAGEBYTES - 1));

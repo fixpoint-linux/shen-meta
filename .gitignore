@@ -1,4 +1,6 @@
 *.kl
+# ...except the shensh shell source (committed; it is NOT OS kernel .kl)
+!shell/*.kl
 *.o
 zincvm
 zincdec

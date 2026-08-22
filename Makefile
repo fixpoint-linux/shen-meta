@@ -1,9 +1,9 @@
-.PHONY: all vm test bundle pipeline interp setup clean gate gcdebug gc-verify qbe-gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qberepl qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test gen-symbol-static
+.PHONY: all vm test bundle pipeline interp setup clean gate gcdebug gc-verify qbe-gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qberepl qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test gen-symbol-static shensh
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
 
-all: zincvm zincdec zinctest
+all: zincvm zincdec zinctest shensh
 
 # cosmocc produces a fat APE plus cross-build intermediates (.com.dbg,
 # .aarch64.elf) alongside the output.  Stage those in a temp dir so they never
@@ -56,8 +56,11 @@ zinctest-gc: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.
 zinctest-asan: vm/zinctest.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h vm/symbol_static.c vm/symbol_static.h
 	$(call compile-vm,$@,$(CFLAGS) -O0 -g -fsanitize=undefined -DZINCTEST,vm/zinctest.c vm/zincvm.c vm/gc.c vm/symbol_static.c)
 
+shensh: vm/shensh.c vm/zincvm.c vm/gc.c vm/gc.h vm/zinctypes.h vm/zincvm.h vm/symbol_static.c vm/symbol_static.h
+	$(call compile-vm,$@,$(CFLAGS) -DSHELL,vm/shensh.c vm/zincvm.c vm/gc.c vm/symbol_static.c)
+
 clean:
-	rm -f zincvm zincdec zincvm-asan zinctest zinctest-gc zinctest-asan *.csexp globals.csexp
+	rm -f zincvm zincdec zincvm-asan zinctest zinctest-gc zinctest-asan shensh *.csexp globals.csexp
 
 test: zinctest
 	./zinctest

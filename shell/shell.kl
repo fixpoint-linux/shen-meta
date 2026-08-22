@@ -1,0 +1,7 @@
+;; Minimal shell.kl stub for shensh frontend
+;; Loaded at boot via interp-load-raw (namespace 2).
+;; Phase 3b will replace this with the full shell loop.
+
+(defun sh-prompt () (cn (getcwd 0) "> "))
+
+(defun shell-eval-line (S) S)
