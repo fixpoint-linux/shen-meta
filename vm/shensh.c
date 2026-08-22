@@ -267,6 +267,58 @@ static Value eval_kl_form(Value form) {
     return acc;
 }
 
+/* ---- shen_load_source: run a REAL Shen source file through the bundled
+ *      subset-Shen compiler.  Mirrors serialize-reduced.shen's shen-load:
+ *
+ *      shen-load Path = (shen-eval-forms (shen->kl-forms (shen-read-file Path)))
+ *
+ *   All three stages are BUNDLED closures in namespace 1 (C defun_table),
+ *   reached via call_bundled_1 (NOT eval-kl, which resolves namespace 2 and
+ *   would say 'global not found').  shen-read-file parses .shen source into
+ *   forms; shen->kl-forms compiles each form (define/pattern/guards/cond) to
+ *   KLambda defuns; interp-eval registers each into the interp's namespace-2
+ *   global-table so eval-kl can call them.  This is how the shell runs actual
+ *   Shen source, not just flat KLambda.
+ *
+ *   Returns a symbol result ('loaded' on success, or an error symbol/Value);
+ *   individual form failures are tolerated (each interp-eval is independent). */
+static Value shen_load_source(const char *path) {
+    /* stage 1: read the file into forms */
+    Value p = val_string(path, (long)strlen(path));
+    gc_root_push_value(&p);
+    Value forms = call_bundled_1("read-file-raw", p);
+    gc_root_pop();
+    if (forms.tag != VAL_CONS) {
+        return val_symbol("shen-load: read failed");
+    }
+    gc_root_push_value(&forms);
+
+    /* stage 2: compile Shen source forms -> KLambda defuns */
+    Value kls = call_bundled_1("shen->kl-forms", forms);
+    gc_root_push_value(&kls);
+    if (kls.tag != VAL_CONS && kls.tag != VAL_NIL) {
+        gc_root_pop(); gc_root_pop();
+        return val_symbol("shen-load: compile failed");
+    }
+
+    /* stage 3: register each defun into namespace 2 via interp-eval */
+    Value cur = kls;
+    Value last = val_symbol("loaded");
+    gc_root_push_value(&last);
+    while (cur.tag == VAL_CONS) {
+        Value defun = *cur.cons.car;
+        gc_root_push_value(&defun);
+        last = call_bundled_1("interp-eval", defun);
+        gc_root_pop();
+        cur = *cur.cons.cdr;
+    }
+
+    gc_root_pop();  /* last */
+    gc_root_pop();  /* kls */
+    gc_root_pop();  /* forms */
+    return last;
+}
+
 /* Does the line (after leading whitespace) start with '(' ?  If so it is a
  * KLambda expression and shensh evaluates it through parse-exprs + eval-kl
  * (the meta_repl path, in C) rather than treating it as a shell command. */
@@ -399,6 +451,18 @@ int main(int argc, char **argv) {
            namespace-1 bundled closure, unreachable from interpreted code. */
         if (line_is_klambda(line)) {
             eval_klambda_line(line, (int)strlen(line));
+            free(line);
+            continue;
+        }
+
+        /* `shen-load <path>` builtin (handled in C so it can reach the
+           namespace-1 bundled Shen compiler): load a real .shen source file
+           into namespace 2, exactly like shen-load in serialize-reduced.shen. */
+        if (strncmp(line, "shen-load", 9) == 0 && (line[9] == ' ' || line[9] == '\t')) {
+            const char *p = line + 9;
+            while (*p == ' ' || *p == '\t') p++;
+            Value r = shen_load_source(p);
+            print_shen(r);
             free(line);
             continue;
         }
