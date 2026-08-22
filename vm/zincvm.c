@@ -2621,10 +2621,10 @@ static void meta_repl(void) {
     printf("Type KLambda expressions.  Primitive calls evaluate, e.g.\n");
     printf("  (+ 1 2)  (cons 1 2)  (hd ...)  (tl ...)  (cn \"a\" \"b\")\n");
     printf("  (= x y)  (< x y)     (str X)   (number? X)\n");
-    printf("Structural forms (if/and/or/cond/let/lambda/defun) and calls to\n");
-    printf("non-primitive bundled closures need the metacircular compile\n");
-    printf("pipeline, which is not yet functional in the reduced C-VM bundle\n");
-    printf("(the repo's open 'close the loop' item).\n");
+    printf("Structural forms (if/and/or/cond/let/lambda), list literals, calls\n");
+    printf("to bundled closures (reverse, strlen ...), and KLambda defuns\n");
+    printf("((defun F (X) ...) then (F arg)) all evaluate.\n");
+    printf("Use KLambda syntax: (defun F (X) Body), not Shen (defun F X -> ...).\n");
     printf("Ctrl-D (EOF) to exit.\n\n");
     fflush(stdout);
 
@@ -2679,11 +2679,10 @@ static void meta_repl(void) {
             if (setjmp(cf.buf) == 0) {
                 if (is_defun) {
                     /* register a defun in the Shen global-table via interp-eval.
-                       NOTE: this requires the metacircular compile pipeline
-                       (kl->zinc's non-primitive branch), which is not functional
-                       in the reduced C-VM bundle yet (the "close the loop" open
-                       item).  We report the outcome honestly rather than assume
-                       success. */
+                       Requires KLambda syntax (defun F (X) Body) — the reader
+                       carries the param list and kmacros (normalize.shen)
+                       unwraps/curries it before debruijn.  We report the
+                       outcome honestly rather than assume success. */
                     Value r = call_closure1("interp-eval", expr);
                     result = r;
                 } else {

@@ -95,6 +95,7 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
 | 7b' | read-from-string typed define `{ A --> A }` | Pass (returns [[define id ...]]) — regression test for Bug #1 |
 | 7c | read via string stream | Pass |
 | 8-10 | id, newvar, defun->lambda (bundled via interp-load-raw) | Pass |
+| 10b | lambda-as-value application: `((lambda (X) (+ X 100)) 5)` → 105, multi-param `((lambda (X Y) (- X Y)) 10 3)` → 7, `(let F (lambda (X Y) (+ X Y)) (F 3 4))` → 7 | Pass — regression for the kmacros param-list fix (`fix(interp)` 9bc7300). Raw KLambda `(lambda (X ...) Body)` must be unwrapped/curried by `kmacros` (normalize.shen) before debruijn, else body refs don't resolve and the interp dies with `interp: unknown prim`. Use KLambda syntax `(defun F (X) Body)`, not Shen `(defun F X -> ...)`. |
 
 ## Key files (under `shen/` unless noted):
 - `shen/interp.shen` — meta-circular ZINC VM (loads everything)

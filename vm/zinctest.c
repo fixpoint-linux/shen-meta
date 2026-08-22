@@ -1531,6 +1531,26 @@ int main(int argc, char **argv) {
             printf("--- Test 14b: eval-kl [/ 1 0] — expect identity, no SIGFPE (safe./ div-zero) ---\n");
             run_test("eval-kl-trap-divzero", "(g[5:s]*ev6*P[7:s]eval-kl)", 0);
 
+            /* Test 14c: eval-kl (str BIG) on a >4096-char string — regression
+               for the str_value overflow heap smash (results > ~4090 chars
+               used to SIGSEGV print_shen / the str primitive).  Before the
+               sv_append fix this aborts the whole harness; after it, returns
+               the 10002-char printed form and survives. */
+            {
+                char *big = malloc(10000 + 1);
+                for (int bi = 0; bi < 10000; bi++) big[bi] = 'x';
+                big[10000] = '\0';
+                Value str_sym = val_symbol("str");
+                Value bign = val_string(big, 10000);
+                Value nil = val_nil();
+                Value args = val_cons(bign, nil);          /* (BIG) */
+                Value expr = val_cons(str_sym, args);      /* (str BIG) */
+                defun_set("*evbig*", expr);
+                free(big);
+            }
+            printf("--- Test 14c: eval-kl (str 10000-char) — regression: no heap smash ---\n");
+            run_test("eval-kl-str-big", "(g[7:s]*evbig*P[7:s]eval-kl)", 0);
+
             /* Diagnostic: dump bytecode of toplevel-interp and interp */
             printf("--- Bytecode Dump ---\n");
             {

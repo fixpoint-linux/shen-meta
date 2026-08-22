@@ -22,6 +22,7 @@
 #include <ctype.h>
 #include <setjmp.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include "zincvm.h"   /* Value, ValueArray, val_*, defun_get, vm_exec_env, externs */
 #include "gc.h"       /* gc_root_*, gc_in_oldgen, value_references_nursery, gc_dirty_vectors_add */
 
@@ -47,58 +48,73 @@ static void wasm_va_push(ValueArray *a, Value v) {
 
 /* ---- faithful copy of str_value() (static in zincvm.c, line 878) -------
  * Renders a Value the way the meta REPL prints results. */
+/* Bounds-safe append for wasm_str_value: clamp pos exactly like zincvm.c's
+   sv_append.  snprintf returns the would-be length; unclamped, pos runs past
+   bufsize once the buffer fills and the next buf+*pos write is OOB with a
+   negative->huge size. */
+static void wasm_sv_append(char *buf, int *pos, int bufsize, const char *fmt, ...) {
+    if (bufsize <= 0 || *pos >= bufsize - 1) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *pos, bufsize - *pos, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    int room = bufsize - 1 - *pos;
+    *pos += (n > room) ? room : n;
+}
+
 static void wasm_str_value(Value v, char *buf, int *pos, int bufsize, int depth) {
-    if (depth > 100) { *pos += snprintf(buf + *pos, bufsize - *pos, "..."); return; }
+    if (depth > 100) { wasm_sv_append(buf, pos, bufsize, "..."); return; }
     switch (v.tag) {
         case VAL_SYMBOL:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "%s", v.sym.name);
+            wasm_sv_append(buf, pos, bufsize, "%s", v.sym.name);
             break;
         case VAL_STRING:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "\"%.*s\"", v.str.len, v.str.data);
+            wasm_sv_append(buf, pos, bufsize, "\"%.*s\"", v.str.len, v.str.data);
             break;
         case VAL_NUMBER:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "%ld", v.number);
+            wasm_sv_append(buf, pos, bufsize, "%ld", v.number);
             break;
         case VAL_BOOLEAN:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "%s", v.boolean ? "true" : "false");
+            wasm_sv_append(buf, pos, bufsize, "%s", v.boolean ? "true" : "false");
             break;
         case VAL_NIL:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "[]");
+            wasm_sv_append(buf, pos, bufsize, "[]");
             break;
         case VAL_CONS: {
             Value *cur = &v;
             int first = 1;
-            *pos += snprintf(buf + *pos, bufsize - *pos, "[");
+            wasm_sv_append(buf, pos, bufsize, "[");
             while (cur->tag == VAL_CONS && *pos < bufsize - 1) {
-                if (!first) *pos += snprintf(buf + *pos, bufsize - *pos, " ");
+                if (!first) wasm_sv_append(buf, pos, bufsize, " ");
                 first = 0;
                 wasm_str_value(*cur->cons.car, buf, pos, bufsize, depth + 1);
                 cur = cur->cons.cdr;
             }
             if (cur->tag != VAL_NIL && *pos < bufsize - 1) {
-                *pos += snprintf(buf + *pos, bufsize - *pos, " . ");
+                wasm_sv_append(buf, pos, bufsize, " . ");
                 wasm_str_value(*cur, buf, pos, bufsize, depth + 1);
             }
-            *pos += snprintf(buf + *pos, bufsize - *pos, "]");
+            wasm_sv_append(buf, pos, bufsize, "]");
             break;
         }
         case VAL_ERROR:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<error %s>", v.error.message);
+            wasm_sv_append(buf, pos, bufsize, "<error %s>", v.error.message);
             break;
         case VAL_LAMBDA:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<lambda>");
+            wasm_sv_append(buf, pos, bufsize, "<lambda>");
             break;
         case VAL_PRIM:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<prim %s>", v.prim.name);
+            wasm_sv_append(buf, pos, bufsize, "<prim %s>", v.prim.name);
             break;
         case VAL_VECTOR:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<vector %d>", v.vector.len);
+            wasm_sv_append(buf, pos, bufsize, "<vector %d>", v.vector.len);
             break;
         case VAL_STREAM:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<stream>");
+            wasm_sv_append(buf, pos, bufsize, "<stream>");
             break;
         default:
-            *pos += snprintf(buf + *pos, bufsize - *pos, "<unknown>");
+            wasm_sv_append(buf, pos, bufsize, "<unknown>");
             break;
     }
 }
