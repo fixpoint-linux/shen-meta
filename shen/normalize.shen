@@ -9,6 +9,17 @@
 (define kmacros { klambda --> klambda }
   [freeze X]                                   -> [lambda (newvar) (kmacros X)]
   [thaw X]                                     -> [(kmacros X) 0]
+  \* Lambda param lists: unwrap single / curry multiple.  Raw KLambda from the
+     reader carries (lambda (X ...) Body) with a param LIST; the compiler core
+     (debruijn/zinc) expects the single-binding form (lambda X Body).  Without
+     these rules the generic [X | Y] rule macro-expands INSIDE the param list
+     ([X] -> [X 0] pollution) and debruijn then scopes the whole param list as
+     ONE element, so body references never resolve and the interp dies with
+     "interp: unknown prim" on the first primitive in the body.  Must precede
+     the generic [X | Y] rule. *\
+  [lambda [X] Y]                                -> [lambda X (kmacros Y)]
+  [lambda [X | Ps] Y]                           -> [lambda X (kmacros [lambda Ps Y])]
+  [lambda [] Y]                                 -> [lambda (newvar) (kmacros Y)]
   [and]                                        -> true
   [and X]                                      -> (kmacros X)
   [and X Y | Z]                                -> (kmacros [if (kmacros X) (kmacros [and Y | Z]) false])
