@@ -10,11 +10,17 @@ all: zincvm zincdec zinctest
 # land in the repo; only the native x86_64 ELF (.com.dbg) is copied out as the
 # final binary.  Leaves the working dir unpolluted by build products.
 
-# $1 = final binary path (zincvm / zincdec / zinctest ...), $2 = extra CFLAGS
+# cosmocc builds a fat APE (we copy out the native .com.dbg ELF); a stock
+# system C compiler (used on CI runners without the cosmocc toolchain) builds
+# a single native ELF directly.  Either produces an equivalent native binary.
 define compile-vm
 	@T=$$(mktemp -d /tmp/$(notdir $(1)).build.XXXXXX) && \
-	cosmocc $(2) -o $$T/out.ape $(3) && \
-	cp $$T/out.ape.com.dbg $(1) && chmod 755 $(1); \
+	if command -v cosmocc >/dev/null 2>&1; then \
+		cosmocc $(2) -o $$T/out.ape $(3) && \
+		cp $$T/out.ape.com.dbg $(1) && chmod 755 $(1); \
+	else \
+		$(CC) $(2) -o $(1) $(3) && chmod 755 $(1); \
+	fi; \
 	st=$$?; rm -rf $$T; exit $$st
 endef
 
