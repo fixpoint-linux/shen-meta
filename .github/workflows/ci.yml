@@ -29,19 +29,18 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgc-dev uuid-dev
+        run: sudo apt-get update && sudo apt-get install -y libgc-dev
 
       - name: Build C VM
         run: make
 
-      - name: Clone shen-scheme
-        run: git clone --depth 1 https://github.com/tizoc/shen-scheme.git shen-scheme
-
-      - name: Build shen-scheme
-        run: make -C shen-scheme
-
-      - name: Bundle
-        run: make bundle SHEN=shen-scheme/_build/bin/shen-scheme
+      # The repo vendors a working shen-scheme binary (Makefile SHEN points at
+      # vendor/shen-scheme/bin/shen-scheme), so the bundle builds directly.
+      # Cloning + building shen-scheme from source would need its release
+      # source tarball (which ships the generated shen-scheme.scm); a bare git
+      # clone omits it, so `make -C shen-scheme` fails. Use the vendored binary.
+      - name: Bundle (vendored shen-scheme)
+        run: make bundle
 
       - name: Test (self-hosting)
         run: timeout 120 make run-bundle
