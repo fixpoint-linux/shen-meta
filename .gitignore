@@ -35,3 +35,8 @@ tools/bundle-verify/__pycache__/
 # scratch / build artifacts
 zinctest-osload*
 .exec_test/
+# fixpoint docs site build artifacts (shen-meta MFE site)
+node_modules/
+elm-stuff/
+dist/
+vendor/@mfe/

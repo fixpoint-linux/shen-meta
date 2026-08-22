@@ -1,0 +1,34 @@
+{
+    "name": "shen-meta",
+    "version": "1.0.0",
+    "description": "shen-meta — self-hosted Shen: evaluates itself, compiles itself to native bytecode, and runs on a custom C VM with a moving generational GC. Docs site built on the Fixpoint design stack with a browser WebAssembly playground.",
+    "main": "index.js",
+    "directories": {
+        "doc": "dist",
+        "test": "tests"
+    },
+    "scripts": {
+        "build": "./vendor/dhake/dhake.com dist/index.html"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/fixpoint-linux/shen-meta.git"
+    },
+    "keywords": [],
+    "bugs": {
+        "url": "https://github.com/fixpoint-linux/shen-meta/issues"
+    },
+    "homepage": "https://github.com/fixpoint-linux/shen-meta#readme",
+    "devDependencies": {
+        "elm": "^0.19.2-0",
+        "elm-format": "^0.8.8",
+        "happy-dom": "^20.11.6"
+    },
+    "allowScripts": {
+        "elm@0.19.2-0": true,
+        "elm-format@0.8.8": true
+    },
+    "dependencies": {
+        "@xterm/xterm": "^6.0.0"
+    }
+}

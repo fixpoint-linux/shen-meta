@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shen-meta — self-hosted Shen on a native C VM</title>
+<meta name="description" content="shen-meta: self-hosted Shen — evaluates itself, compiles itself to native bytecode, and runs on a custom C VM with a moving generational GC.">
+<script type="importmap">
+{
+  "imports": {
+    "@mfe/core": "/vendor/@mfe/core/index.js",
+    "@mfe/framework": "/vendor/@mfe/framework/index.js",
+    "shen-landing": "/shen/shell/mfe/shen-page.js",
+    "shen-architecture": "/shen/shell/mfe/shen-page.js",
+    "shen-build": "/shen/shell/mfe/shen-page.js",
+    "shen-primitives": "/shen/shell/mfe/shen-page.js",
+    "shen-playground": "/shen/shell/mfe/shen-page.js",
+    "fixpoint-landing": "/shell/mfe/fixpoint-landing.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app" ssr>
+  <div class="fixpoint-root">
+    <div data-mfe="shen-landing"></div>
+  </div>
+</div>
+<script type="module" src="/shen/shell/shell.js"></script>
+</body>
+</html>
