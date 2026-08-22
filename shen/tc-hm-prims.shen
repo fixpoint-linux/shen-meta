@@ -89,6 +89,17 @@
    [(intern "read-file-as-string") (tc-mono (tc-build-arrow [[con string]] [con string]))]
    [(intern "open")   (tc-mono (tc-build-arrow [[con string] [con symbol]] [con stream]))]
    [(intern "close")  (tc-mono (tc-build-arrow [[con stream]] [app list [con zinc-value]]))]
+   \* Shell / process prims (C VM exec_primitive; used by shell/shell.shen).
+      exec-command runs an external command and returns a plain list
+      [exit-code stdout-output ...] through eval-kl; shell-pipe runs a
+      pipeline of stage strings and returns the same shape.  getcwd takes a
+      dummy number (C pops & ignores it) and returns the cwd string.
+      setenv/cd are string->...->boolean.  All monomorphic. *\
+   [(intern "exec-command") (tc-mono (tc-build-arrow [[con string]] [app list [con zinc-value]]))]
+   [(intern "shell-pipe")   (tc-mono (tc-build-arrow [[app list [con string]]] [app list [con zinc-value]]))]
+   [(intern "getcwd")       (tc-mono (tc-build-arrow [[con number]] [con string]))]
+   [(intern "setenv")       (tc-mono (tc-build-arrow [[con string] [con string]] [con boolean]))]
+   [(intern "cd")           (tc-mono (tc-build-arrow [[con string]] [con boolean]))]
    \* Predicates *\
    [(intern "function?") (tc-poly1 (tc-build-arrow [[tvar 0]] [con boolean]))]
    [(intern "error?")    (tc-poly1 (tc-build-arrow [[tvar 0]] [con boolean]))]

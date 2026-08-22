@@ -3,7 +3,8 @@
  *
  * This is a SEPARATE binary from zincvm (the plain KL executor that loads
  * Shen OS via --repl). shensh boots the reduced bundle and runs a Shen
- * shell loop defined in shell/shell.kl (loaded via interp-load-raw).
+ * shell loop defined in shell/shell.shen (typed Shen, loaded via
+ * shen_load_source, which type-checks it with the bundled HM checker).
  *
  * It replicates the GC init/bootstrap/vm_load_bundle sequence from
  * zincvm.c main() using ONLY the public/extern API, because zincvm.c's
@@ -170,7 +171,7 @@ static char *read_stdin_line(void) {
 /* ---- eval_form1: build [fn arg] and run exec_primitive("eval-kl") -------
  * Mirrors the convention used in eval-kl: the form is placed on the stack
  * and exec_primitive("eval-kl") resolves it through the metacircular interp
- * (namespace 2: interp-load-raw'd shell defuns are NOT in the C defun_table). */
+ * (namespace 2: shen_load_source'd shell defuns are NOT in the C defun_table). */
 static Value eval_form1(const char *fn, Value arg) {
     Value f = val_symbol(fn);
     Value form = val_cons(f, val_cons(arg, val_nil()));
@@ -325,9 +326,12 @@ static Value eval_kl_form(Value form) {
  *
  *   Returns a symbol result ('loaded' on success, or an error symbol/Value);
  *   individual form failures are tolerated (each interp-eval is independent). */
-static Value shen_load_source(const char *path) {
+static Value shen_load_source_ex(const char *path, int verbose) {
     /* stage 0: type-check the whole file (type-check by default).  tc-hm-file
-       re-reads via shen-read-file internally; we just call it with the path. */
+       re-reads via shen-read-file internally; we just call it with the path.
+       When verbose is set (the `shen-load` shell command) each define's
+       [ok Name]/[fail Reason] is printed; when clear (boot) the check runs
+       silently and only the final fail reason is returned on error. */
     Value p = val_string(path, (long)strlen(path));
     gc_root_push_value(&p);
     Value tcs = call_bundled_1("tc-hm-file", p);
@@ -348,7 +352,7 @@ static Value shen_load_source(const char *path) {
                     fail_res = *(*res.cons.cdr).cons.car;
                 }
             }
-            print_shen(res);
+            if (verbose) print_shen(res);
             if (is_fail) any_fail = 1;
             r = *r.cons.cdr;
         }
@@ -384,7 +388,14 @@ static Value shen_load_source(const char *path) {
         return val_symbol("shen-load: compile failed");
     }
 
-    /* stage 3: register each defun into namespace 2 via interp-eval */
+    /* stage 3: register each defun into namespace 2 via interp-eval.
+       interp-eval returns the defun's Name symbol on success, the form
+       unchanged (e.g. shen.skip from a (tc -) line) for non-defun forms, or
+       throws (caught by call_bundled_1 -> VAL_ERROR) if a defun fails to
+       compile.  Individual form failures are tolerated (the loop continues),
+       mirroring shen-eval-forms.  We return symbol 'loaded' when the final
+       form did not error (success), or the error value if it did -- so the
+       boot check can distinguish a clean load from a compile failure. */
     Value cur = kls;
     Value last = val_symbol("loaded");
     gc_root_push_value(&last);
@@ -396,10 +407,17 @@ static Value shen_load_source(const char *path) {
         cur = *cur.cons.cdr;
     }
 
+    Value ret = (last.tag == VAL_ERROR) ? last : val_symbol("loaded");
     gc_root_pop();  /* last */
     gc_root_pop();  /* kls */
     gc_root_pop();  /* forms */
-    return last;
+    return ret;
+}
+
+/* Default verbose wrapper for the `shen-load` shell command: prints each
+   define's type-check result.  Boot uses shen_load_source_ex(.., 0). */
+static Value shen_load_source(const char *path) {
+    return shen_load_source_ex(path, 1);
 }
 
 /* Does the line (after leading whitespace) start with '(' ?  If so it is a
@@ -491,13 +509,18 @@ int main(int argc, char **argv) {
     }
     free(src);
 
-    /* Boot the shell source via the bundled interp-load-raw closure (C
-       namespace 1 — reached directly, not through eval-kl).  This registers
-       the shell defuns (sh-prompt, shell-eval-line, ...) into the Shen
-       global-table (namespace 2), where the per-line eval-kl CAN find them. */
-    Value boot = call_bundled_1("interp-load-raw", val_string("shell/shell.kl", (long)strlen("shell/shell.kl")));
+    /* Boot the shell source via shen_load_source: read shell/shell.shen,
+       type-check it through the bundled HM checker (tc-hm-file), then compile
+       each define through shen->kl-forms and register it into the interp's
+       namespace-2 global-table via interp-eval — where eval_form1 / eval-kl
+       reach.  shell.shen is the typed Shen port of the former flat-KLambda
+       shell/shell.kl; shen_load_source type-checks by default and returns
+       symbol 'loaded' on success, or a fail-reason symbol if a define fails
+       the HM check (the shell then refuses to load the ill-typed defun).  We
+       warn and continue so KLambda lines and shen-load still work. */
+    Value boot = shen_load_source_ex("shell/shell.shen", 0);
     if (boot.tag != VAL_SYMBOL || strcmp(boot.sym.name, "loaded") != 0) {
-        fprintf(stderr, "shensh: warning: failed to load shell/shell.kl (got ");
+        fprintf(stderr, "shensh: warning: failed to load shell/shell.shen (got ");
         print_shen(boot);
         fprintf(stderr, ") — continuing without shell\n");
     }
@@ -567,7 +590,7 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        /* Otherwise: a shell command line, handled by shell.kl. */
+        /* Otherwise: a shell command line, handled by shell.shen. */
         Value result = eval_form1("shell-eval-line", val_string(line, (long)strlen(line)));
         free(line);
 
