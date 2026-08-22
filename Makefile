@@ -138,7 +138,7 @@ run-bundle: zinctest globals.csexp
 # files (existing 58-OK baseline).  tc-hm-self rebuilds the bundle (so the
 # run-tc-hm-self driver lands in globals.csexp) and runs the checker on its
 # own 7 tc-hm*.shen source files.  tc-hm-tests rebuilds the bundle and runs
-# the ~68 synthetic unit tests (opt-in, not gating).
+# the ~77 synthetic unit tests (opt-in, not gating).
 tc-hm: zincvm globals.csexp
 	./zincvm globals.csexp --tc-hm
 

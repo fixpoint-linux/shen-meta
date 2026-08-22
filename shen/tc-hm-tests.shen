@@ -13,6 +13,8 @@
 (load "shen/tc-hm-prims.shen")
 (load "shen/tc-hm-patterns.shen")
 (load "shen/tc-hm-sig.shen")
+\* Stage 6 tests exercise tc-hm-define / tc-hm-infer-define (define level) *\
+(load "shen/tc-hm.shen")
 
 \* ===== Test infrastructure ===== *\
 
@@ -489,6 +491,112 @@
            (tc-assert-ok "infer: 1-arg call to unknown should succeed" R))))
 
 \* ================================================================
+   STAGE 6 TESTS — define-level checking: higher-order return sigs
+   (arity-from-clause fix) and top-level inference of sig-less defines.
+   NB: tests run in ORDER inside tc-hm-tests-run-all; the cross-use and
+   scheme-stored tests depend on earlier inference tests having run
+   (inference registers schemes into tc-global-sig-table as a side effect).
+   ================================================================ *\
+\* GOAL A — higher-order return sigs (arity from the clause, not the sig) *\
+
+(define test-define-1-ho-ret-sig
+  { --> (list symbol) }
+  -> (tc-assert-ok "define: {number --> (number --> number)} X -> (lambda Y (+ X Y))"
+       (tc-hm-define (intern "tst-adder")
+         (tc-parse-sig [(intern "{") number --> number --> number (intern "}")])
+         [(intern "X") (intern "->")
+          [lambda (intern "Y") [(intern "+") (intern "X") (intern "Y")]]])))
+
+(define test-define-2-ho-ret-body-mismatch
+  { --> (list symbol) }
+  -> (tc-assert-fail "define: ho return sig rejects non-function body"
+       (tc-hm-define (intern "tst-adder-bad")
+         (tc-parse-sig [(intern "{") number --> number --> number (intern "}")])
+         [(intern "X") (intern "->") [(intern "+") (intern "X") 1]])))
+
+(define test-define-3-arity-exceeds-sig
+  { --> (list symbol) }
+  -> (tc-assert-fail "define: clause arity exceeding sig arrows fails cleanly"
+       (tc-hm-define (intern "tst-arity")
+         (tc-parse-sig [(intern "{") number --> number (intern "}")])
+         [(intern "X") (intern "Y") (intern "->") (intern "X")])))
+
+(define test-define-4-nested-app-ret
+  { --> (list symbol) }
+  -> (tc-assert-ok "define: {A --> (list A)} nested non-arrow ret still checks"
+       (tc-hm-define (intern "tst-wrap")
+         (tc-parse-sig [(intern "{") A --> [list A] (intern "}")])
+         [(intern "X") (intern "->") [cons (intern "X") []]])))
+
+\* GOAL B — top-level inference for sig-less defines *\
+
+(define test-infer-1-id-infers
+  { --> (list symbol) }
+  -> (tc-assert-ok "infer: sigless X -> X infers"
+       (tc-hm-infer-define (intern "tst-id")
+                           [(intern "X") (intern "->") (intern "X")])))
+
+(define test-infer-2-id-scheme-stored
+  { --> (list symbol) }
+  -> (let Pair (tc-assoc (intern "tst-id") (%% value tc-global-sig-table))
+       (tc-assert-equal "infer: X -> X stored as polymorphic forall scheme"
+         forall (tc-type-tag (hd (tl Pair))))))
+
+(define test-infer-3-num-body
+  { --> (list symbol) }
+  -> (tc-assert-ok "infer: X -> (+ X 1) infers number->number"
+       (tc-hm-infer-define (intern "tst-inc")
+         [(intern "X") (intern "->") [(intern "+") (intern "X") 1]])))
+
+(define test-infer-4-bad-body-fails
+  { --> (list symbol) }
+  -> (tc-assert-fail "infer: ill-typed sigless body fails"
+       (tc-hm-infer-define (intern "tst-bad")
+         [(intern "X") (intern "->") [(intern "+") (intern "X") "s"]])))
+
+(define test-infer-5-recursive-fact
+  { --> (list symbol) }
+  -> (tc-assert-ok "infer: recursive sigless factorial infers"
+       (tc-hm-infer-define (intern "tst-fact")
+         [(intern "N") (intern "->")
+          [if [(intern "=") (intern "N") 0] 1
+              [(intern "*") (intern "N")
+               [(intern "tst-fact") [(intern "-") (intern "N") 1]]]]])))
+
+(define test-infer-6-fact-mono-arrow
+  { --> (list symbol) }
+  -> (let Pair (tc-assoc (intern "tst-fact") (%% value tc-global-sig-table))
+       (tc-assert-equal "infer: fact stored as (mono) arrow, not forall"
+         arrow (tc-type-tag (hd (tl Pair))))))
+
+(define test-infer-7-multi-clause-ok
+  { --> (list symbol) }
+  -> (tc-assert-ok "infer: multi-clause consistent defines infer"
+       (tc-hm-infer-define (intern "tst-self")
+         [(intern "X") (intern "->") (intern "X")
+          0 (intern "->") 0])))
+
+(define test-infer-8-multi-clause-conflict
+  { --> (list symbol) }
+  -> (tc-assert-fail "infer: multi-clause return-type conflict rejected"
+       (tc-hm-infer-define (intern "tst-conf")
+         [(intern "X") (intern "->") [(intern "+") (intern "X") 1]
+          (intern "Y") (intern "->") "boom"])))
+
+(define test-infer-9-arity-mismatch
+  { --> (list symbol) }
+  -> (tc-assert-fail "infer: clauses with different arity rejected"
+       (tc-hm-infer-define (intern "tst-ari")
+         [(intern "X") (intern "->") (intern "X")
+          (intern "X") (intern "Y") (intern "->") (intern "X")])))
+
+(define test-infer-10-cross-use
+  { --> (list symbol) }
+  -> (tc-assert-ok "infer: later define resolves an inferred scheme"
+       (tc-hm-infer-define (intern "tst-use")
+         [(intern "N") (intern "->") [(intern "tst-fact") (intern "N")]])))
+
+\* ================================================================
    TEST RUNNER
    ================================================================ *\
 
@@ -586,6 +694,21 @@
          (test-opaque-rep-8-tc-result)
          (test-prim-lookup-unknown-tvar)
          (test-infer-app-unknown-1arg-tvar)
+         \* Stage 6: define-level checking — higher-order ret sigs + inference *\
+         (test-define-1-ho-ret-sig)
+         (test-define-2-ho-ret-body-mismatch)
+         (test-define-3-arity-exceeds-sig)
+         (test-define-4-nested-app-ret)
+         (test-infer-1-id-infers)
+         (test-infer-2-id-scheme-stored)
+         (test-infer-3-num-body)
+         (test-infer-4-bad-body-fails)
+         (test-infer-5-recursive-fact)
+         (test-infer-6-fact-mono-arrow)
+         (test-infer-7-multi-clause-ok)
+         (test-infer-8-multi-clause-conflict)
+         (test-infer-9-arity-mismatch)
+         (test-infer-10-cross-use)
          \* Report: build the summary string and RETURN it.  print is NOT a C
             primitive in the reduced bundle (print/pr are Shen OS functions the
             reduced bundle skips), so (print ...) miscompiles to [global print]

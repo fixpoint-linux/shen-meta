@@ -58,6 +58,60 @@
   [] -> 0
   [_ | Rest] -> (+ 1 (tc-my-length Rest)))
 
+\* ===== clause-arity: number of patterns in the FIRST clause =====
+   Counts flat rule-list elements before the first -> / <- separator.
+   The define's arity comes from the CLAUSE, not the sig: in Shen
+   { A --> (B --> C) } and { A --> B --> C } are the SAME curried type,
+   and a clause may consume fewer arrows than the sig provides, returning
+   the remaining arrow as a higher-order result:
+     (define adder { number --> (number --> number) } X -> (lambda Y (+ X Y)))
+   Flattening the WHOLE sig (old tc-sig-arg-types) made this look like
+   arity 2 while the clause has 1 pattern -> "malformed clause".
+   Returns 0 when no arrow is found (malformed clause; callers fail). *\
+
+(define tc-clause-arity
+  { (list expr) --> number }
+  Rules -> (tc-clause-arity-h Rules 0))
+
+(define tc-clause-arity-h
+  { (list expr) --> number --> number }
+  [] _ -> 0
+  [H | T] N -> (if (tc-rule-arrow? H) N (tc-clause-arity-h T (+ N 1))))
+
+\* ===== arrow-count: how many curried arrows an instantiated sig has ===== *\
+
+(define tc-arrow-count
+  { type --> number }
+  T -> (if (= (tc-type-tag T) arrow)
+          (+ 1 (tc-arrow-count (tc-arrow-cod T)))
+          0))
+
+\* ===== take-domains: peel EXACTLY N domains off a curried arrow =====
+   (tc-take-domains 1 [arrow A [arrow B C]]) → [[A] [arrow B C]]
+   Unlike tc-flatten-arrow-domains this stops after N peels, so the
+   "return type" may itself be an arrow (higher-order return).
+   Caller MUST first check (<= N (tc-arrow-count T)). *\
+
+(define tc-take-domains
+  { number --> type --> (list (list type) type) }
+  0 T -> [[] T]
+  N T -> (let Inner (tc-take-domains (- N 1) (tc-arrow-cod T))
+           [[(tc-arrow-dom T) | (hd Inner)] | (tl Inner)]))
+
+\* ===== sig-for-arity: instantiate the sig ONCE and peel Arity arrows =====
+   Single instantiation preserves arg/ret tvar sharing ({ A --> A } keeps
+   both ends the SAME tvar).  Returns [ok [[ArgTypes] RetType]] or
+   [fail Reason] when the clause needs more arrows than the sig has. *\
+
+(define tc-hm-sig-for-arity
+  { number --> type --> result }
+  Arity Sig -> (let Inst (tc-instantiate Sig)
+                 (let SigArrows (tc-arrow-count Inst)
+                   (if (> Arity SigArrows)
+                       [fail (cn "clause arity " (cn (str Arity)
+                                                 (cn " exceeds sig arity " (str SigArrows))))]
+                       [ok (tc-take-domains Arity Inst)]))))
+
 \* ===== has-sig?: check if a define form has a type signature =====
    The sig is the element after the define name, surrounded by {...}. *\
 
@@ -99,22 +153,209 @@
    Name: the define name
    Sig: the parsed scheme (type)
    Rules: the flat rule list [Pat1 ... -> Body ...]
+   Arity comes from the CLAUSE's pattern count (tc-clause-arity), not
+   from flattening the sig — a higher-order return sig like
+   { number --> (number --> number) } still has 1-pattern clauses.
    Returns [ok Name] or [fail (cn Name Reason)]. *\
 
 (define tc-hm-define
   { symbol --> type --> (list expr) --> tc-result }
   Name Sig Rules ->
-    (let ArgTypes (tc-sig-arg-types Sig)
-      (let RetType (tc-sig-ret-type Sig)
-        (let Arity (tc-my-length ArgTypes)
-          \* Add self-sig to global table for recursive calls *\
-          (do (%% set tc-global-sig-table [[Name Sig] | (%% value tc-global-sig-table)])
-              \* Also register in tc-prim-table so W's tc-infer-var finds it *\
-              (do (%% set tc-prim-table [[Name Sig] | (%% value tc-prim-table)])
-                  (let Result (tc-hm-clauses Name ArgTypes RetType Arity Rules [])
-                    \* Clean up: remove self from tables *\
-                    (do (%% set tc-prim-table (tl (%% value tc-prim-table)))
-                        Result))))))))
+    (let Arity (tc-clause-arity Rules)
+      (if (tc-clause-malformed? Rules Arity)
+          [fail (cn (str Name) ": malformed clause (no -> or <- found)")]
+          (let R (tc-hm-sig-for-arity Arity Sig)
+            (if (tc-ok? R)
+                (let Peeled (tc-ok-subst R)
+                  (tc-hm-define-h Name Sig Rules Arity
+                                  (hd Peeled) (hd (tl Peeled))))
+                [fail (cn (str Name) (cn ": " (tc-fail-reason R)))])))))
+
+\* tc-clause-malformed?: a clause is malformed iff it has NO arrow at all.
+   tc-clause-arity returns 0 both for a valid nullary clause (the arrow is
+   the FIRST element, arity 0) and for a clause with no arrow anywhere.
+   Distinguish by checking whether the first element is an arrow: a nullary
+   clause [-> Body ...] starts with one; a malformed clause does not. *\
+
+(define tc-clause-malformed?
+  { (list expr) --> number --> boolean }
+  Rules Arity -> (if (cons? Rules)
+                     (if (tc-rule-arrow? (hd Rules))
+                         false
+                         (= Arity 0))
+                     true))
+
+\* tc-hm-define-h: register the self-sig, check clauses, clean up.
+   Same registration dance as before the arity fix: sig goes into
+   tc-global-sig-table (kept — cross-define references) and briefly into
+   tc-prim-table (popped after — W's tc-infer-var finds it during this
+   define's own body check). *\
+
+(define tc-hm-define-h
+  { symbol --> type --> (list expr) --> number --> (list type) --> type --> tc-result }
+  Name Sig Rules Arity ArgTypes RetType ->
+    (do (%% set tc-global-sig-table [[Name Sig] | (%% value tc-global-sig-table)])
+        (do (%% set tc-prim-table [[Name Sig] | (%% value tc-prim-table)])
+            (let Result (tc-hm-clauses Name ArgTypes RetType Arity Rules [])
+              (do (%% set tc-prim-table (tl (%% value tc-prim-table)))
+                  Result)))))
+
+\* ===== tc-hm-infer-define: infer a define's type when it has no sig =====
+   Classic monomorphic-letrec HM for top-level definitions:
+   1. Arity N from the FIRST clause's pattern count.
+   2. N SHARED fresh arg tvars a1..aN + fresh ret tvar r;
+      SelfType = a1 --> ... --> aN --> r (monomorphic).
+   3. Pre-register Name -> SelfType into tc-prim-table so recursive
+      self-calls resolve during body checking (standard HM letrec:
+      self-reference is monomorphic; generalization happens once at the
+      end).  Popped after checking, like the sig path.
+   4. Each clause is typed against the SHARED a1..aN with ONE
+      accumulating substitution; each body type unifies with r.  All
+      clauses therefore must agree on a single type.
+   5. FinalType = SelfType under the final substitution; the scheme is
+      tc-generalize [] FinalType (ALL free tvars quantified — top-level,
+      empty ambient env) and is stored into tc-global-sig-table so later
+      defines (this file or later files) resolve it. *\
+
+(define tc-hm-infer-define
+  { symbol --> (list expr) --> tc-result }
+  Name Rules ->
+    (let Arity (tc-clause-arity Rules)
+      (if (tc-clause-malformed? Rules Arity)
+          [fail (cn (str Name) ": malformed clause (no -> or <- found)")]
+          (tc-hm-infer-define-h Name Rules Arity (tc-fresh-tvars Arity)))))
+
+(define tc-hm-infer-define-h
+  { symbol --> (list expr) --> number --> (list type) --> tc-result }
+  Name Rules Arity ArgTvars ->
+    (let RetTvar (tc-fresh-tvar (intern ""))
+      (let SelfType (tc-build-arrow ArgTvars RetTvar)
+        (tc-hm-infer-define-h2 Name Rules SelfType ArgTvars RetTvar))))
+
+(define tc-hm-infer-define-h2
+  { symbol --> (list expr) --> type --> (list type) --> type --> tc-result }
+  Name Rules SelfType ArgTvars RetTvar ->
+    (do (%% set tc-prim-table [[Name SelfType] | (%% value tc-prim-table)])
+        (let R (tc-hm-infer-clauses Name ArgTvars RetTvar Rules [])
+          (do (%% set tc-prim-table (tl (%% value tc-prim-table)))
+              (if (tc-ok? R)
+                  (tc-hm-infer-finish Name SelfType (tc-ok-subst R))
+                  R)))))
+
+\* tc-hm-infer-finish: close the letrec — generalize and store. *\
+
+(define tc-hm-infer-finish
+  { symbol --> type --> subst --> tc-result }
+  Name SelfType FinalSub ->
+    (let FinalType (tc-apply-subst FinalSub SelfType)
+      (let Scheme (tc-generalize [] FinalType)
+        (do (%% set tc-global-sig-table [[Name Scheme] | (%% value tc-global-sig-table)])
+            [ok Name]))))
+
+\* ===== tc-fresh-tvars: a list of N fresh tvars ===== *\
+
+(define tc-fresh-tvars
+  { number --> (list type) }
+  0 -> []
+  N -> [(tc-fresh-tvar (intern "")) | (tc-fresh-tvars (- N 1))])
+
+\* ===== tc-hm-infer-clauses: infer all clauses under shared tvars =====
+   Loops with tc-hm-clause-remainder (same clause skipping as the sig
+   path, incl. where-guards).  Every clause must have the SAME arity as
+   the first (Shen requires this anyway); mismatch fails with a clear
+   reason instead of a downstream "malformed clause". *\
+
+(define tc-hm-infer-clauses
+  { symbol --> (list type) --> type --> (list expr) --> subst --> result }
+  Name ArgTvars RetTvar Rules Sub ->
+    (if (= Rules [])
+        [ok Sub]
+        (let Arity (tc-my-length ArgTvars)
+          (let NextArity (tc-clause-arity Rules)
+            (if (= NextArity Arity)
+                (let R (tc-hm-infer-one-clause Name ArgTvars RetTvar Rules Sub)
+                  (if (tc-ok? R)
+                      (tc-hm-infer-clauses Name ArgTvars RetTvar
+                                           (tc-hm-clause-remainder Rules Arity)
+                                           (tc-ok-subst R))
+                      R))
+                [fail (cn (str Name) (cn ": clause arity mismatch: expected "
+                          (cn (str Arity) (cn " patterns, found "
+                          (str NextArity)))))])))))
+
+\* ===== tc-hm-infer-one-clause: type one clause against shared tvars =====
+   Mirrors tc-hm-one-clause, but (a) patterns type against the shared
+   ArgTvars rather than sig-arg-types, and (b) the accumulated Sub is
+   returned to the caller instead of being discarded. *\
+
+(define tc-hm-infer-one-clause
+  { symbol --> (list type) --> type --> (list expr) --> subst --> result }
+  Name ArgTvars RetTvar Rules Sub ->
+    (let Arity (tc-my-length ArgTvars)
+      (let Pats (tc-kl-take Arity Rules)
+        (let AfterPats (tc-kl-drop Arity Rules)
+          (if (and (cons? AfterPats) (tc-rule-arrow? (hd AfterPats)))
+              (tc-hm-infer-one-clause-2 Name ArgTvars RetTvar Pats
+                                        (hd (tl AfterPats))
+                                        (tl (tl AfterPats))
+                                        Sub)
+              [fail (cn (str Name) ": malformed clause, expected -> or <-")])))))
+
+(define tc-hm-infer-one-clause-2
+  { symbol --> (list type) --> type --> (list expr) --> expr --> (list expr) --> subst --> result }
+  Name ArgTvars RetTvar Pats Body AfterBody Sub ->
+    (let PatResult (tc-type-patterns Pats ArgTvars Sub)
+      (if (tc-ok? PatResult)
+          (let Pair (tc-ok-subst-bindings PatResult)
+            (let Sub2 (hd Pair)
+              (let Binds (hd (tl Pair))
+                (let PatEnv (tc-apply-subst-to-env Sub2 Binds)
+                  (if (and (cons? AfterBody) (= (hd AfterBody) (intern "where")))
+                      (if (cons? (tl AfterBody))
+                          (tc-hm-infer-one-clause-guard Name PatEnv Body
+                                                        (hd (tl AfterBody)) Sub2 RetTvar)
+                          [fail (cn (str Name) ": where with no guard")])
+                      (tc-hm-infer-one-clause-body Name PatEnv Body Sub2 RetTvar))))))
+          [fail (cn (str Name) (cn ": pattern ["
+                    (cn (str Pats) (cn "] typing failed: "
+                    (tc-fail-reason PatResult)))))])))
+
+\* tc-hm-infer-one-clause-body: infer the body, unify with the shared
+   ret tvar, return the extended substitution. *\
+
+(define tc-hm-infer-one-clause-body
+  { symbol --> env --> expr --> subst --> type --> result }
+  Name PatEnv Body Sub RetTvar ->
+    (let R (tc-infer PatEnv Body Sub)
+      (if (tc-ok? R)
+          (let Pair (tc-ok-subst-type R)
+            (let Sub2 (hd Pair)
+              (let BodyType (hd (tl Pair))
+                (let RU (tc-unify BodyType RetTvar Sub2)
+                  (if (tc-ok? RU)
+                      [ok (tc-ok-subst RU)]
+                      [fail (cn (str Name) (cn ": body/ret mismatch: "
+                                (tc-fail-reason RU)))])))))
+          [fail (cn (str Name) (cn ": body infer failed BODY="
+                    (cn (str Body) (cn " REASON=" (tc-fail-reason R)))))])))
+
+\* tc-hm-infer-one-clause-guard: where-guard must be boolean; the body
+   is then typed with the ORIGINAL Sub (mirrors the sig path). *\
+
+(define tc-hm-infer-one-clause-guard
+  { symbol --> env --> expr --> expr --> subst --> type --> result }
+  Name PatEnv Body Guard Sub RetTvar ->
+    (let RG (tc-infer PatEnv Guard Sub)
+      (if (tc-ok? RG)
+          (let PairG (tc-ok-subst-type RG)
+            (let GuardType (hd (tl PairG))
+              (let RU (tc-unify GuardType [con boolean] (hd PairG))
+                (if (tc-ok? RU)
+                    (tc-hm-infer-one-clause-body Name PatEnv Body Sub RetTvar)
+                    [fail (cn (str Name) (cn ": guard not boolean: "
+                              (tc-fail-reason RU)))]))))
+          [fail (cn (str Name) (cn ": guard infer failed: "
+                    (tc-fail-reason RG)))])))
 
 \* ===== tc-hm-clauses: check all clauses of a define ===== *\
 
@@ -311,15 +552,23 @@
                false)
            false))
 
+\* ===== tc-hm-one-form: check ONE define form =====
+   Sig present  → tc-hm-define (sig-anchored check).
+   Sig absent   → tc-hm-infer-define (infer + generalize + store the
+                  scheme).  This replaces the old "no type signature,
+                  skipping" fail: a missing sig now still gets the body
+                  CHECKED (trust boundary for shen-load) instead of
+                  aborting the load. *\
+
 (define tc-hm-one-form
   { expr --> tc-result }
   Form -> (let Name (tc-extract-name Form)
             (let SigForm (tc-extract-sig (tl (tl Form)))
-              (if (cons? SigForm)
-                  (let ParsedSig (tc-parse-sig SigForm)
-                    (let Rules (tc-extract-rules Form)
-                      (tc-hm-define Name ParsedSig Rules)))
-                  [fail (cn (str Name) ": no type signature, skipping")]))))
+              (let Rules (tc-extract-rules Form)
+                (if (cons? SigForm)
+                    (let ParsedSig (tc-parse-sig SigForm)
+                      (tc-hm-define Name ParsedSig Rules))
+                    (tc-hm-infer-define Name Rules))))))
 
 \* ===== tc-hm-all: type-check all Group A files ===== *\
 
