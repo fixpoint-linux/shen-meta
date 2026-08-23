@@ -428,9 +428,9 @@
 
 \* The shen-scheme BOOTSTRAP helper `set-toplevel` and its top-level
    (set-toplevel ...) alias calls moved to shen/set-toplevel.shen.
-   serialize-reduced.shen / serialize-qbe.shen load that file right after
+   serialize-reduced.shen loads that file right after
    interp.shen in the HOST sequence.  The self-hosted reduced bundle never
-   loads it, so `set-toplevel` is absent from globals.csexp / QBE emission. *\
+   loads it, so `set-toplevel` is absent from globals.csexp. *\
 
 
 \* Load eval/load infrastructure into the host for serialization *\

@@ -6,8 +6,8 @@ Reads globals.csexp (the reduced self-contained bundle) and emits two files:
   vm/symbol_static.c   — the static symbol array (indexed by MPH slot) + the
                          displacement table g[] + the hash/lookup functions
 
-DESIGN (closed world): every VAL_SYMBOL carries a canonical char* so that the
-QBE inline `=` fast path (symbol pointer-equality) is sound: a name is one
+DESIGN (closed world): every VAL_SYMBOL carries a canonical char* so that
+symbol pointer-equality is sound: a name is one
 pointer iff pointer-eq == strcmp-eq.  The bundle's symbol literals are a FIXED
 compile-time set ("the subset/meta-interp bundle"), so they live in a STATIC
 table addressed by a MINIMAL PERFECT HASH (N keys -> N slots, O(1)).  Any name
@@ -25,7 +25,7 @@ regeneration from the same bundle is reproducible.
 Regenerate with:  python3 tools/gen-symbol-static.py
 (wired into the Makefile as `gen-symbol-static`; the output is COMMITTED so
 `make zincvm` builds standalone, and is only regenerated when globals.csexp is
-newer — mirroring gen-qbe-subset / gen-prims.)
+newer — mirroring gen-prims.)
 """
 import re, sys, os
 

@@ -7,15 +7,14 @@
    register the bare-name -> safe-wrapper / interpreter aliases that the HOST
    shen-scheme needs while compiling the source files into the bundle.
 
-   This file is loaded ONLY by the host build (serialize-reduced.shen /
-   serialize-qbe.shen, immediately after interp.shen).  The SELF-HOSTED reduced
+   This file is loaded ONLY by the host build (serialize-reduced.shen,
+   immediately after interp.shen).  The SELF-HOSTED reduced
    bundle (shen-load path, runs on the C VM) never loads it: interp-eval skips
    non-defun forms anyway, nothing references [global set-toplevel] at runtime,
    and the reduced bundle's aliases are pre-computed statically (see
    serialize-reduced.shen's safe-alias-pairs block).  Keeping this bootstrap
-   helper OUT of the reduced bundle means it never appears in globals.csexp or
-   the QBE emission, and the QBE backend need not lower the host-only `ps`
-   dynamic-apply it contains.
+   helper OUT of the reduced bundle means it never appears in globals.csexp,
+   and the host-only `ps` dynamic-apply it contains need not be lowered.
    ============================================================================= *\
 
 (tc -)

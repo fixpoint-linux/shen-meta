@@ -161,10 +161,10 @@ The hottest cost centers, in roughly decreasing impact:
 ## Category C — architectural
 
 - **C1. Direct-threaded dispatch** — see A4 (promoted to Category A).
-- **C2. QBE AOT lowering** — documented in `docs/qbe-lowering.md` (design only).
-  Hot closures gain 10–100×, but pursue for the soundness/type-preservation story
-  (its actual purpose), not as a perf hack; the C VM is a stand-in for a generated
-  interpreter. Weeks, high risk.
+- **C2. AOT lowering** — the C VM is a stand-in for a generated
+  interpreter (see the design intent in AGENTS.md); a future static
+  lowering of the proven interpreter is the soundness/type-preservation story,
+  not a perf hack. Weeks, high risk.
 - **C3. Specialized/fused opcodes** — profile-driven (`access2`, `cons-access`,
   etc.). Defer until a benchmark harness exists.
 - **C4. NaN-boxing** — rejected: changes the entire Value model and breaks the

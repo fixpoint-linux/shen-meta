@@ -345,7 +345,7 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
   through `interp-eval`; errors in individual forms are caught and skipped
 - The **reduced** self-contained bundle (`make bundle` → `globals.csexp`) is
   `serialize-reduced.shen` — it walks the deduped `global-table` and serializes
-  all closures (~340 in the reduced build; the QBE build emits 913 `$clo_`).
+  all closures (~340 in the reduced build).
   The full Shen OS is NOT a second bundle: it is loaded from `.kl` at **runtime**
   by the C VM's `--repl` mode (`./zincvm globals.csexp --repl` loads the OS
   kernel `.kl` into the meta-interpreter via `interp-load-raw`, then runs

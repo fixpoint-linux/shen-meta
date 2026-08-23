@@ -39,19 +39,4 @@
   K [[H V] | T] -> [H V] where (= K H)
   K [_ | T] -> (assoc K T))
 
-\* factorial - type-safe recursive arithmetic helper (QBE Tests 1-4). *\
-(define factorial
-  N -> (if (= N 0) 1 (* N (factorial (- N 1)))))
-
-\* qbe-let-test - exercises the letz (OP_LET) lowering: binds a COMPUTED value
-   Y = (+ X 1) used twice (so letz is genuinely emitted, not inlined away) and
-   passes (+ Y Y) to the 2-arg closure qbe-sub2: (qbe-sub2 12 10) = 2.
-   Regression coverage for the Slice-3 review fix (letz must POP the stack,
-   matching the C VM OP_LET and the metacircular interp, so a let-bound value
-   used in a closure-argument position does not inflate the apply arg count). *\
-(define qbe-sub2
-  X Z -> (- X Z))
-(define qbe-let-test
-  X -> (qbe-sub2 (let Y (+ X 1) (+ Y Y)) 10))
-
 (tc +)

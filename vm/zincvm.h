@@ -156,8 +156,8 @@ char *read_file_or_stdin(const char *path);
 
 /* Marshal/demarshal between a C Value and the Shen tagged form used by the
    metacircular extract-kl/kl->zinc/toplevel-interp chain (the eval-kl path).
-   Exposed so a native QBE driver (qberepl.c) can replicate eval-kl against the
-   QBE-compiled closures instead of the C VM interpreter. */
+   Exposed so a native driver can replicate eval-kl against the
+   compiled closures instead of the C VM interpreter. */
 Value marshal_to_tagged(Value v);
 Value demarshal_from_tagged(Value tagged);
 

@@ -85,12 +85,12 @@
    normalize-names are now DIRECT-STYLE (no K : (klambda --> klambda)
    continuation threaded through /. lambdas) — each sub-normalization result
    is bound to a name and threaded directly.  This is SEMANTICALLY-EQUIVALENT
-   to the prior CPS form (verified by the QBE differential + self-hosting):
+   to the prior CPS form (verified by self-hosting):
    both compile to correct, equal code.  Note it is NOT byte-identical for
    nested lets — CPS hoisted inner lets to left-nested form, the direct style
    preserves right-nested source order; both evaluate identically.  The
    benefit: no closure-allocating continuations, so the whole front-end is
-   first-order and the QBE lowerer can compile it statically. *\
+   first-order and can be compiled statically. *\
 (define normalize-term { klambda --> klambda } Exp -> (normalize Exp))
 
 (define flatten-%%app { klambda --> (list klambda) --> klambda }
