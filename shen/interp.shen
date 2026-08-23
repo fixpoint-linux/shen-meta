@@ -373,6 +373,7 @@
   [prim kill | C] [number A] E [[number A1] | S] R           -> (interp C [boolean (kill A A1)] E S R)
   [prim cd | C] [string A] E S R                             -> (interp C [boolean (cd A)] E S R)
   [prim getcwd | C] A E S R                                  -> (interp C [string (getcwd A)] E S R)
+  [prim getpid | C] A E S R                                  -> (interp C [number (getpid A)] E S R)
   [prim getenv | C] [string A] E S R                        -> (interp C [string (getenv A)] E S R)
   [prim setenv | C] [string A] E [[string A1] | S] R         -> (interp C [boolean (setenv A A1)] E S R)
   [prim glob | C] [string A] E S R                           -> (interp C (glob A) E S R)

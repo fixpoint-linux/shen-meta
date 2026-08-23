@@ -18,9 +18,10 @@
    Rejects (via simple-error, caught by the shell's trap-error wrapper):
      backtick, $(, $((, <(, >( => "X not supported"
      bare &                          => "background & not supported in v1"
-     fd-dup N>&M partial             => "bad fd-dup"
-     $0-$9 $# $@ $* $$ $! $-         => "X not supported"
-   $? is supported (stretch: expands to *sh-exit-code* in U4).
+     fd-dup N>& partial (2>&, 2>&x)  => "bad fd-dup"
+   $? $0-$9 $# $@ $* $$ $! $- are lexed as one-char [var Name Q] parts;
+   shexpand.shen gives them their positional-parameter semantics
+   ($? = *sh-exit-code*, $$ = getpid, $! = "" - no background jobs).
    Driver: sp-lex Str => [Tokens PendingDelims]. *\
 
 \* ===== string helpers (local copies of shell.shen sh-*) ===== *\
@@ -158,16 +159,18 @@
                                  [[var Name Q] Np])))
                            (if (= C "?")
                                [[var "?" Q] (+ Pos 1)]
-                               (if (or (sp-digit? C)
-                                       (or (= C "#") (= C "@") (= C "*")
-                                           (= C "!") (= C "-")))
-                                   (simple-error (cn C " not supported"))
-                                   (if (sp-var-start? C)
-                                       (let Np (sp-lex-varname S Pos Len)
-                                         (let Name (hd Np)
-                                           (let Np2 (hd (tl Np))
-                                             [[var Name Q] Np2])))
-                                       [[lit "$"] Pos])))))))
+                               (if (= C "$")
+                                   [[var "$" Q] (+ Pos 1)]
+                                   (if (or (sp-digit? C)
+                                           (or (= C "#") (= C "@") (= C "*")
+                                               (= C "!") (= C "-")))
+                                       [[var C Q] (+ Pos 1)]
+                                       (if (sp-var-start? C)
+                                           (let Np (sp-lex-varname S Pos Len)
+                                             (let Name (hd Np)
+                                               (let Np2 (hd (tl Np))
+                                                 [[var Name Q] Np2])))
+                                           [[lit "$"] Pos]))))))))
 
 \* ===== single-quote: fully literal contents (quotes stripped) ===== *\
 \* find the closing single-quote at/after Start; returns its index or -1. *\
@@ -368,7 +371,9 @@
                                                               (sp-lex-run S (+ P 4) Len
                                                                           (cons [redir dup Fd [[lit (sp-ch S (+ P 3))]]] TokAcc)
                                                                           PDAcc NBS Nl Depth))))
-                                                      (if (and (= C "<") (= (sp-ch S (+ P 1)) "<") (= (sp-ch S (+ P 2)) "<"))
+                                                      (if (sp-fd-dup-prefix? S P Len)
+                                                          (simple-error "bad fd-dup")
+                                                          (if (and (= C "<") (= (sp-ch S (+ P 1)) "<") (= (sp-ch S (+ P 2)) "<"))
                                                           (sp-lex-hstring S P Len TokAcc PDAcc NBS Nl Depth)
                                                           (if (and (= C "<") (= (sp-ch S (+ P 1)) "<") (= (sp-ch S (+ P 2)) "-"))
                                                               (sp-lex-heredoc S (+ P 3) Len TokAcc PDAcc NBS Nl Depth true)
@@ -386,7 +391,7 @@
                                                                                       (sp-lex-redir S (+ P 1) Len gt 1 TokAcc PDAcc NBS Nl Depth)
                                                                                       (if (= C "<")
                                                                                           (sp-lex-redir S (+ P 1) Len lt 0 TokAcc PDAcc NBS Nl Depth)
-                                                                                          (sp-lex-word-token S P Len TokAcc PDAcc NBS Nl Depth)))))))))))))))))))))))))
+                                                                                          (sp-lex-word-token S P Len TokAcc PDAcc NBS Nl Depth))))))))))))))))))))))))))
 
 \* fd-dup at P: char P in {1,2}, P+1 '>', P+2 '&', P+3 in {1,2}. *\
 (define sp-fd-dup?
@@ -404,6 +409,22 @@
   C -> (= (or (or (= C " ") (= C (n->string 9)) (= C (n->string 10)) (= C (n->string 13)))
                 (or (= C "|") (= C ";") (= C "&") (= C "(") (= C ")"))
                 (= C "")) false))
+
+\* fd-dup PREFIX at P: char P in {1,2}, P+1 '>', P+2 '&' - regardless of what
+   follows.  When sp-fd-dup? (the complete N>&M, target in {1,2}) is false
+   but this is true, the input is a MALFORMED fd-dup: truncated (2>& at EOI)
+   or an invalid target (2>&x, 2>&3).  The dispatch checks it BEFORE the
+   plain N> redirect handlers, which would otherwise swallow the 2> and
+   re-lex the stray & as a background operator - producing the misleading
+   'background & not supported in v1' instead of 'bad fd-dup'. *\
+(define sp-fd-dup-prefix?
+  { string --> number --> number --> boolean }
+  S P Len -> (if (>= (+ P 2) Len)
+                 false
+                 (let A (sp-ch S P)
+                   (and (or (= A "1") (= A "2"))
+                        (= (sp-ch S (+ P 1)) ">")
+                        (= (sp-ch S (+ P 2)) "&")))))
 
 (define sp-num
   { string --> number }

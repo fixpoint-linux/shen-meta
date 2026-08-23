@@ -170,6 +170,73 @@ t  "backtick rejected"   'echo `x`'                     'error:.*backtick'
 t  "\$( ) rejected"      'echo $(x)'                    'error:.*command substitution'
 t  "bare & rejected"     'sleep 1 &'                    'error:.*background'
 
+echo "== NEW: fd-dup edges (truncated / invalid N>&) =="
+
+t  "2>& rejected as bad fd-dup"  'echo hi 2>&'          'error:.*bad fd-dup'
+t  "2>&x rejected as bad fd-dup" 'echo hi 2>&x'         'error:.*bad fd-dup'
+tn "2>& is not a background &"   'echo hi 2>&'          'background'
+t  "2>&1 still a valid dup"       'echo hi 2>&1'        '> hi'
+t  "2>&2 still a valid dup"       'echo hi 2>&2'        '> hi'
+
+echo "== NEW: positional parameters (interactive) =="
+
+t  "\$0 is the invocation path"  'echo X$0X'            "X\./shenshX"
+t  "interactive \$# is 0"        'echo N$#N'            'N0N'
+t  "interactive \$1 is empty"    'echo [$1]'            '>\ \[\]$'
+t  "\$\$ is the shell PID (numeric)" 'echo P=$$'        'P=[0-9]+'
+t  "\$- is i when interactive"   'echo F=$-'            'F=i'
+t  "\$! empty (no background jobs)" 'echo B=[$!]'       'B=\[\]'
+
+# cp <name> <cmd> <operands-string> <expect-ERE> [<expect-ERE>...]
+#   -c mode: the cmd string is single-quoted through eval (its own quotes and
+#   $-refs stay literal), the operands string is word-split by bash (first
+#   operand names $0, the rest are $1..$9 — bash convention).  Every expect
+#   pattern must match the combined output.
+cp() {
+    local name="$1" cmd="$2" operands="$3"
+    shift 3
+    local out rc
+    # eval string after first expansion: "$BIN" "$BUNDLE" -c '<cmd verbatim>'
+    # + operands.  \$BIN/\$BUNDLE stay backslashed (expanded BY eval, in double
+    # quotes there); $cmd expands NOW into single quotes so eval re-parses it
+    # as ONE literal word — its $-refs and double quotes survive untouched
+    # for shensh to expand (cmds must not contain single quotes).
+    out="$(eval "\"\$BIN\" \"\$BUNDLE\" -c '$cmd' $operands" 2>&1)"
+    rc=$?
+    out="$out
+(exit $rc)"
+    local ok=1 pat
+    for pat in "$@"; do
+        if ! printf '%s' "$out" | grep -qE -- "$pat"; then
+            ok=0
+            echo "FAIL $name"
+            echo "  cmd:      $cmd $operands"
+            echo "  expected: /$pat/"
+            printf '%s' "$out" | grep -v -E 'Loaded|Perfect' | head -4 | sed 's/^/  /'
+            break
+        fi
+    done
+    if [ "$ok" -eq 1 ]; then
+        pass=$((pass + 1))
+        echo "ok   $name"
+    else
+        fail=$((fail + 1))
+    fi
+}
+
+echo "== NEW: positional parameters (shensh -c) =="
+
+cp "-c \$0 \$1 \$2 \$#"   'echo $0 $1 $2 $#'      'myname aa bb'   'myname aa bb 2'
+cp "-c default \$0 is argv0" 'echo [$0]'         ''              '\./shensh'
+cp "-c quoted \"\$@\" separate fields" 'printf [%s][%s][%s] "$@"' 'nm x y z' '\[x\]\[y\]\[z\]'
+cp "-c quoted \"\$*\" one field"    'printf [%s] "$*"'         'nm x y z'    '\[x y z\]'
+cp "-c unquoted \$* re-splits"      'printf [%s][%s] $*'       'nm x y'      '\[x\]\[y\]'
+cp "-c \$\$ numeric PID"            'echo P=$$'                 'nm'          'P=[0-9]+'
+cp "-c \$- is c"                    'echo F=$-'                 'nm'          'F=c'
+cp "-c \$! empty"                   'echo B=[$!]'               'nm'          'B=\[\]'
+cp "-c false exits 1"               'false'                     'nm'          'exit 1'
+cp "-c not-found exits 127"         'nosuchcmd-zze2e'           'nm'          'exit 127'
+
 echo
 echo "shensh-e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

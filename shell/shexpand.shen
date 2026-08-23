@@ -21,15 +21,139 @@
                 hstr} (gt->out, gtgt->append, lt->in), fd 0 for in/hdoc/
                 hstr and 1|2 for out/append/dup, dup target = NUMBER 1|2.
    $VAR reads getenv ('' when unset); $? reads *sh-exit-code* (stretch,
-   '0' when unbound).  Depends on shlex.shen (sp-* helpers). *\
+   '0' when unbound).  The one-char specials $0-$9 $# $@ $* $$ $! $- are
+   positional parameters (see the block below).  Depends on shlex.shen
+   (sp-* helpers). *\
 
 \* ===== variable values ===== *\
+
+\* ===== positional parameters (v1 semantics) =====
+
+   Boot globals set by shensh.c BEFORE the shell sources load (namespace-1
+   values table, read via `value`):  *sh-argv0* (string, $0), *sh-posargs*
+   (list of strings, $1..$9), *sh-flags* (string, $-).  An unbound global
+   evaluates to its SYMBOL (value does not throw), so discriminate by type
+   and fall back to honest defaults.
+   $0      = how the shell was invoked: argv[0] for the interactive REPL;
+             in -c mode the first operand after the command string, else
+             argv[0] (bash convention).
+   $1..$9  = positional args: interactive REPL has none; shensh -c 'cmd'
+             NAME a b -> $1=a $2=b (only the first 9; ${10} is NOT
+             supported - it lexes but resolves as an ordinary name).
+   $#      = arg count (decimal string).
+   $*      = args joined with single spaces; unquoted $* then field-splits
+             (POSIX join-then-split), quoted "$*" is ONE field.
+   $@      = unquoted: same joined+split value as $* (v1 tractable;
+             diverges from POSIX only when an arg itself contains ws);
+             quoted "$@" = SEPARATE fields, one per arg (see shx-at-fold).
+   $$      = the shell's live PID via the getpid C prim.
+   $!      = "" - v1 has no background jobs; a shell that never
+             backgrounded anything has no last-background PID (matches
+             bash, where $! with no jobs ever run expands empty).
+   $-      = option flags: "i" for the interactive REPL, "c" in -c mode -
+             the only two states shensh actually has (no h/B: there is no
+             hashall toggle and no brace expansion). *\
+(define shx-posargs
+  { --> klambda }
+  -> (let V (trap-error (value *sh-posargs*) (lambda E []))
+       (if (cons? V) V [])))
+
+(define shx-argv0
+  { --> string }
+  -> (let V (trap-error (value *sh-argv0*) (lambda E "shensh"))
+       (if (string? V) V "shensh")))
+
+(define shx-flags
+  { --> string }
+  -> (let V (trap-error (value *sh-flags*) (lambda E ""))
+       (if (string? V) V "")))
+
+\* count of positional args. *\
+(define shx-posargs-count
+  { --> number }
+  -> (shx-count (shx-posargs) 0))
+
+(define shx-count
+  { klambda --> number --> number }
+  L N -> (if (= L []) N (shx-count (tl L) (+ N 1))))
+
+\* $N for N in 1..9 (caller checks); 1-based, "" past the end. *\
+(define shx-posarg
+  { string --> string }
+  N -> (shx-nth (shx-posargs) (- (string->n N) 48)))
+
+(define shx-nth
+  { klambda --> number --> string }
+  L I -> (if (= L [])
+             ""
+             (if (= I 1)
+                 (hd L)
+                 (shx-nth (tl L) (- I 1)))))
+
+\* $@/$* as a scalar: args joined with single spaces. *\
+(define shx-posjoin
+  { --> string }
+  -> (shx-join-sp (shx-posargs) ""))
+
+(define shx-join-sp
+  { klambda --> string --> string }
+  L Acc -> (if (= L [])
+               Acc
+               (if (= Acc "")
+                   (shx-join-sp (tl L) (hd L))
+                   (shx-join-sp (tl L) (cn (cn Acc " ") (hd L))))))
+
+\* fold QUOTED "$@" (POSIX 2.5.2 separate fields): with args A1..An and
+   current state [Cur Open], A1 joins Cur (opening the field), A2..A(n-1)
+   become standalone fields, An stays open as the new Cur.  One arg
+   behaves exactly like a normal quoted variable; ZERO args leave the
+   state untouched (a word that is only an empty "$@" makes no field).
+   -> [Cur Open EmitFields] like shx-uv. *\
+(define shx-at-fold
+  { klambda --> string --> boolean --> klambda }
+  Args Cur Open ->
+    (if (= Args [])
+        [Cur Open []]
+        (shx-at-args Args (cn Cur (hd Args)))))
+
+(define shx-at-args
+  { klambda --> string --> klambda }
+  Args Acc ->
+    (if (= (tl Args) [])
+        [Acc true []]
+        (let More (shx-at-args (tl Args) (hd (tl Args)))
+          (let NewCur (hd More)
+            (let NewOpen (hd (tl More))
+              (let Mids (hd (tl (tl More)))
+                [NewCur NewOpen (cons Acc Mids)]))))))
 
 (define shx-var-value
   { string --> string }
   Name -> (if (= Name "?")
               (shx-exit-code)
-              (getenv Name)))
+              (if (= Name "0")
+                  (shx-argv0)
+                  (if (shx-posnum? Name)
+                      (shx-posarg Name)
+                      (if (= Name "#")
+                          (str (shx-posargs-count))
+                          (if (or (= Name "@") (= Name "*"))
+                              (shx-posjoin)
+                              (if (= Name "$")
+                                  (str (getpid 0))
+                                  (if (= Name "!")
+                                      ""
+                                      (if (= Name "-")
+                                          (shx-flags)
+                                          (getenv Name))))))))))
+
+\* a single-char digit 1-9 (positional parameter index).  Length-checked:
+   ${10} must NOT resolve as $1. *\
+(define shx-posnum?
+  { string --> boolean }
+  C -> (if (= (sp-len C) 1)
+          (let N (string->n C) (and (>= N 49) (<= N 57)))
+          false))
 
 \* $? reads *sh-exit-code* (stretch).  An unbound global evaluates to the
    SYMBOL *sh-exit-code* (value does not throw), so discriminate by type:
@@ -124,15 +248,22 @@
         (let P (hd Parts)
           (if (= (hd P) lit)
               (shx-word-1 (tl Parts) (cn Cur (hd (tl P))) true Fields)
-              (let Val (shx-var-value (hd (tl P)))
-                (if (hd (tl (tl P)))
-                    (shx-word-1 (tl Parts) (cn Cur Val) true Fields)
-                    (let Uv (shx-uv Val Cur Open)
+              (let Name (hd (tl P))
+                (if (and (= Name "@") (hd (tl (tl P))))
+                    (let At (shx-at-fold (shx-posargs) Cur Open)
                       (shx-word-1 (tl Parts)
-                                  (hd Uv)
-                                  (hd (tl Uv))
-                                  (sp-prepend-list (hd (tl (tl Uv)))
-                                                   Fields)))))))))
+                                  (hd At)
+                                  (hd (tl At))
+                                  (sp-prepend-list (hd (tl (tl At))) Fields)))
+                    (let Val (shx-var-value Name)
+                      (if (hd (tl (tl P)))
+                          (shx-word-1 (tl Parts) (cn Cur Val) true Fields)
+                          (let Uv (shx-uv Val Cur Open)
+                            (shx-word-1 (tl Parts)
+                                        (hd Uv)
+                                        (hd (tl Uv))
+                                        (sp-prepend-list (hd (tl (tl Uv)))
+                                                         Fields)))))))))))
 
 \* ===== redirect target expansion ===== *\
 

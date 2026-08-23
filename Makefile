@@ -95,8 +95,10 @@ gate: test test-asan
 # shensh-test: end-to-end tests for the shensh shell — feeds shell command
 # lines through the real REPL (stdin pipe) and checks quoting, field
 # splitting, redirections (incl. the 2>&1 >file ordering), pipelines,
-# chains, subshell cd isolation, the heredoc sh-continue protocol, and the
-# v1 rejects.  See tools/shensh-e2e.sh.  Needs globals.csexp (built on
+# chains, subshell cd isolation, the heredoc sh-continue protocol, the
+# v1 rejects, fd-dup edges (2>& / 2>&x -> bad fd-dup), and positional
+# parameters ($0 $1..$9 $# $@ $* $$ $! $-; interactive + shensh -c).
+# See tools/shensh-e2e.sh.  Needs globals.csexp (built on
 # demand via bundle).
 shensh-test: shensh
 	@if [ ! -f globals.csexp ]; then $(MAKE) bundle; fi

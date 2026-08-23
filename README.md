@@ -47,11 +47,11 @@ git clone --recurse-submodules https://github.com/jmars/shen-meta.git
 cd shen-meta
 make setup    # clone shen-scheme if not already present
 make          # build C VM + decompiler (uses cosmocc, Cosmopolitan)
-make test     # run 34 built-in bytecode tests
+make test     # run 48 built-in bytecode tests
 make pipeline # compile (+ 1 2) through full pipeline
 make bundle   # compile bundle .shen via shen->kl → globals.csexp
 make run-bundle  # run C VM with self-hosting bundle
-make shensh-test # run the 36-case shensh end-to-end shell tests
+make shensh-test # run the 57-case shensh end-to-end shell tests
 make shpar-verify # gate: zero execl(/bin/sh) sites in the VM sources
 make gate     # test + test-asan
 ```
@@ -82,9 +82,13 @@ false || echo "exit $? is tracked"
 exit
 ```
 
-Backticks, `$( )`, and bare `&` are rejected with clean `error:` messages
-(the parser never leaves Shen — no host shell is consulted). Run
-`make shensh-test` for the full 36-case end-to-end suite.
+Positional parameters work: `./shensh globals.csexp -c 'echo $0 $1 $2 $#'
+myname aa bb` prints `myname aa bb 2` (first `-c` operand names `$0`, bash
+convention); `"$@"` keeps separate fields, `"$*"` joins; `$$` is the live
+PID, `$!` is empty (no background jobs in v1), `$-` is `i`/`c`. Backticks,
+`$( )`, and bare `&` are rejected with clean `error:` messages (the parser
+never leaves Shen — no host shell is consulted). Run `make shensh-test` for
+the full 57-case end-to-end suite.
 
 Requires [shen-scheme](https://github.com/tizoc/shen-scheme) (Shen 41.2 on Chez Scheme) at `vendor/shen-scheme/` (used to bootstrap the serializer; the shipped bundle is compiled by our own `shen->kl`).
 
@@ -208,7 +212,7 @@ The reduced bundle contains zero Shen OS `.kl` closures. Every bytecode closure 
 - [x] Per-closure instruction tracing (`--trace`)
 - [x] String stream support in `open` primitive
 - [x] **Own `shen->kl` compiler** — reduced bundle has no Shen OS `.kl` code
-- [x] **shensh shell** — POSIX-style shell with Shen lexer/parser/expander + native exec-plan runner; `/bin/sh` fully removed (`make shpar-verify`, 36-case e2e suite)
+- [x] **shensh shell** — POSIX-style shell with Shen lexer/parser/expander + native exec-plan runner; `/bin/sh` fully removed (`make shpar-verify`, 57-case e2e suite)
 - [ ] REPL with interactive terminal I/O
 - [ ] `shen.initialise` non-idempotency fix
 

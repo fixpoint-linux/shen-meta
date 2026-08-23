@@ -2197,6 +2197,16 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
                 *acc = val_string("", 0);
             return 0;
         }
+        /* getpid: return the process id (raw number; interp rule wraps
+           [number ...]).  Called as (getpid 0) with a dummy arg — nullary
+           prim calls cannot compile (a single-element symbol list is a
+           literal), the getcwd convention.  Arity 0 — pop spurious arg if
+           present (newvar/getcwd precedent).  Used by $$ shell expansion. */
+        if (strcmp(name, "getpid") == 0) {
+            if (stack->len > 0) va_pop(stack);
+            *acc = val_number((long)getpid());
+            return 0;
+        }
         /* getenv: return value or "" (raw string; interp rule wraps [string ...]). */
         if (strcmp(name, "getenv") == 0) {
             Value name_v = va_pop(stack);
@@ -3634,7 +3644,14 @@ static void meta_repl(void) {
             free(line); continue;
         }
         Value exprs = *parsed.cons.car;  /* hd of [[Expr|Rest] FinalPos] */
-        Value cur = exprs;
+        /* cur must stay rooted across each form's eval: eval-kl / interp-eval
+           allocate, and the exprs spine cells are only reachable through
+           `parsed`'s root, popped above — a collection mid-loop leaves cur
+           stale and the next form compiles from garbage (same fix as
+           shensh.c's eval_klambda_line).  volatile: cur is live across the
+           setjmp inside the loop. */
+        volatile Value cur = exprs;
+        gc_root_push_value_volatile(&cur);
         while (cur.tag == VAL_CONS) {
             Value expr = *cur.cons.car;
             volatile int is_defun = is_defun_form(expr);
@@ -3688,6 +3705,7 @@ static void meta_repl(void) {
             gc_root_pop();  /* S3: result */
             cur = *cur.cons.cdr;
         }
+        gc_root_pop();  /* cur */
         free(line);
     }
     printf("\nBye.\n");

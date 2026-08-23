@@ -115,6 +115,7 @@ PRIM("wait",1)           /* Pid -> exit status                         */
 PRIM("kill",2)           /* Pid Sig -> true                            */
 PRIM("cd",1)             /* Path -> true/false                         */
 PRIM("getcwd",0)         /* -> cwd string (mirror newvar arity-0 pops)  */
+PRIM("getpid",0)         /* -> shell PID number ($$; dummy-arg call like getcwd) */
 PRIM("getenv",1)         /* Name -> value or ""                        */
 PRIM("setenv",2)         /* Name Val -> true                           */
 PRIM("glob",1)           /* Pattern -> sorted list of path strings     */

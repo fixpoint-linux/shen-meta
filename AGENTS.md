@@ -11,7 +11,7 @@ make pipeline # compile (+ 1 2) through full pipeline
 make bundle   # serialize all safe wrappers → globals.csexp
 make run-bundle  # run zinctest with globals.csexp (self-hosting + GC stress tests)
                 # ./zinctest globals.csexp  is equivalent
-make shensh-test # build+run the shensh end-to-end shell tests (36 cases)
+make shensh-test # build+run the shensh end-to-end shell tests (57 cases)
 make shpar-verify # grep gate: zero execl(/bin/sh) sites in vm/zincvm.c vm/shensh.c
 
 # Trace execution of specific closures:
@@ -100,11 +100,36 @@ The `shensh.c` REPL then prints a `> ` continuation prompt, accumulates
 line until the delimiter closes. EOF while pending prints
 `heredoc: unexpected EOF` and resets the buffer. Parsing never leaves Shen.
 
+### Positional parameters (v1 semantics)
+
+`$0` `$1`..`$9` `$#` `$@` `$*` `$$` `$!` `$-` are supported (lexed as
+one-char var parts in `shlex.shen`, expanded in `shexpand.shen`'s
+`shx-var-value` dispatch). `shensh.c` sets `*sh-argv0*`, `*sh-posargs*`,
+`*sh-flags*`, `*sh-pid*` in the C values table at boot (via `eval_kl_form`
+on `(set ...)` forms, so they land TAGGED — see the note below) and
+`shexpand.shen` reads them via `value`, falling back to honest defaults
+when unbound:
+
+- `$0` = how the shell was invoked: argv[0] for the interactive REPL; for
+  `shensh -c 'cmd' operands...` the first operand names `$0` (bash `-c`
+  convention), falling back to argv[0].
+- `$1`..`$9` = positional args: none in the interactive REPL; the operands
+  after the `-c` name operand. `${9}x` disambiguates from `$9x`.
+- `$#` = decimal count of positional args.
+- `$@`/`$*` = the positional args: `"$@"` produces separate quoted fields,
+  `"$*"` one joined field; unquoted both join with spaces and re-split.
+- `$$` = the shell's live PID (C `getpid` prim, 5-registry registered).
+- `$!` = empty string (v1 has no background jobs — honest, not an error).
+- `$-` = `"i"` in the interactive REPL, `"c"` under `-c`.
+
 ### Known syntax rejections (clean `error:` messages)
 
-Backtick, `$( )`, bare `&`, field splitting inside redirect targets, and
-`$0`/positional parameters are rejected by the lexer/expander as
-`error: ... not supported` — caught by `shell-eval-line`'s trap-error.
+Backtick, `$( )`, bare `&`, and field splitting inside redirect targets are
+rejected by the lexer/expander as `error: ... not supported` — caught by
+`shell-eval-line`'s trap-error. A truncated (`2>&`) or invalid-target
+(`2>&x`) fd-dup is rejected as `error: bad fd-dup ...` (detected by the
+`N>&` prefix BEFORE the plain `>` redirect handlers, so it can never be
+mis-reported as "background & not supported").
 
 
 ## Partial application (metacircular interp only)
@@ -354,6 +379,21 @@ whether the closure you're calling is in the C VM table or only the Shen
 `global-table`. A `[global X]` reaching a non-primitive, non-registered name
 returns the symbol `X` — not an error. If you see the symbol coming back as a
 "result", you are reading the wrong namespace.
+
+**Tagged vs raw values in the C values table (`set`/`value` asymmetry).** The
+metacircular interp's `[prim set]` rule (interp.shen) passes the interpreter's
+TAGGED representation (`[string S]`/`[number N]` cons cells) to the C `set`
+primitive, so every REPL/shensh-boot `(set ...)` lands TAGGED in
+`global_table`/values table; `[prim value]` returns it as-is and downstream
+interp rules pattern-match the tagged forms (`[prim string?] [string _]`...).
+But a RAW C `value_set(name, val_string(...))` writes UNTAGGED — a bundled
+closure reading it via `value` then fails its tagged pattern matches and
+silently falls to the catch-all/default arm (symptom: C-boot globals look set
+from the REPL `(value ...)` yet shell closures always take their defaults).
+**Rule: from C, set Shen-visible globals through `eval_kl_form` on a
+`(set ...)` KLambda form** (see `boot_set_kl_string`/`boot_set_kl_posargs` in
+vm/shensh.c), never raw `value_set` — and unwrap both raw and `[number N]`
+forms when reading them back from C (`sh_exit_code_num`).
 
 **How the metacircular interp loads a `.kl` file at runtime** (the OS-load path):
 1. `interp-load-raw Path` (`load.shen:11`) reads the file via `read-file-raw`

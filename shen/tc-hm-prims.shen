@@ -93,9 +93,12 @@
       exec-plan runs a decoded command plan and returns a plain list
       [exit-code stdout stderr] through eval-kl.  getcwd takes a
       dummy number (C pops & ignores it) and returns the cwd string.
-      setenv/cd are string->...->boolean.  All monomorphic. *\
+      getpid mirrors getcwd: dummy number -> the process id (number),
+      used by $$ shell expansion.  setenv/cd are string->...->boolean.
+      All monomorphic. *\
    [(intern "exec-plan")    (tc-mono (tc-build-arrow [[app list [con zinc-value]]] [app list [con zinc-value]]))]
    [(intern "getcwd")       (tc-mono (tc-build-arrow [[con number]] [con string]))]
+   [(intern "getpid")       (tc-mono (tc-build-arrow [[con number]] [con number]))]
    [(intern "setenv")       (tc-mono (tc-build-arrow [[con string] [con string]] [con boolean]))]
    [(intern "cd")           (tc-mono (tc-build-arrow [[con string]] [con boolean]))]
    \* Predicates *\

@@ -318,13 +318,90 @@ static int is_defun_form(Value f) {
     return h.tag == VAL_SYMBOL && strcmp(h.sym.name, "defun") == 0;
 }
 
-/* Evaluate a KLambda form via the eval-kl primitive (namespace 2 resolution). */
+/* Evaluate a KLambda form via the eval-kl primitive (namespace 2 resolution).
+ * The form MUST stay rooted: GC_VALUE_ARRAY(1) below and the whole eval-kl
+ * chain (extract-kl -> kl->zinc -> toplevel-interp) allocate, and an unrooted
+ * form goes stale after any collection.  That was the REPL fragility: some
+ * nested prim-call forms compiled from garbage ("zinc-c: unknown expression"
+ * / "No condition was true") and could SEGV afterwards.  volatile +
+ * shadow-stack root, mirroring eval_form1 / the parsed/result discipline. */
 static Value eval_kl_form(Value form) {
+    volatile Value f = form;
+    gc_root_push_value_volatile(&f);
     ValueArray s; s.data = GC_VALUE_ARRAY(1); s.len = 0; s.cap = 1;
-    va_push(&s, form);
+    va_push(&s, f);
     Value acc; memset(&acc, 0, sizeof(acc));
     exec_primitive("eval-kl", &acc, &s);
+    gc_root_pop();
     return acc;
+}
+
+/* ---- boot globals for the shell positional parameters ----
+ * These MUST be stored through the interpreter's own (set X V) path —
+ * eval_kl_form on a (set ...) KLambda form — and NOT via the raw C
+ * value_set().  The interp's [prim set] rule passes the interpreter's TAGGED
+ * value representation ([string S] / [number N] cons cells) to the C set
+ * primitive, so anything set by interpreted code (including the REPL) lands
+ * TAGGED in the C values table; the interp's [prim value] rule then returns
+ * that tagged form as the accumulator, which is what downstream interp rules
+ * ([prim string?], [prim cons?], ...) pattern-match.  A raw C VAL_STRING
+ * written by value_set reads back UNtagged and every tagged-pattern rule
+ * misclassifies it (the observed failure: shell/shexpand.shen's shx-argv0 /
+ * shx-flags / shx-posargs always fell to their defaults, so $0/$-/$1.. never
+ * expanded, while REPL (set ...) values expanded fine).  Storing through
+ * eval-kl lands exactly what a REPL (set ...) lands, which the shell sources
+ * already read correctly. */
+static void boot_set_kl_string(const char *name, const char *sval) {
+    /* (set <name> "<sval>") */
+    Value form = val_cons(val_symbol("set"),
+                    val_cons(val_symbol(name),
+                      val_cons(val_string(sval, (long)strlen(sval)),
+                               val_nil())));
+    gc_root_push_value(&form);
+    eval_kl_form(form);
+    gc_root_pop();
+}
+
+static void boot_set_kl_posargs(char **args, int n) {
+    /* (set *sh-posargs* (cons "a1" (cons "a2" ... ()))) — built
+       right-to-left so the form is ordinary KLambda the eval-kl compiler
+       handles (cons is a primitive; () compiles to emptylist). */
+    Value tail = val_nil();
+    gc_root_push_value(&tail);
+    for (int i = n - 1; i >= 0; i--) {
+        Value s = val_string(args[i], (long)strlen(args[i]));
+        gc_root_push_value(&s);   /* s live across the cons allocs below */
+        Value cell = val_cons(val_symbol("cons"),
+                              val_cons(s, val_cons(tail, val_nil())));
+        gc_root_pop();            /* s */
+        tail = cell;
+    }
+    Value form = val_cons(val_symbol("set"),
+                    val_cons(val_symbol("*sh-posargs*"),
+                             val_cons(tail, val_nil())));
+    gc_root_push_value(&form);
+    eval_kl_form(form);
+    gc_root_pop();                /* form */
+    gc_root_pop();                /* tail */
+}
+
+/* *sh-exit-code* is stored by shell.shen (sh-run-plan) through the interp's
+ * (set ...), so the C values-table entry is the interpreter's TAGGED
+ * [number N] cons, not a raw VAL_NUMBER.  Unwrap either form. */
+static long sh_exit_code_num(void) {
+    Value code = value_get("*sh-exit-code*");
+    if (code.tag == VAL_NUMBER) return (long)code.number;
+    if (code.tag == VAL_CONS) {
+        Value h = *code.cons.car;
+        if (h.tag == VAL_SYMBOL && strcmp(h.sym.name, "number") == 0) {
+            Value rest = *code.cons.cdr;   /* the (N) tail of [number N] */
+            if (rest.tag == VAL_CONS) {
+                Value num = *rest.cons.car;
+                if (num.tag == VAL_NUMBER) return (long)num.number;
+            }
+        }
+    }
+    return 0;
 }
 
 /* ---- shen_load_source: run a REAL Shen source file through the bundled
@@ -501,7 +578,15 @@ static void eval_klambda_line(const char *line, int linelen) {
         return;
     }
     Value exprs = *parsed.cons.car;  /* hd of [[Expr|Rest] FinalPos] */
-    Value cur = exprs;
+    /* cur must stay rooted across each form's eval: eval_kl_form /
+       call_bundled_1 allocate (compile + interp + global-table update), and
+       the exprs spine cells were only reachable through `parsed`'s root,
+       which was popped above — a collection mid-loop left cur pointing at
+       dead/moved cells, so the NEXT form was compiled from garbage (the
+       observed multi-error batches and SEGV-after-failed-compile).  volatile:
+       cur is live across the setjmp inside the loop. */
+    volatile Value cur = exprs;
+    gc_root_push_value_volatile(&cur);
     while (cur.tag == VAL_CONS) {
         Value expr = *cur.cons.car;
         volatile int is_defun = is_defun_form(expr);
@@ -534,6 +619,7 @@ static void eval_klambda_line(const char *line, int linelen) {
         gc_root_pop();  /* result */
         cur = *cur.cons.cdr;
     }
+    gc_root_pop();  /* cur */
 }
 
 /* ---- main() ----------------------------------------------------------- */
@@ -594,6 +680,63 @@ int main(int argc, char **argv) {
             print_shen(boot);
             fprintf(stderr, ") — continuing without it\n");
         }
+    }
+
+    /* ---- positional-parameter globals ($0 $1..$9 $# $@ $* $$ $! $-,
+       expanded by shell/shexpand.shen).  Set BEFORE any line runs:
+         *sh-argv0*   = how the shell was invoked: argv[0]; in -c mode the
+                        first operand after the command string when given
+                        (bash convention: that operand names $0 and the
+                        remaining operands are $1..$9).
+         *sh-posargs*  = list of positional-arg strings (empty interactive).
+         *sh-flags*    = $- option flags: "i" interactive, "c" -c mode —
+                        the only two states shensh actually has.
+       Stored via eval_kl_form (see boot_set_kl_* above) so the values land
+       in the interpreter's TAGGED representation — a raw value_set() write
+       is invisible to the shell sources' [prim string?]/[prim cons?]
+       readers and $0/$-/$1.. silently fall to their defaults. */
+    const char *cmd_string = NULL;   /* -c MODE: the command string */
+    char **pos_args = NULL; int n_pos_args = 0;
+    const char *argv0 = argv[0];
+    if (argc > 3 && strcmp(argv[2], "-c") == 0) {
+        cmd_string = argv[3];
+        int first_pos = 4;
+        if (argc > 4) { argv0 = argv[4]; first_pos = 5; }
+        pos_args = &argv[first_pos];
+        n_pos_args = argc - first_pos;
+    } else if (argc > 2 && strcmp(argv[2], "-c") == 0) {
+        fprintf(stderr, "shensh: -c requires a command string\n");
+        return 2;
+    }
+    boot_set_kl_string("*sh-argv0*", argv0);
+    boot_set_kl_string("*sh-flags*", cmd_string ? "c" : "i");
+    boot_set_kl_posargs(pos_args, n_pos_args);
+
+    if (cmd_string) {
+        /* -c MODE: run the ONE command string through the same
+           shell-eval-line path the REPL uses (no prompt), print its output
+           raw, and exit with the last command's exit status (POSIX sh -c).
+           The result stays rooted while printed. */
+        volatile Value cresult; memset((void *)&cresult, 0, sizeof(cresult));
+        cresult.tag = VAL_NIL;
+        gc_root_push_value_volatile(&cresult);
+        cresult = eval_form1("shell-eval-line",
+                             val_string(cmd_string, (long)strlen(cmd_string)));
+        if (cresult.tag == VAL_ERROR) {
+            fprintf(stderr, "shensh: ");
+            print_shen(cresult);
+            gc_root_pop();
+            return 126;
+        }
+        if (cresult.tag == VAL_SYMBOL &&
+            strcmp(cresult.sym.name, "sh-continue") == 0) {
+            fprintf(stderr, "shensh: heredoc: unexpected EOF\n");
+            gc_root_pop();
+            return 1;
+        }
+        print_raw_string_ex(cresult, 1);
+        gc_root_pop();
+        return (int)sh_exit_code_num();
     }
 
     /* REPL loop: prompt via eval_form1("sh-prompt", val_string("",0)) → read_stdin_line();
