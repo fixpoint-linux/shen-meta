@@ -43,6 +43,41 @@
   Var Expr [H | T] -> [(beta-substitute Var Expr H) | (beta-substitute-list Var Expr T)]
   Var Expr X -> (beta-substitute Var Expr X))
 
+\* expand-let / expand-let-elt: destructuring-let expansion.
+   The reader consifies [A B] / [A B | R] into constructor forms
+   ([cons A [cons B []]] etc. — the same shape cons-constructor-pattern?
+   recognizes).  A let whose binder is NOT a symbol is expanded into
+   nested single-symbol lets over one fresh temp so E evaluates ONCE:
+     (let [A B] E Body)
+       => (let T E (let A (hd T) (let B (hd (tl T)) Body)))
+   Element semantics (pure extraction, NO match tests — a non-cons E
+   fails at runtime through the hd/tl safe wrappers, catchable):
+     variable -> bound to the element accessor
+     _ / []   -> no binding (wildcard / end of proper list)
+     [P1 P2]  -> nested (P1 at hd, P2 at tl; an improper tail symbol
+                 binds the remaining tl directly)
+   Any other binder element is a compile-time simple-error. *\
+
+(define expand-let
+  V E B -> (if (symbol? V)
+               [let V E B]
+               (let Tmp (fresh-var (intern "L"))
+                 [let Tmp E (expand-let-elt V Tmp B)])))
+
+(define expand-let-elt
+  Pat Acc Inner ->
+    (if (variable? Pat)
+        [let Pat Acc Inner]
+        (if (= Pat (intern "_"))
+            Inner
+            (if (empty? Pat)
+                Inner
+                (if (cons-constructor-pattern? Pat)
+                    (expand-let-elt (hd (tl Pat))
+                                    [hd Acc]
+                                    (expand-let-elt (hd (tl (tl Pat))) [tl Acc] Inner))
+                    (simple-error (cn "let: unsupported destructuring binder: " (str Pat))))))))
+
 \* alpha-convert: rename lambda/let bound variables to fresh gensyms.
    fresh-var (not [prim gensym]) — the C gensym primitive returns lowercase
    shen.gensym_N, which is not a variable and breaks debruijn on the
@@ -52,9 +87,11 @@
   [lambda Arg Body] -> (let New (fresh-var (intern "Z"))
                           (let NewBody (beta-substitute Arg New Body)
                             [lambda New (alpha-convert NewBody)]))
-  [let V E B] -> (let New (fresh-var (intern "W"))
-                   (let NewBody (beta-substitute V New B)
-                     [let New (alpha-convert E) (alpha-convert NewBody)]))
+  [let V E B] -> (if (symbol? V)
+                   (let New (fresh-var (intern "W"))
+                     (let NewBody (beta-substitute V New B)
+                       [let New (alpha-convert E) (alpha-convert NewBody)]))
+                   (alpha-convert (expand-let V E B)))
   [H | T] -> [(alpha-convert H) | (alpha-convert T)]
   X -> X)
 
@@ -163,7 +200,9 @@
 
 (define shen->kl-form
   [lambda Arg Body]   -> [lambda Arg (shen->kl-body Body)]
-  [let V E B]         -> [let V (shen->kl-body E) (shen->kl-body B)]
+  [let V E B]         -> (if (symbol? V)
+                           [let V (shen->kl-body E) (shen->kl-body B)]
+                           (shen->kl-body (expand-let V E B)))
   [protect X]         -> (shen->kl-body X)
   [/. Arg Body]       -> (shen->kl-shorthand Arg Body)
   []                  -> []
