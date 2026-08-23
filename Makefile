@@ -96,8 +96,10 @@ gate: test test-asan
 # lines through the real REPL (stdin pipe) and checks quoting, field
 # splitting, redirections (incl. the 2>&1 >file ordering), pipelines,
 # chains, subshell cd isolation, the heredoc sh-continue protocol, the
-# v1 rejects, fd-dup edges (2>& / 2>&x -> bad fd-dup), and positional
-# parameters ($0 $1..$9 $# $@ $* $$ $! $-; interactive + shensh -c).
+# v1 rejects, fd-dup edges (2>& / 2>&x -> bad fd-dup), positional
+# parameters ($0 $1..$9 $# $@ $* $$ $! $-; interactive + shensh -c),
+# and the '(' escape running Shen SURFACE syntax through the bundled
+# flat-Shen reader/compiler (shen-parse-exprs + shen->kl).
 # See tools/shensh-e2e.sh.  Needs globals.csexp (built on
 # demand via bundle).
 shensh-test: shensh

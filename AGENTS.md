@@ -11,7 +11,7 @@ make pipeline # compile (+ 1 2) through full pipeline
 make bundle   # serialize all safe wrappers → globals.csexp
 make run-bundle  # run zinctest with globals.csexp (self-hosting + GC stress tests)
                 # ./zinctest globals.csexp  is equivalent
-make shensh-test # build+run the shensh end-to-end shell tests (57 cases)
+make shensh-test # build+run the shensh end-to-end shell tests (67 cases)
 make shpar-verify # grep gate: zero execl(/bin/sh) sites in vm/zincvm.c vm/shensh.c
 
 # Trace execution of specific closures:
@@ -90,6 +90,19 @@ tested in zinctest 51 + e2e).
   runs **in-process** with fds 0/1/2 saved/restored — that is what makes
   `(cd /; pwd)` print `/` (POSIX subshell semantics).
 - `$?` reads `*sh-exit-code*` (set from the last exec-plan result).
+
+### The `(` escape (Shen surface at the prompt)
+
+A line starting with `(` (no unquoted `;` `|` `&` — those are shell subshells)
+routes through `eval_klambda_line` (vm/shensh.c): the **bundled flat-Shen
+reader/compiler** — `shen-parse-exprs` (the .shen surface reader: `{ A --> B }`
+sigs grouped, `[X | Y]` consified, `->` an atom) parses, then each form is
+compiled by `shen->kl` (the same dispatcher `shen-load` uses) and dispatched:
+a compiled `(defun ...)` registers into namespace 2 via `interp-eval`
+(`; registered <name>`), anything else evaluates via `eval-kl` (`=> <result>`).
+So BOTH Shen surface (`(define sq { number --> number } X -> (* X X))` then
+`(sq 7)` → `49`) and raw KLambda (`(defun f (X) ...)`) work at the prompt.
+`vm/zincvm.c`'s `--meta-repl` uses the identical pipeline.
 
 ### sh-continue heredoc protocol
 

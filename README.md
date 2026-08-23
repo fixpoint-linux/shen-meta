@@ -51,7 +51,7 @@ make test     # run 48 built-in bytecode tests
 make pipeline # compile (+ 1 2) through full pipeline
 make bundle   # compile bundle .shen via shen->kl → globals.csexp
 make run-bundle  # run C VM with self-hosting bundle
-make shensh-test # run the 57-case shensh end-to-end shell tests
+make shensh-test # run the 67-case shensh end-to-end shell tests
 make shpar-verify # gate: zero execl(/bin/sh) sites in the VM sources
 make gate     # test + test-asan
 ```

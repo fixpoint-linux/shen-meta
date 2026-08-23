@@ -3500,7 +3500,7 @@ static Value call_closure1(const char *name, Value arg) {
 }
 
 /* Call a bundled lambda closure by name with three arguments
-   (used for parse-exprs Str Pos Len). */
+   (used for reader-convention closures: shen-parse-exprs Str Pos Len). */
 static Value call_closure3(const char *name, Value a, Value b, Value c) {
     Value g = defun_get(name);
     if (g.tag != VAL_LAMBDA) {
@@ -3592,19 +3592,20 @@ static void print_shen(Value v) {
     free(pbuf);
 }
 
-/* The meta REPL: reads KLambda text, parses it with the bundled
-   parse-exprs reader, evaluates each form via eval-kl (expressions)
-   or interp-eval (defuns).  Bypasses the Shen OS REPL (shen.repl)
+/* The meta REPL: reads Shen/KLambda text, parses it with the bundled
+   flat-Shen reader (shen-parse-exprs), compiles each form through
+   shen->kl, then registers defuns via interp-eval or evaluates
+   expressions via eval-kl.  Bypasses the Shen OS REPL (shen.repl)
    which is not present in the reduced bundle. */
 static void meta_repl(void) {
     printf("=== Meta REPL (metacircular KLambda interpreter, no Shen OS) ===\n");
-    printf("Type KLambda expressions.  Primitive calls evaluate, e.g.\n");
+    printf("Type Shen or KLambda expressions.  Primitive calls evaluate, e.g.\n");
     printf("  (+ 1 2)  (cons 1 2)  (hd ...)  (tl ...)  (cn \"a\" \"b\")\n");
     printf("  (= x y)  (< x y)     (str X)   (number? X)\n");
     printf("Structural forms (if/and/or/cond/let/lambda), list literals, calls\n");
-    printf("to bundled closures (reverse, strlen ...), and KLambda defuns\n");
-    printf("((defun F (X) ...) then (F arg)) all evaluate.\n");
-    printf("Use KLambda syntax: (defun F (X) Body), not Shen (defun F X -> ...).\n");
+    printf("to bundled closures (reverse, strlen ...), KLambda defuns\n");
+    printf("((defun F (X) ...) then (F arg)), and Shen surface defines\n");
+    printf("((define F { A --> B } X -> ...)) all evaluate.\n");
     printf("Ctrl-D (EOF) to exit.\n\n");
     fflush(stdout);
 
@@ -3631,7 +3632,7 @@ static void meta_repl(void) {
         gc_root_push_value_volatile(&parsed);
         int parse_err = 0;
         if (setjmp(cf_parse.buf) == 0) {
-            parsed = call_closure3("parse-exprs", Str, Zero, Len);
+            parsed = call_closure3("shen-parse-exprs", Str, Zero, Len);
         } else {
             parse_err = 1;
             parsed = cf_parse.error_val;
@@ -3654,28 +3655,41 @@ static void meta_repl(void) {
         gc_root_push_value_volatile(&cur);
         while (cur.tag == VAL_CONS) {
             Value expr = *cur.cons.car;
-            volatile int is_defun = is_defun_form(expr);
 
             CatchFrame cf;
             cf.parent = vm_catch_chain; cf.in_trap_error = 0;
             vm_catch_chain = &cf;
+            /* compiled (the shen->kl output) must stay rooted: interp-eval
+               and the eval-kl chain below allocate.  is_defun is set from
+               compiled INSIDE the try, so it is volatile (live across the
+               setjmp).  expr itself is rooted by the callee (call_closure1
+               pushes its arg before its first allocation). */
+            volatile Value compiled; memset((void*)&compiled, 0, sizeof(compiled));
+            compiled.tag = VAL_NIL;
+            gc_root_push_value_volatile(&compiled); /* S3b: root compiled */
             volatile Value result; memset((void*)&result, 0, sizeof(result));
             result.tag = VAL_NIL;
             gc_root_push_value_volatile(&result); /* S3: root result across loop body */
+            volatile int is_defun = 0;
             int err = 0;
             if (setjmp(cf.buf) == 0) {
+                /* compile the parsed form through the flat-Shen compiler:
+                   (define F sig rules ...) -> a KLambda (defun ...),
+                   (defun ...) passthrough, expressions -> body rewrite. */
+                compiled = call_closure1("shen->kl", expr);
+                is_defun = is_defun_form(compiled);
                 if (is_defun) {
                     /* register a defun in the Shen global-table via interp-eval.
-                       Requires KLambda syntax (defun F (X) Body) — the reader
-                       carries the param list and kmacros (normalize.shen)
-                       unwraps/curries it before debruijn.  We report the
-                       outcome honestly rather than assume success. */
-                    Value r = call_closure1("interp-eval", expr);
+                       The compiled (defun F (X) Body) carries the param list
+                       and kmacros (normalize.shen) unwraps/curries it before
+                       debruijn.  We report the outcome honestly rather than
+                       assume success. */
+                    Value r = call_closure1("interp-eval", compiled);
                     result = r;
                 } else {
                     /* evaluate an expression via eval-kl */
                     ValueArray s; va_init(&s);
-                    va_push(&s, expr);
+                    va_push(&s, compiled);
                     Value acc; memset(&acc, 0, sizeof(acc));
                     exec_primitive("eval-kl", &acc, &s);
                     va_free(&s);
@@ -3703,6 +3717,7 @@ static void meta_repl(void) {
                 print_shen(result);
             }
             gc_root_pop();  /* S3: result */
+            gc_root_pop();  /* S3b: compiled */
             cur = *cur.cons.cdr;
         }
         gc_root_pop();  /* cur */
@@ -4194,9 +4209,10 @@ int main(int argc, char **argv) {
                 }
                 return 0;
             }
-            /* --meta-repl: run the meta-interpreter KLambda REPL
-               (bypasses the Shen OS; uses bundled parse-exprs / eval-kl /
-               interp-eval — all present in the reduced bundle). */
+            /* --meta-repl: run the meta-interpreter Shen/KLambda REPL
+               (bypasses the Shen OS; uses bundled shen-parse-exprs /
+               shen->kl / eval-kl / interp-eval — all in the reduced
+               bundle). */
             if (ai < argc && strcmp(argv[ai], "--meta-repl") == 0) {
                 meta_repl();
                 return 0;

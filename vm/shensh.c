@@ -286,8 +286,9 @@ static Value call_bundled_0(const char *name) {
     return result;
 }
 
-/* ---- call_closure3: call a bundled closure with three args (parse-exprs
- *      Str Pos Len).  Same namespace-1 defun_get convention as the others. */
+/* ---- call_closure3: call a bundled closure with three args (the reader
+ *      convention parse-exprs / shen-parse-exprs take: Str Pos Len).
+ *      Same namespace-1 defun_get convention as the others. */
 static Value call_closure3(const char *name, Value a, Value b, Value c) {
     Value g = defun_get(name);
     if (g.tag != VAL_LAMBDA) return val_nil();
@@ -527,12 +528,13 @@ static Value shen_load_source(const char *path) {
 }
 
 /* Does the line (after leading whitespace) start with '(' ?  If so it is
- * EITHER a KLambda expression (shensh evaluates it through parse-exprs +
- * eval-kl, the meta_repl path, in C) or a SHELL SUBSHELL — the grammar
- * from shpar-p2 treats '(' at command position as a subshell
- * ((cd /; pwd), (ls | head), ...).  KLambda has no ; | & operators, so a
- * '(' line containing any of those outside quotes is a subshell, not
- * KLambda.  A bare (cd /) with no chain/pipeline still parses as KLambda
+ * EITHER a Shen/KLambda expression (shensh evaluates it through the bundled
+ * flat-Shen reader/compiler — shen-parse-exprs + shen->kl, the shen-load
+ * pipeline on one line — see eval_klambda_line) or a SHELL SUBSHELL — the
+ * grammar from shpar-p2 treats '(' at command position as a subshell
+ * ((cd /; pwd), (ls | head), ...).  Shen/KLambda has no ; | & operators,
+ * so a '(' line containing any of those outside quotes is a subshell, not
+ * Shen.  A bare (cd /) with no chain/pipeline still parses as Shen
  * (KLambda probe) — documented v1 divergence. */
 static int line_is_klambda(const char *line) {
     while (*line && isspace((unsigned char)*line)) line++;
@@ -550,8 +552,16 @@ static int line_is_klambda(const char *line) {
     return 1;
 }
 
-/* Evaluate a whole KLambda line (possibly several forms) via parse-exprs +
- * eval-kl, printing each form's result.  Returns 1 if the line was handled. */
+/* Evaluate a whole '(' line (possibly several forms) through the bundled
+ * FLAT-SHEN reader + compiler — the same pipeline `shen-load` uses, on a
+ * single line: shen-parse-exprs (the .shen surface reader: { A --> B }
+ * sigs grouped, [X | Y] consified, -> / atoms) parses; each form is then
+ * compiled by shen->kl (top-level dispatcher: (define F sig rules ...) ->
+ * a KLambda defun, (defun ...) passthrough, (set S E), expressions ->
+ * body rewrite); a compiled (defun ...) registers into namespace 2 via
+ * interp-eval (returns the Name), everything else evaluates via eval-kl.
+ * This makes Shen SURFACE syntax work at the prompt ((define sq { sig }
+ * X -> (* X X))), not just raw KLambda.  Prints each form's result. */
 static void eval_klambda_line(const char *line, int linelen) {
     Value Str = val_string(line, linelen);
     Value Zero = val_number(0);
@@ -565,7 +575,7 @@ static void eval_klambda_line(const char *line, int linelen) {
     gc_root_push_value_volatile(&parsed);
     int parse_err = 0;
     if (setjmp(cf_parse.buf) == 0) {
-        parsed = call_closure3("parse-exprs", Str, Zero, Len);
+        parsed = call_closure3("shen-parse-exprs", Str, Zero, Len);
     } else {
         parse_err = 1;
         parsed = cf_parse.error_val;
@@ -578,31 +588,42 @@ static void eval_klambda_line(const char *line, int linelen) {
         return;
     }
     Value exprs = *parsed.cons.car;  /* hd of [[Expr|Rest] FinalPos] */
-    /* cur must stay rooted across each form's eval: eval_kl_form /
-       call_bundled_1 allocate (compile + interp + global-table update), and
-       the exprs spine cells were only reachable through `parsed`'s root,
-       which was popped above — a collection mid-loop left cur pointing at
-       dead/moved cells, so the NEXT form was compiled from garbage (the
-       observed multi-error batches and SEGV-after-failed-compile).  volatile:
-       cur is live across the setjmp inside the loop. */
+    /* cur must stay rooted across each form's compile+eval: shen->kl,
+       interp-eval and eval_kl_form all allocate (compile + interp +
+       global-table update), and the exprs spine cells were only reachable
+       through `parsed`'s root, which was popped above — a collection
+       mid-loop left cur pointing at dead/moved cells, so the NEXT form was
+       compiled from garbage (the observed multi-error batches and
+       SEGV-after-failed-compile).  volatile: cur is live across the
+       setjmp inside the loop. */
     volatile Value cur = exprs;
     gc_root_push_value_volatile(&cur);
     while (cur.tag == VAL_CONS) {
         Value expr = *cur.cons.car;
-        volatile int is_defun = is_defun_form(expr);
 
         CatchFrame cf;
         cf.parent = vm_catch_chain; cf.in_trap_error = 0;
         vm_catch_chain = &cf;
+        /* compiled must stay rooted: it is the shen->kl output handed to
+           interp-eval / eval-kl, both of which allocate.  is_defun is set
+           from compiled INSIDE the try, so it is volatile (live across the
+           setjmp).  expr itself is rooted by the callee (call_bundled_1
+           pushes its arg before its first allocation). */
+        volatile Value compiled; memset((void*)&compiled, 0, sizeof(compiled));
+        compiled.tag = VAL_NIL;
+        gc_root_push_value_volatile(&compiled);
         volatile Value result; memset((void*)&result, 0, sizeof(result));
         result.tag = VAL_NIL;
         gc_root_push_value_volatile(&result);
+        volatile int is_defun = 0;
         int err = 0;
         if (setjmp(cf.buf) == 0) {
+            compiled = call_bundled_1("shen->kl", expr);
+            is_defun = is_defun_form(compiled);
             if (is_defun) {
-                result = call_bundled_1("interp-eval", expr);
+                result = call_bundled_1("interp-eval", compiled);
             } else {
-                result = eval_kl_form(expr);
+                result = eval_kl_form(compiled);
             }
         } else {
             err = 1;
@@ -617,6 +638,7 @@ static void eval_klambda_line(const char *line, int linelen) {
             printf("=> "); print_shen(result);
         }
         gc_root_pop();  /* result */
+        gc_root_pop();  /* compiled */
         cur = *cur.cons.cdr;
     }
     gc_root_pop();  /* cur */
@@ -769,9 +791,10 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        /* KLambda expression lines (start with '(') go through the C
-           parse-exprs + eval-kl path (meta_repl style) — parse-exprs is a
-           namespace-1 bundled closure, unreachable from interpreted code. */
+        /* '(' lines go through the bundled flat-Shen reader/compiler
+           (shen-parse-exprs + shen->kl + interp-eval/eval-kl, in C) —
+           shen-parse-exprs is a namespace-1 bundled closure, unreachable
+           from interpreted code. */
         if (line_is_klambda(line)) {
             eval_klambda_line(line, (int)strlen(line));
             free(line);

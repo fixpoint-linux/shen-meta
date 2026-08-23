@@ -3,9 +3,10 @@
 #
 # Feeds shell command LINES through the REAL shensh REPL (stdin pipe, the
 # same path a user types) and greps the combined output for expected
-# patterns.  Never probes parser internals via nested REPL KLambda
-# expressions (the shensh eval-kl path has known compile limitations);
-# commands are exercised exactly like real usage.
+# patterns.  Never probes parser internals via nested REPL expressions;
+# commands are exercised exactly like real usage.  The '(' escape lines
+# run through the bundled flat-Shen reader/compiler (shen-parse-exprs +
+# shen->kl), so simple Shen SURFACE forms are fair game as test inputs.
 #
 # Must run from the repo root: the shell boots shell/*.shen relative to
 # cwd (the script cds itself).  Requires ./shensh + globals.csexp
@@ -100,6 +101,24 @@ tn "exit stops the repl" 'echo before
 exit
 echo after'                                              'after'
 t  "exit prints exit"    'exit'                         'exit'
+
+echo "== NEW: Shen surface at the '(' escape (flat-Shen reader/compiler) =="
+
+t  "Shen define with sig"   '(define sq { number --> number } X -> (* X X))
+(sq 7)'                   'registered sq' '=> 49'
+t  "Shen define multi-rule recursive" '(define fac { number --> number } 0 -> 1 N -> (* N (fac (- N 1))))
+(fac 5)'                  '=> 120'
+t  "KLambda defun compat"   '(defun f2 (X) (* X X))
+(f2 6)'                   '=> 36'
+t  "expression still evaluates" '(+ 1 2)'    '=> 3'
+t  "list literal via Shen reader" '(reverse [1 2 3])'    '=> \[3 2 1\]'
+t  "set/value through Shen" '(set e2x 5)
+(value e2x)'              '=> 5'
+t  "malformed define errors, repl survives" '(define bad { number --> number } X -> )
+(+ 2 2)'                  'No condition was true' '=> 4'
+t  "(cd /; pwd) runs as subshell" '(cd /; pwd)'    '> /'
+tn "(cd /; pwd) is not Shen eval" '(cd /; pwd)'    '=>'
+t  "(echo quoted semicolon) is Shen" '(echo "a;b")'    'global not found: echo'
 
 echo "== NEW: quoting and field splitting =="
 
