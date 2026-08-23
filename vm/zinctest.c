@@ -107,6 +107,147 @@ static void run_test(const char *label, const char *bytecode, int show_code) {
     run_test_timeout(label, bytecode, show_code, 0);
 }
 
+/* ---- tagged plan builders for the exec-plan tests (46-52) ----
+   Same tagged forms the metacircular interp produces ([cons H T] as a
+   3-element list, [cons] = empty); rooting discipline mirrors the
+   make_tagged_* helpers in zincvm.c: each intermediate Value is rooted
+   across the next val_cons allocation.  A Value passed as an argument is
+   DEAD after the call (it may move) — never reuse it. */
+
+static Value tstr_(const char *s) {
+    Value v = val_string(s, (int)strlen(s));
+    gc_root_push_value(&v);
+    Value inner = val_cons(v, val_nil());
+    gc_root_push_value(&inner);
+    Value result = val_cons(val_symbol("string"), inner);
+    gc_root_pop(); gc_root_pop();
+    return result;
+}
+
+static Value tsym_(const char *s) {
+    Value v = val_symbol(s);
+    gc_root_push_value(&v);
+    Value inner = val_cons(v, val_nil());
+    gc_root_push_value(&inner);
+    Value result = val_cons(val_symbol("symbol"), inner);
+    gc_root_pop(); gc_root_pop();
+    return result;
+}
+
+static Value tnum_(long n) {
+    Value v = val_number(n);
+    gc_root_push_value(&v);
+    Value inner = val_cons(v, val_nil());
+    gc_root_push_value(&inner);
+    Value result = val_cons(val_symbol("number"), inner);
+    gc_root_pop(); gc_root_pop();
+    return result;
+}
+
+/* [cons] = empty tagged list */
+static Value tnil_(void) {
+    return val_cons(val_symbol("cons"), val_nil());
+}
+
+/* [cons car cdr] */
+static Value tcons2_(Value car, Value cdr) {
+    gc_root_push_value(&car);
+    gc_root_push_value(&cdr);
+    Value inner = val_cons(car, val_cons(cdr, val_nil()));
+    gc_root_push_value(&inner);
+    Value result = val_cons(val_symbol("cons"), inner);
+    gc_root_pop(); gc_root_pop(); gc_root_pop();
+    return result;
+}
+
+/* [cons a [cons]] */
+static Value tlist1_(Value a) {
+    gc_root_push_value(&a);
+    Value nil = tnil_();
+    gc_root_pop();
+    return tcons2_(a, nil);
+}
+
+/* [cons a [cons b [cons]]] */
+static Value tlist2_(Value a, Value b) {
+    gc_root_push_value(&a);
+    gc_root_push_value(&b);
+    Value l = tnil_();
+    Value r = tcons2_(b, l);
+    gc_root_pop(); gc_root_pop();
+    return tcons2_(a, r);
+}
+
+/* [cons a [cons b [cons c [cons]]]] */
+static Value tlist3_(Value a, Value b, Value c) {
+    gc_root_push_value(&a);
+    gc_root_push_value(&b);
+    gc_root_push_value(&c);
+    Value l = tnil_();
+    Value r2 = tcons2_(c, l);
+    Value r1 = tcons2_(b, r2);
+    gc_root_pop(); gc_root_pop(); gc_root_pop();
+    return tcons2_(a, r1);
+}
+
+/* argv tagged list from a C string array */
+static Value targv_(char **argv, int argc) {
+    Value av = tnil_();
+    for (int i = argc - 1; i >= 0; i--) {
+        gc_root_push_value(&av);
+        Value s = tstr_(argv[i]);
+        gc_root_pop();
+        av = tcons2_(s, av);
+    }
+    return av;
+}
+
+/* Cmd = [argv [] ()] */
+static Value tcmd_(char **argv, int argc) {
+    Value av = targv_(argv, argc);
+    gc_root_push_value(&av);
+    Value redirs = tnil_();
+    gc_root_push_value(&redirs);
+    Value sub = tnil_();
+    gc_root_pop(); gc_root_pop();
+    return tlist3_(av, redirs, sub);
+}
+
+/* Cmd = [argv Redirs ()] with a pre-built redir list */
+static Value tcmd_r_(char **argv, int argc, Value redirs) {
+    gc_root_push_value(&redirs);
+    Value av = targv_(argv, argc);
+    gc_root_push_value(&av);
+    Value sub = tnil_();
+    gc_root_pop(); gc_root_pop();
+    return tlist3_(av, redirs, sub);
+}
+
+/* Redirs = [[op fd target]] — one-element redirect list */
+static Value tredir_(Value op, Value fd, Value target) {
+    Value r = tlist3_(op, fd, target);
+    return tlist1_(r);
+}
+
+/* Chain = [op pipe] */
+static Value tchain_(const char *op, Value pipe) {
+    gc_root_push_value(&pipe);
+    Value o = tsym_(op);
+    gc_root_pop();
+    return tlist2_(o, pipe);
+}
+
+/* Program = [[seq [cmd]]] — single chain, single plain command */
+static Value tplan1_(char **argv, int argc) {
+    Value cmd = tcmd_(argv, argc);
+    gc_root_push_value(&cmd);
+    Value pipe = tlist1_(cmd);
+    gc_root_push_value(&pipe);
+    Value chain = tchain_("seq", pipe);
+    gc_root_pop(); gc_root_pop();
+    return tlist1_(chain);
+}
+
 /* call_bundled_1: call a single-argument bundled closure by name, returning
  * the result Value (or VAL_ERROR on lookup/exec failure).  Mirrors the env
  * setup used by eval-kl in zincvm.c: init_env = closure.env + [arg].  Used by
@@ -2417,43 +2558,9 @@ int main(int argc, char **argv) {
        but no pushmark; arg gets collected, then stack empty → error    */
     run_test("38. appterm: missing mark", "(n[2:n]42c(a[1:n]0v)t)", 0);
 
-    /* === shensh process-primitive tests (inline OP_PRIM / global+apply) === */
-
-    /* 39. exec-command "echo hello" → tagged [0 "hello\n" ""] */
-    run_test("39. exec-command echo hello",
-        "(mS[10:S]echo hellog[12:s]exec-commandp)", 1);
-
-    /* 40. shell-pipe ["echo hello" "wc -c"] → tagged [0 "6\n"].
-       Build the tagged argument list in C (same pattern as eval-kl tests
-       that store a pre-built KLambda form in a global), then load it via
-       OP_GLOBAL and call the primitive via OP_PRIM.  Strings are rooted
-       across the val_cons calls to keep str.data pointers valid. */
-    {
-        Value nil = val_nil();
-        Value s1 = val_string("echo hello", 10);
-        gc_root_push_value(&s1);
-        Value s2 = val_string("wc -c", 5);
-        gc_root_push_value(&s2);
-        /* [string "echo hello"] */
-        Value e1 = val_cons(val_symbol("string"), val_cons(s1, nil));
-        gc_root_push_value(&e1);
-        /* [string "wc -c"] */
-        Value e2 = val_cons(val_symbol("string"), val_cons(s2, nil));
-        gc_root_push_value(&e2);
-        /* terminator [cons] = val_cons(sym("cons"), nil) */
-        Value term = val_cons(val_symbol("cons"), nil);
-        gc_root_push_value(&term);
-        /* [cons [string "wc -c"] [cons]] */
-        Value c2 = val_cons(val_symbol("cons"), val_cons(e2, term));
-        gc_root_push_value(&c2);
-        /* [cons [string "echo hello"] [...]] */
-        Value lst = val_cons(val_symbol("cons"), val_cons(e1, c2));
-        defun_set("*sp1*", lst);
-        gc_root_pop(); gc_root_pop(); gc_root_pop(); gc_root_pop();
-        gc_root_pop(); gc_root_pop();
-    }
-    run_test("40. shell-pipe echo|wc",
-        "(g[5:s]*sp1*P[10:s]shell-pipe)", 1);
+    /* === shensh process-primitive tests (inline OP_PRIM / global+apply) ===
+       (tests 39/40 — exec-command / shell-pipe — were removed in shpar-p2
+       U6 together with the /bin/sh code paths; exec-plan replaces them.) */
 
     /* 41. getcwd → current directory string */
     run_test("41. getcwd", "(mg[6:s]getcwdp)", 1);
@@ -2472,7 +2579,134 @@ int main(int argc, char **argv) {
     run_test("45. setenv FOO=bar",
         "(mS[3:S]barS[3:S]FOOg[6:s]setenvp)", 1);
 
-    printf("=== All 41 tests done ===\n");
+    /* === exec-plan tests (46-52): tagged plan built in C, stored as a
+       global, executed via inline OP_PRIM (pre-built-global pattern). === */
+
+    /* 46. exec-plan `echo hi` (child builtin) → tagged [0 "hi\n" ""] */
+    {
+        char *argv[2] = {"echo", "hi"};
+        Value plan = tplan1_(argv, 2);
+        defun_set("*epA*", plan);
+    }
+    run_test("46. exec-plan echo hi",
+        "(g[5:s]*epA*P[9:s]exec-plan)", 1);
+
+    /* 47. exec-plan pipeline `echo hello | wc -c` → tagged [0 "6\n" ""]
+       (execvp path: last stage is the external wc) */
+    {
+        char *a1[2] = {"echo", "hello"};
+        char *a2[2] = {"wc", "-c"};
+        Value c1 = tcmd_(a1, 2);
+        gc_root_push_value(&c1);
+        Value c2 = tcmd_(a2, 2);
+        gc_root_pop();
+        Value pipe = tlist2_(c1, c2);
+        gc_root_push_value(&pipe);
+        Value chain = tchain_("seq", pipe);
+        gc_root_pop();
+        Value plan = tlist1_(chain);
+        defun_set("*epB*", plan);
+    }
+    run_test("47. exec-plan echo hello | wc -c",
+        "(g[5:s]*epB*P[9:s]exec-plan)", 1);
+
+    /* 48. exec-plan chains `false || echo yes` → tagged [0 "yes\n" ""]
+       (seq chain fails with 1, or-chain runs) */
+    {
+        char *a1[1] = {"false"};
+        char *a2[2] = {"echo", "yes"};
+        Value c1 = tcmd_(a1, 1);
+        gc_root_push_value(&c1);
+        Value p1 = tlist1_(c1);
+        gc_root_push_value(&p1);
+        Value ch1 = tchain_("seq", p1);
+        gc_root_push_value(&ch1);
+        Value c2 = tcmd_(a2, 2);
+        gc_root_push_value(&c2);
+        Value p2 = tlist1_(c2);
+        gc_root_push_value(&p2);
+        Value ch2 = tchain_("or", p2);
+        gc_root_push_value(&ch2);
+        Value plan = tlist2_(ch1, ch2);
+        defun_set("*epC*", plan);
+        gc_root_pop(); gc_root_pop(); gc_root_pop();
+        gc_root_pop(); gc_root_pop(); gc_root_pop();
+    }
+    run_test("48. exec-plan false || echo yes",
+        "(g[5:s]*epC*P[9:s]exec-plan)", 1);
+
+    /* 49. exec-plan redirect `echo hi > /tmp/zinctest-ep-redir.txt`
+       → tagged [0 "" ""] (stdout goes to the file, not the capture) */
+    {
+        char *argv[2] = {"echo", "hi"};
+        Value op = tsym_("out");
+        gc_root_push_value(&op);
+        Value fd = tnum_(1);
+        gc_root_push_value(&fd);
+        Value tgt = tstr_("/tmp/zinctest-ep-redir.txt");
+        gc_root_pop(); gc_root_pop();
+        Value redirs = tredir_(op, fd, tgt);
+        gc_root_push_value(&redirs);
+        Value cmd = tcmd_r_(argv, 2, redirs);
+        gc_root_push_value(&cmd);
+        Value pipe = tlist1_(cmd);
+        gc_root_push_value(&pipe);
+        Value chain = tchain_("seq", pipe);
+        gc_root_push_value(&chain);
+        Value plan = tlist1_(chain);
+        defun_set("*epD*", plan);
+        gc_root_pop(); gc_root_pop(); gc_root_pop();
+        gc_root_pop(); gc_root_pop();
+    }
+    run_test("49. exec-plan echo hi > /tmp file",
+        "(g[5:s]*epD*P[9:s]exec-plan)", 1);
+
+    /* 50. exec-plan `cat /tmp/zinctest-ep-redir.txt` → tagged [0 "hi\n" ""]
+       (reads back what 49 wrote — proves the redirect took effect) */
+    {
+        char *argv[2] = {"cat", "/tmp/zinctest-ep-redir.txt"};
+        Value plan = tplan1_(argv, 2);
+        defun_set("*epE*", plan);
+    }
+    run_test("50. exec-plan cat redirected file",
+        "(g[5:s]*epE*P[9:s]exec-plan)", 1);
+
+    /* 51. exec-plan `echo duped` with [dup 1 2] (1>&2) → tagged
+       [0 "" "duped\n"] (stdout dup'd onto stderr → stderr capture) */
+    {
+        char *argv[2] = {"echo", "duped"};
+        Value op = tsym_("dup");
+        gc_root_push_value(&op);
+        Value fd = tnum_(1);
+        gc_root_push_value(&fd);
+        Value tgt = tnum_(2);
+        gc_root_pop(); gc_root_pop();
+        Value redirs = tredir_(op, fd, tgt);
+        gc_root_push_value(&redirs);
+        Value cmd = tcmd_r_(argv, 2, redirs);
+        gc_root_push_value(&cmd);
+        Value pipe = tlist1_(cmd);
+        gc_root_push_value(&pipe);
+        Value chain = tchain_("seq", pipe);
+        gc_root_push_value(&chain);
+        Value plan = tlist1_(chain);
+        defun_set("*epF*", plan);
+        gc_root_pop(); gc_root_pop(); gc_root_pop();
+        gc_root_pop(); gc_root_pop();
+    }
+    run_test("51. exec-plan dup 1>&2",
+        "(g[5:s]*epF*P[9:s]exec-plan)", 1);
+
+    /* 52. exec-plan ENOENT → tagged [127 "" "shensh: X: not found\n"] */
+    {
+        char *argv[1] = {"definitely-no-such-cmd-xyzzy"};
+        Value plan = tplan1_(argv, 1);
+        defun_set("*epG*", plan);
+    }
+    run_test("52. exec-plan ENOENT -> 127",
+        "(g[5:s]*epG*P[9:s]exec-plan)", 1);
+
+    printf("=== All 48 tests done ===\n");
 
     return 0;
 }

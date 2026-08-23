@@ -108,11 +108,9 @@ PRIM("shen.fail!",1)
 
 /* ---- shensh process primitives (exec_primitive; each needs a matching
    [prim X] rule in shen/interp.shen or interpreted code cannot call it).
-   exec-command/shell-pipe/glob return TAGGED values (interp-compatible);
+   exec-plan/glob return TAGGED values (interp-compatible);
    the rest return raw values wrapped by their interp rules. ---- */
-PRIM("exec-command",1)   /* Cmd -> [exit-code stdout stderr]            */
-PRIM("shell-pipe",1)     /* [Cmd1 Cmd2 ...] -> [exit output]           */
-PRIM("spawn",1)          /* Cmd -> pid (child inherits stdio)          */
+PRIM("exec-plan",1)     /* tagged plan tree -> [exit-code stdout stderr] (no /bin/sh) */
 PRIM("wait",1)           /* Pid -> exit status                         */
 PRIM("kill",2)           /* Pid Sig -> true                            */
 PRIM("cd",1)             /* Path -> true/false                         */

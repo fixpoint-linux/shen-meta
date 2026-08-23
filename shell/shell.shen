@@ -1,163 +1,118 @@
 (tc -)
 
+\* shell.shen - shpar-p2 U5: the shell driver.
+   Boots AFTER shlex.shen / shparse.shen / shexpand.shen (shensh.c boot list,
+   dependency order - the HM sig table accumulates across files) and drives
+   them: sp-lex -> sp-parse -> shx-plan -> C exec-plan.  There is NO /bin/sh
+   anywhere: exec-plan decodes the plan tree and forks/execvp's natively
+   (see the plan-runner section in vm/zincvm.c).
+   Builtins kept Shen-level because they must mutate the PARENT process:
+   cd, pwd, setenv/export, exit.  echo/true/false/:/cd/pwd additionally
+   exist as C CHILD builtins (apply post-redirect inside forked children)
+   so they behave uniformly inside pipelines and subshells.
+   Heredoc protocol: when a line ends inside an unterminated heredoc the
+   parser returns [pending Delims] and shell-eval-line returns the SYMBOL
+   sh-continue; the shensh.c REPL then accumulates further input lines and
+   re-evaluates the whole buffer until the delimiter closes.  Parsing never
+   leaves Shen. *\
+\* NOTE: the old /bin/sh path (sh-run-command via exec-command, sh-run-pipe
+   via shell-pipe, sh-split-pipe, sh-tag-stages, sh-echo) and the sh-* string
+   helpers are RETIRED - shlex.shen carries the sp-* copies. *\
+\* NOTE: chain-op symbols etc are lowercase CONSTANTS; never place bare
+   and/or/append (KLambda macros) in list literals - use intern. *\
+
 (define sh-prompt
   { --> string }
   -> (cn (getcwd 0) "> "))
 
-(define sh-len
-  { string --> number }
-  S -> (if (= S "") 0 (+ 1 (sh-len (tlstr S)))))
-
-(define sh-ch
+\* first whitespace-delimited token of S at Start (setenv NAME parsing). *\
+(define sh-token
   { string --> number --> string }
-  S I -> (if (< I (sh-len S)) (pos S I) ""))
-
-(define sh-at-end
-  { string --> number --> boolean }
-  S I -> (>= I (sh-len S)))
-
-(define sh-is-space
-  { string --> number --> boolean }
-  S I -> (let C (sh-ch S I)
-           (or (= C " ") (= C "\t") (= C "\n") (= C "\r"))))
-
-(define sh-skipws
-  { string --> number --> number }
-  S I -> (if (sh-is-space S I) (sh-skipws S (+ I 1)) I))
-
-(define sh-substr
-  { string --> number --> number --> string }
-  S Start End -> (if (or (sh-at-end S Start)
-                         (if (= End -1) false (>= Start End)))
-                     ""
-                     (cn (sh-ch S Start) (sh-substr S (+ Start 1) End))))
-
-(define sh-trim
-  { string --> number --> string }
-  S Start -> (sh-substr S Start -1))
-
-(define sh-find-ch
-  { string --> number --> number --> number }
-  S From C -> (if (sh-at-end S From)
-                  -1
-                  (if (= (string->n (sh-ch S From)) C)
-                      From
-                      (sh-find-ch S (+ From 1) C))))
-
-(define sh-prefix
-  { string --> string --> boolean }
-  S P -> (sh-prefix-1 S P 0))
-
-(define sh-prefix-1
-  { string --> string --> number --> boolean }
-  S P I -> (if (sh-at-end P I)
-               true
-               (if (sh-at-end S I)
-                   false
-                   (if (= (sh-ch S I) (sh-ch P I))
-                       (sh-prefix-1 S P (+ I 1))
-                       false))))
+  S Start -> (let Sp (sp-find-ch S Start 32)
+               (if (= Sp -1) (sp-trim S Start) (sp-substr S Start Sp))))
 
 (define sh-cd
   { string --> string }
-  S -> (let I (sh-skipws S 3)
-         (if (cd (sh-trim S I)) "" "cd failed")))
-
-(define sh-echo
-  { string --> string }
-  S -> (sh-trim S (sh-skipws S 5)))
+  S -> (let I (sp-skipws S 3)
+         (if (cd (sp-trim S I)) "" "cd failed")))
 
 (define sh-pwd
   { --> string }
-  -> (str (getcwd 0)))
+  -> (getcwd 0))
 
-(define sh-token
-  { string --> number --> string }
-  S Start -> (let Sp (sh-find-ch S Start 32)
-               (if (= Sp -1) (sh-trim S Start) (sh-substr S Start Sp))))
-
+\* setenv NAME VALUE  /  setenv NAME=VALUE  /  export NAME=VALUE. *\
 (define sh-setenv
   { string --> number --> string }
-  S Start -> (let I (sh-find-ch S Start 61)
+  S Start -> (let I (sp-find-ch S Start 61)
                (if (= I -1)
-                   (let Sp (sh-find-ch S Start 32)
+                   (let Sp (sp-find-ch S Start 32)
                      (if (= Sp -1)
                          "usage: setenv NAME VALUE or NAME=VALUE"
-                         (if (setenv (sh-token S Start) (sh-trim S (+ Sp 1)))
+                         (if (setenv (sh-token S Start) (sp-trim S (+ Sp 1)))
                              "" "setenv failed")))
-                   (if (setenv (sh-token S Start) (sh-trim S (+ I 1)))
+                   (if (setenv (sp-substr S Start I) (sp-trim S (+ I 1)))
                        "" "setenv failed"))))
 
-(define sh-run-command
-  { string --> string }
-  Cmd -> (let Res (exec-command Cmd)
-           (let Exit (hd Res)
-             (let Out (hd (tl Res))
-               (if (= Exit 0) (str Out) (cn "exit " (str Exit)))))))
+\* Display string for a finished program: the captured stdout when the
+   program produced any; else the captured stderr when it produced any
+   (so e.g. ENOENT messages are visible); else "exit N" on failure, ""
+   on success.  (Plan D-U5 says stdout / "exit N"; surfacing stderr when
+   stdout is empty is an intentional improvement - a shell shows error
+   text.)  Values are the TAGGED exec-plan result elements; = and str
+   operate on them transparently at interp level. *\
+(define sh-display
+  { number --> string --> string --> string }
+  Exit Out Err ->
+    (if (= Out "")
+        (if (= Err "")
+            (if (= Exit 0) "" (cn "exit " (str Exit)))
+            Err)
+        Out))
 
-(define sh-run-pipe
-  { (list string) --> string }
-  Stages -> (let Res (shell-pipe Stages)
-              (let Exit (hd Res)
-                (let Out (hd (tl Res))
-                  (if (= Exit 0) (str Out) (cn "exit " (str Exit)))))))
+\* Run an expanded plan tree: exec-plan returns the tagged
+   [exit stdout stderr]; *sh-exit-code* records the exit for $?. *\
+(define sh-run-plan
+  { klambda --> klambda }
+  Plan -> (let Res (exec-plan Plan)
+            (let Exit (hd Res)
+              (let Out (hd (tl Res))
+                (let Err (hd (tl (tl Res)))
+                  (let Ign (set *sh-exit-code* Exit)
+                    (sh-display Exit Out Err)))))))
 
-(define sh-split-pipe
-  { string --> (list string) }
-  S -> (sh-split-pipe-1 S 0 nil "" false (n->string 34)))
+\* [ok Ast] -> run the expanded plan;  [pending Delims] -> symbol
+   sh-continue (the shensh.c REPL accumulates more input and re-evals). *\
+(define sh-run-parsed
+  { klambda --> klambda }
+  [ok Ast] -> (sh-run-plan (shx-plan Ast))
+  [pending Delims] -> sh-continue)
 
-(define sh-split-pipe-1
-  { string --> number --> (list string) --> string --> boolean --> string --> (list string) }
-  S I Acc Cur InQuote Q -> (if (sh-at-end S I)
-                              (sh-append-stage Acc Cur)
-                              (let C (sh-ch S I)
-                                (if InQuote
-                                    (if (= C Q)
-                                        (sh-split-pipe-1 S (+ I 1) Acc (cn Cur C) false Q)
-                                        (sh-split-pipe-1 S (+ I 1) Acc (cn Cur C) true Q))
-                                    (if (= C Q)
-                                        (sh-split-pipe-1 S (+ I 1) Acc (cn Cur C) true Q)
-                                        (if (= C "|")
-                                            (sh-split-pipe-1 S (+ I 1) (sh-append-stage Acc Cur) "" false Q)
-                                            (sh-split-pipe-1 S (+ I 1) Acc (cn Cur C) false Q)))))))
+\* lex -> parse -> expand -> exec-plan for every non-builtin line.
+   Lexer/parser rejects (backtick, $(), bare &, ...) throw simple-error,
+   caught by shell-eval-line's trap-error wrapper. *\
+(define sh-exec-line
+  { string --> klambda }
+  S -> (sh-run-parsed (sp-parse (sp-lex S))))
 
-(define sh-append-stage
-  { (list string) --> string --> (list string) }
-  Acc Cur -> (if (= Acc nil)
-                  (cons Cur nil)
-                  (cons (hd Acc) (sh-append-stage (tl Acc) Cur))))
-
-(define sh-tag-stages
-  { (list string) --> (list string) }
-  S -> (if (= S nil) nil (cons (sh-trim (hd S) (sh-skipws (hd S) 0)) (sh-tag-stages (tl S)))))
-
-(define sh-run-external
-  { string --> string }
-  S -> (let I (sh-skipws S 0)
-         (let Line (sh-trim S I)
-           (let PipeI (sh-find-ch Line 0 124)
-             (if (= PipeI -1)
-                 (sh-run-command Line)
-                 (sh-run-pipe (sh-tag-stages (sh-split-pipe Line))))))))
-
+\* Shen-level builtins (parent-process effects): cd / pwd / setenv /
+   export / exit.  Everything else - including echo, true, false, : -
+   goes through exec-plan (child builtins + external commands). *\
 (define sh-builtin
-  { string --> string }
-  S -> (let I (sh-skipws S 0)
-         (let Cmd (sh-ch S I)
-           (if (= Cmd "c")
-               (if (sh-prefix S "cd ") (sh-cd S) (sh-run-external S))
-               (if (= Cmd "p")
-                   (if (sh-prefix S "pwd") (sh-pwd) (sh-run-external S))
-                   (if (= Cmd "s")
-                       (if (sh-prefix S "setenv ") (sh-setenv S 7) (sh-run-external S))
-                       (if (= Cmd "e")
-                           (if (sh-prefix S "exit")
-                               (if (set *sh-exit* true) "exit" "exit")
-                               (if (sh-prefix S "echo ")
-                                   (sh-echo S)
-                                   (if (sh-prefix S "export ") (sh-setenv S 7) (sh-run-external S))))
-                           (sh-run-external S))))))))
+  { string --> klambda }
+  S -> (let Ws (sp-skipws S 0)
+         (let Cmd (sh-token S Ws)
+           (if (= Cmd "cd")
+               (sh-cd S)
+               (if (= Cmd "pwd")
+                   (sh-pwd)
+                   (if (= Cmd "setenv")
+                       (sh-setenv S 7)
+                       (if (= Cmd "export")
+                           (sh-setenv S 7)
+                           (if (= Cmd "exit")
+                               (if (set *sh-exit* true) exit exit)
+                               (sh-exec-line S)))))))))
 
 (define shell-eval-line
-  { string --> string }
-  S -> (trap-error (sh-builtin S) (lambda E (cn "error: " (str E)))))
+  { string --> klambda }
+  S -> (trap-error (sh-builtin S) (lambda E (cn "error: " (error-to-string E)))))

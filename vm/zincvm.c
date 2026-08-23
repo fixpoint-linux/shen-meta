@@ -36,6 +36,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <poll.h>
 #include <dirent.h>
@@ -981,94 +982,7 @@ static int cmp_str(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/* Drain a single fd to EOF into a growing malloc buffer.
- * Used by shell-pipe for the capture pipe (single fd, no poll needed). */
-static int drain_fd(int fd, char **out, size_t *outlen) {
-    size_t cap = 8192, n = 0;
-    char *buf = (char *)malloc(cap);
-    if (!buf) return -1;
-    for (;;) {
-        if (n + 4096 >= cap) {
-            size_t nc = cap * 2;
-            char *nb = (char *)realloc(buf, nc);
-            if (!nb) { free(buf); return -1; }
-            buf = nb; cap = nc;
-        }
-        ssize_t r = read(fd, buf + n, 4096);
-        if (r < 0) { if (errno == EINTR) continue; break; }
-        if (r == 0) break;
-        n += (size_t)r;
-    }
-    buf[n] = '\0';
-    *out = buf; *outlen = n;
-    return 0;
-}
-
-/* Run `/bin/sh -c cmd`; capture stdout AND stderr to EOF via poll().
- * MUST poll both fds simultaneously: draining one pipe fully before the
- * other DEADLOCKS when the first pipe fills (64KB) while the child blocks
- * writing the other.  Returns exit status (or 128+signal on abnormal exit),
- * -1 on fork/pipe failure.  out/err are malloc'd (caller frees). */
-static int run_capture(const char *cmd, char **out, size_t *outlen,
-                       char **err, size_t *errlen) {
-    int po[2], pe[2];
-    if (pipe(po) < 0) return -1;
-    if (pipe(pe) < 0) { close(po[0]); close(po[1]); return -1; }
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(po[0]); close(po[1]); close(pe[0]); close(pe[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        /* Child: NO malloc, NO GC, NO stdio.  Only dup2/close/execl/_exit. */
-        dup2(po[1], STDOUT_FILENO);
-        dup2(pe[1], STDERR_FILENO);
-        close(po[0]); close(po[1]); close(pe[0]); close(pe[1]);
-        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-        _exit(127);
-    }
-    close(po[1]); close(pe[1]);
-
-    size_t ocap = 8192, ecap = 8192, on = 0, en = 0;
-    char *ob = (char *)malloc(ocap), *eb = (char *)malloc(ecap);
-    if (!ob || !eb) {
-        free(ob); free(eb);
-        close(po[0]); close(pe[0]);
-        waitpid(pid, NULL, 0);
-        return -1;
-    }
-    struct pollfd pf[2] = { { po[0], POLLIN, 0 }, { pe[0], POLLIN, 0 } };
-    int openfds = 2;
-    while (openfds > 0) {
-        int rv = poll(pf, 2, -1);
-        if (rv < 0) { if (errno == EINTR) continue; break; }
-        for (int i = 0; i < 2; i++) {
-            if (pf[i].fd < 0) continue;
-            if (!(pf[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
-            char **bp  = i == 0 ? &ob : &eb;
-            size_t *cp  = i == 0 ? &ocap : &ecap;
-            size_t *np  = i == 0 ? &on  : &en;
-            if (*np + 4096 >= *cp) {
-                size_t nc = *cp * 2;
-                char *nb = (char *)realloc(*bp, nc);
-                if (!nb) { close(pf[i].fd); pf[i].fd = -1; openfds--; continue; }
-                *bp = nb; *cp = nc;
-            }
-            ssize_t r = read(pf[i].fd, *bp + *np, 4096);
-            if (r <= 0) { close(pf[i].fd); pf[i].fd = -1; openfds--; continue; }
-            *np += (size_t)r;
-        }
-    }
-    /* Close any fds still open (poll error exit path). */
-    if (pf[0].fd >= 0) close(pf[0].fd);
-    if (pf[1].fd >= 0) close(pf[1].fd);
-    int st = 0; waitpid(pid, &st, 0);
-    ob[on] = '\0'; eb[en] = '\0';
-    *out = ob; *outlen = on; *err = eb; *errlen = en;
-    return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
-}
-
-/* ---- Tagged-value builders (for exec-command/shell-pipe/glob results) ----
+/* ---- Tagged-value builders (for exec-plan/glob results) ----
  * The metacircular interp works with TAGGED values: a list (a b) is
  * [cons [.. a ..] [cons [.. b ..] [cons]]].  These helpers build the tagged
  * forms with correct GC rooting (each intermediate Value is pushed onto the
@@ -1119,6 +1033,740 @@ static Value make_tagged_cons(Value car, Value cdr) {
     return result;
 }
 
+
+/* ------------------------------------------------------------------ */
+/*  exec-plan: native process runner (no /bin/sh)                      */
+/*                                                                    */
+/*  The Shen shell parser (shlex/shparse/shexpand in shell/) produces   */
+/*  command PLAN as a tagged zinc-value tree; this runner decodes it   */
+/*  into malloc'd C structs BEFORE any fork (decode itself performs no */
+/*  GC allocation — strndup/malloc only — so the tagged Value's        */
+/*  interior pointers cannot go stale), then executes it natively with */
+/*  fork/dup2/execvp.  Chains (&&/||/;), pipelines, redirects, and     */
+/*  subshells are evaluated on the C side because a subshell needs a   */
+/*  forked child to re-run the plan body — a forked child must never   */
+/*  touch the GC heap.                                                */
+/*                                                                    */
+/*  Plan encoding (tagged zinc-values; [cons] = empty list,            */
+/*  [cons H T] = 3-element node, T itself a tagged list — the format   */
+/*  demarshal_from_tagged above consumes):                            */
+/*    Program = (list Chain)                                          */
+/*    Chain    = [op Pipeline]    op in {seq,and,or}; first is seq     */
+/*    Pipeline = (list Cmd)                                           */
+/*    Cmd      = [Argv Redirs Sub]                                    */
+/*               Sub = () plain | nested Program (Argv empty then)     */
+/*    Argv     = (list string)    fully expanded                       */
+/*    Redirs   = (list Redir)     source order preserved               */
+/*    Redir    = [op fd target]   op in {in,out,append,dup,hdoc,hstr}  */
+/*               fd in {0,1,2}; target = path/body string, or a        */
+/*               number for dup (target fd, 1 or 2)                    */
+/*                                                                    */
+/*  Capture: stdout+stderr default to two unlinked mkstemp tmpfiles    */
+/*  created once per exec-plan call; every command dup2s them unless   */
+/*  redirected.  All children share one open file description per      */
+/*  stream (shared offset), so sequential outputs concatenate in       */
+/*  order.  Deadlock-free by construction (no pipes to drain).         */
+/* ------------------------------------------------------------------ */
+
+enum { ROP_SEQ = 0, ROP_AND = 1, ROP_OR = 2 };
+enum { RR_IN = 0, RR_OUT = 1, RR_APPEND = 2, RR_DUP = 3, RR_HDOC = 4, RR_HSTR = 5 };
+
+#define PLAN_MAX_CHAINS 256
+#define PLAN_MAX_CMDS   64
+#define PLAN_MAX_ARGS   256
+#define PLAN_MAX_REDIRS 64
+#define PLAN_MAX_DEPTH  32
+
+typedef struct RRedir {
+    int   kind;    /* RR_* */
+    int   fd;      /* 0 / 1 / 2 */
+    char *path;    /* in/out/append target path (owned) */
+    long  dup_fd;  /* RR_DUP: target fd (1 or 2) */
+    char *body;    /* RR_HDOC/RR_HSTR body (owned; hstr carries trailing \n) */
+    int   tmpfd;   /* runtime: pre-opened body tmpfile; -1 until wired */
+} RRedir;
+
+typedef struct RProg RProg;
+
+typedef struct RCmd {
+    char  **argv;   /* NULL-terminated (owned) */
+    int     argc;
+    RRedir *redirs; /* owned array */
+    int     nredir;
+    RProg  *sub;    /* NULL = plain command; else nested program (argc == 0) */
+} RCmd;
+
+typedef struct RPipe { RCmd *cmds; int n; } RPipe;
+typedef struct RChain { int op; RPipe pipe; } RChain;
+struct RProg { RChain *chains; int n; };
+
+static void cmd_free(RCmd *c);
+static void pipe_free(RPipe *pp);
+static void plan_free(RProg *p);
+static int decode_program(Value v, RProg *out, int depth);
+
+/* Tagged-list probes.  The metacircular interp builds [cons A B] as a
+   3-element list (cons . (A . (B . nil))): the tail rides in a singleton
+   wrapper we must unwrap to continue.  tdl_is_empty: 1 = [cons] empty,
+   0 = node, -1 = malformed. */
+static int tdl_is_empty(Value v) {
+    if (v.tag != VAL_CONS) return -1;
+    Value *car = v.cons.car;
+    if (car == NULL || car->tag != VAL_SYMBOL || strcmp(car->sym.name, "cons") != 0)
+        return -1;
+    Value cdr = *v.cons.cdr;
+    if (cdr.tag == VAL_NIL) return 1;
+    if (cdr.tag == VAL_CONS) return 0;
+    return -1;
+}
+
+static int tdl_pop(Value v, Value *head, Value *rest) {
+    if (tdl_is_empty(v) != 0) return -1;
+    Value cdr = *v.cons.cdr;
+    Value t1 = *cdr.cons.cdr;   /* cons(T, nil) singleton wrapper */
+    if (t1.tag != VAL_CONS) return -1;
+    *head = *cdr.cons.car;
+    *rest = *t1.cons.car;
+    return 0;
+}
+
+/* Collect tagged-list elements into a malloc'd Value array (no GC).
+   0 = ok, -1 = malformed / over limit. */
+static int tdl_collect(Value v, Value **out, int *out_n, int limit) {
+    int cap = 8, n = 0;
+    Value *arr = (Value *)malloc((size_t)cap * sizeof(Value));
+    if (!arr) return -1;
+    for (;;) {
+        int e = tdl_is_empty(v);
+        if (e < 0) { free(arr); return -1; }
+        if (e == 1) break;
+        if (n >= limit) { free(arr); return -1; }
+        if (n == cap) {
+            cap *= 2;
+            Value *na = (Value *)realloc(arr, (size_t)cap * sizeof(Value));
+            if (!na) { free(arr); return -1; }
+            arr = na;
+        }
+        if (tdl_pop(v, &arr[n], &v) != 0) { free(arr); return -1; }
+        n++;
+    }
+    *out = arr; *out_n = n;
+    return 0;
+}
+
+static int tdl_len(Value v, int *len) {
+    int n = 0;
+    for (;;) {
+        int e = tdl_is_empty(v);
+        if (e < 0) return -1;
+        if (e == 1) { *len = n; return 0; }
+        Value h;
+        if (tdl_pop(v, &h, &v) != 0) return -1;
+        n++;
+    }
+}
+
+static int tdl_elem(Value v, int idx, Value *out) {
+    Value h;
+    for (int i = 0;; i++) {
+        int e = tdl_is_empty(v);
+        if (e != 0) return -1;    /* malformed or index out of range */
+        if (i == idx) { if (tdl_pop(v, &h, &v) != 0) return -1; *out = h; return 0; }
+        if (tdl_pop(v, &h, &v) != 0) return -1;
+    }
+}
+
+/* Atom decoders: [string S] / [number N] / [symbol X]. */
+static int td_string(Value v, char **out) {
+    if (v.tag != VAL_CONS) return -1;
+    Value *tag = v.cons.car;
+    if (tag == NULL || tag->tag != VAL_SYMBOL || strcmp(tag->sym.name, "string") != 0)
+        return -1;
+    Value cdr = *v.cons.cdr;
+    if (cdr.tag != VAL_CONS) return -1;
+    Value s = *cdr.cons.car;
+    if (s.tag != VAL_STRING) return -1;
+    *out = strndup(s.str.data, (size_t)s.str.len);
+    return *out ? 0 : -1;
+}
+
+static int td_number(Value v, long *out) {
+    if (v.tag != VAL_CONS) return -1;
+    Value *tag = v.cons.car;
+    if (tag == NULL || tag->tag != VAL_SYMBOL || strcmp(tag->sym.name, "number") != 0)
+        return -1;
+    Value cdr = *v.cons.cdr;
+    if (cdr.tag != VAL_CONS) return -1;
+    Value s = *cdr.cons.car;
+    if (s.tag != VAL_NUMBER) return -1;
+    *out = s.number;
+    return 0;
+}
+
+static int td_symbol(Value v, const char **out) {
+    if (v.tag != VAL_CONS) return -1;
+    Value *tag = v.cons.car;
+    if (tag == NULL || tag->tag != VAL_SYMBOL || strcmp(tag->sym.name, "symbol") != 0)
+        return -1;
+    Value cdr = *v.cons.cdr;
+    if (cdr.tag != VAL_CONS) return -1;
+    Value s = *cdr.cons.car;
+    if (s.tag != VAL_SYMBOL) return -1;
+    *out = s.sym.name;
+    return 0;
+}
+
+static void cmd_free(RCmd *c) {
+    if (!c) return;
+    if (c->argv) {
+        for (int i = 0; i < c->argc; i++) free(c->argv[i]);
+        free(c->argv);
+    }
+    if (c->redirs) {
+        for (int i = 0; i < c->nredir; i++) {
+            free(c->redirs[i].path);
+            free(c->redirs[i].body);
+        }
+        free(c->redirs);
+    }
+    if (c->sub) { plan_free(c->sub); free(c->sub); }
+    memset(c, 0, sizeof(*c));
+}
+
+static void pipe_free(RPipe *pp) {
+    if (!pp) return;
+    for (int i = 0; i < pp->n; i++) cmd_free(&pp->cmds[i]);
+    free(pp->cmds);
+    pp->cmds = NULL; pp->n = 0;
+}
+
+static void plan_free(RProg *p) {
+    if (!p) return;
+    for (int i = 0; i < p->n; i++) pipe_free(&p->chains[i].pipe);
+    free(p->chains);
+    p->chains = NULL; p->n = 0;
+}
+
+/* decode_redir: [op fd target].  fd/shape validation mirrors the
+   reference parser: in/hdoc/hstr must target fd 0; out/append/dup fd 1|2;
+   dup target fd must be 1|2; stdin-exclusivity is checked per command in
+   decode_cmd. */
+static int decode_redir(Value v, RRedir *out) {
+    memset(out, 0, sizeof(*out));
+    out->tmpfd = -1;
+    int len;
+    if (tdl_len(v, &len) != 0 || len != 3) return -1;
+    Value opv, fdv, tgv;
+    if (tdl_elem(v, 0, &opv) || tdl_elem(v, 1, &fdv) || tdl_elem(v, 2, &tgv))
+        return -1;
+    const char *op;
+    if (td_symbol(opv, &op) != 0) return -1;
+    long fd;
+    if (td_number(fdv, &fd) != 0) return -1;
+    if (strcmp(op, "in") == 0) out->kind = RR_IN;
+    else if (strcmp(op, "out") == 0) out->kind = RR_OUT;
+    else if (strcmp(op, "append") == 0) out->kind = RR_APPEND;
+    else if (strcmp(op, "dup") == 0) out->kind = RR_DUP;
+    else if (strcmp(op, "hdoc") == 0) out->kind = RR_HDOC;
+    else if (strcmp(op, "hstr") == 0) out->kind = RR_HSTR;
+    else return -1;
+    switch (out->kind) {
+    case RR_IN: case RR_HDOC: case RR_HSTR:
+        if (fd != 0) return -1;
+        out->fd = 0;
+        break;
+    case RR_OUT: case RR_APPEND: case RR_DUP:
+        if (fd != 1 && fd != 2) return -1;
+        out->fd = (int)fd;
+        break;
+    default: return -1;
+    }
+    if (out->kind == RR_DUP) {
+        long dfd;
+        if (td_number(tgv, &dfd) != 0) return -1;
+        if (dfd != 1 && dfd != 2) return -1;
+        out->dup_fd = dfd;
+        return 0;
+    }
+    char *s = NULL;
+    if (td_string(tgv, &s) != 0) return -1;
+    if (out->kind == RR_HDOC) {
+        out->body = s;
+    } else if (out->kind == RR_HSTR) {
+        size_t l = strlen(s);
+        char *b = (char *)malloc(l + 2);
+        if (!b) { free(s); return -1; }
+        memcpy(b, s, l);
+        b[l] = '\n'; b[l + 1] = '\0';
+        free(s);
+        out->body = b;
+    } else {
+        out->path = s;
+    }
+    return 0;
+}
+
+static int decode_cmd(Value v, RCmd *out, int depth) {
+    memset(out, 0, sizeof(*out));
+    int len;
+    if (tdl_len(v, &len) != 0 || len != 3) return -1;
+    Value argvv, redirsv, subv;
+    if (tdl_elem(v, 0, &argvv) || tdl_elem(v, 1, &redirsv) || tdl_elem(v, 2, &subv))
+        return -1;
+    /* argv: (list string) */
+    Value *els = NULL; int n = 0;
+    if (tdl_collect(argvv, &els, &n, PLAN_MAX_ARGS) != 0) return -1;
+    out->argv = (char **)calloc((size_t)n + 1, sizeof(char *));
+    if (!out->argv) { free(els); return -1; }
+    for (int i = 0; i < n; i++) {
+        if (td_string(els[i], &out->argv[i]) != 0) {
+            out->argc = i; free(els); cmd_free(out); return -1;
+        }
+        out->argc = i + 1;
+    }
+    free(els);
+    /* redirs: (list Redir), source order */
+    if (tdl_collect(redirsv, &els, &n, PLAN_MAX_REDIRS) != 0) { cmd_free(out); return -1; }
+    out->redirs = (RRedir *)calloc((size_t)(n > 0 ? n : 1), sizeof(RRedir));
+    if (!out->redirs) { free(els); cmd_free(out); return -1; }
+    for (int i = 0; i < n; i++) {
+        if (decode_redir(els[i], &out->redirs[i]) != 0) {
+            out->nredir = i; free(els); cmd_free(out); return -1;
+        }
+        out->nredir = i + 1;
+    }
+    free(els);
+    /* sub: () plain | nested Program (requires empty argv) */
+    int e = tdl_is_empty(subv);
+    if (e < 0) { cmd_free(out); return -1; }
+    if (e == 1) {
+        if (out->argc == 0) { cmd_free(out); return -1; }  /* empty command */
+    } else {
+        if (out->argc != 0) { cmd_free(out); return -1; }  /* subshell cmd carries no argv */
+        if (depth >= PLAN_MAX_DEPTH) { cmd_free(out); return -1; }
+        out->sub = (RProg *)malloc(sizeof(RProg));
+        if (!out->sub) { cmd_free(out); return -1; }
+        if (decode_program(subv, out->sub, depth + 1) != 0) { cmd_free(out); return -1; }
+    }
+    /* stdin exclusivity (reference parser: 'Multiple stdin redirects') */
+    int nstdin = 0;
+    for (int i = 0; i < out->nredir; i++)
+        if (out->redirs[i].fd == 0) nstdin++;
+    if (nstdin > 1) { cmd_free(out); return -1; }
+    return 0;
+}
+
+static int decode_pipeline(Value v, RPipe *out, int depth) {
+    memset(out, 0, sizeof(*out));
+    Value *els = NULL; int n = 0;
+    if (tdl_collect(v, &els, &n, PLAN_MAX_CMDS) != 0) return -1;
+    if (n == 0) { free(els); return -1; }   /* a pipeline needs >= 1 command */
+    out->cmds = (RCmd *)calloc((size_t)n, sizeof(RCmd));
+    if (!out->cmds) { free(els); return -1; }
+    for (int i = 0; i < n; i++) {
+        if (decode_cmd(els[i], &out->cmds[i], depth) != 0) {
+            out->n = i; free(els); pipe_free(out); return -1;
+        }
+        out->n = i + 1;
+    }
+    free(els);
+    return 0;
+}
+
+static int decode_chain(Value v, RChain *out, int depth) {
+    memset(out, 0, sizeof(*out));
+    int len;
+    if (tdl_len(v, &len) != 0 || len != 2) return -1;
+    Value opv, pipev;
+    if (tdl_elem(v, 0, &opv) || tdl_elem(v, 1, &pipev)) return -1;
+    const char *op;
+    if (td_symbol(opv, &op) != 0) return -1;
+    if (strcmp(op, "seq") == 0) out->op = ROP_SEQ;
+    else if (strcmp(op, "and") == 0) out->op = ROP_AND;
+    else if (strcmp(op, "or") == 0) out->op = ROP_OR;
+    else return -1;
+    if (decode_pipeline(pipev, &out->pipe, depth) != 0) return -1;
+    return 0;
+}
+
+static int decode_program(Value v, RProg *out, int depth) {
+    memset(out, 0, sizeof(*out));
+    Value *els = NULL; int n = 0;
+    if (tdl_collect(v, &els, &n, PLAN_MAX_CHAINS) != 0) return -1;
+    out->chains = (RChain *)calloc((size_t)(n > 0 ? n : 1), sizeof(RChain));
+    if (!out->chains) { free(els); return -1; }
+    for (int i = 0; i < n; i++) {
+        if (decode_chain(els[i], &out->chains[i], depth) != 0) {
+            out->n = i; free(els); plan_free(out); return -1;
+        }
+        out->n = i + 1;
+    }
+    free(els);
+    return 0;
+}
+
+/* plan_decode: tagged plan tree -> C structs.  Malformed input from our
+   own parser is an always-on vm_throw. */
+static int plan_decode(Value v, RProg *out) {
+    return decode_program(v, out, 0);
+}
+
+/* ---- child-side helpers (write() only — NO stdio, NO GC; execvp's
+   internal malloc is fine: single-threaded child, C data only) ---- */
+
+static void child_w2(const char *a, const char *b, const char *c) {
+    if (a) (void)!write(2, a, strlen(a));
+    if (b) (void)!write(2, b, strlen(b));
+    if (c) (void)!write(2, c, strlen(c));
+}
+
+/* open_body_tmpfile: write body to an unlinked tmpfile, rewind.  Called
+   parent-side, pre-fork (and re-entrant from a subshell child, which may
+   safely open files).  -1 on failure. */
+static int open_body_tmpfile(const char *body) {
+    char tmpl[] = "/tmp/shensh-hdoc.XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return -1;
+    unlink(tmpl);
+    size_t n = strlen(body), off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, body + off, n - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            close(fd); return -1;
+        }
+        off += (size_t)w;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+/* apply_redirects: sequential left-to-right dup2 application gives POSIX
+   semantics directly (2>&1 before >file snapshots the old stdout into
+   fd 2; no lookahead needed).  Open failure: write(2) + return -1
+   (caller _exit(1)). */
+static int apply_redirects(RCmd *c) {
+    for (int i = 0; i < c->nredir; i++) {
+        RRedir *r = &c->redirs[i];
+        switch (r->kind) {
+        case RR_IN: {
+            int fd = open(r->path, O_RDONLY);
+            if (fd < 0) {
+                child_w2("Input redirect file not found: ", r->path, "\n");
+                return -1;
+            }
+            if (dup2(fd, r->fd) < 0) { close(fd); return -1; }
+            close(fd);
+            break;
+        }
+        case RR_OUT:
+        case RR_APPEND: {
+            int fd = open(r->path,
+                          O_WRONLY | O_CREAT | (r->kind == RR_APPEND ? O_APPEND : O_TRUNC),
+                          0666);
+            if (fd < 0) {
+                child_w2("Output redirect failed: ", r->path, "\n");
+                return -1;
+            }
+            if (dup2(fd, r->fd) < 0) { close(fd); return -1; }
+            close(fd);
+            break;
+        }
+        case RR_DUP:
+            if (dup2((int)r->dup_fd, r->fd) < 0) return -1;
+            break;
+        case RR_HDOC:
+        case RR_HSTR:
+            if (dup2(r->tmpfd, r->fd) < 0) return -1;
+            close(r->tmpfd);
+            r->tmpfd = -1;   /* consumed (an in-process caller skips it on close) */
+            break;
+        default:
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* child_builtin: builtins runnable INSIDE pipeline/subshell children.
+   Writes to fd 1/2 (already redirected).  Returns exit code, or -1 when
+   argv[0] is not a builtin. */
+static int child_builtin(int argc, char **argv) {
+    if (argc == 0 || !argv[0]) return -1;
+    const char *a0 = argv[0];
+    if (strcmp(a0, "echo") == 0) {
+        int i = 1, nl = 1;
+        if (i < argc && strcmp(argv[i], "-n") == 0) { nl = 0; i++; }
+        int first = i;
+        for (; i < argc; i++) {
+            if (i > first) (void)!write(1, " ", 1);
+            (void)!write(1, argv[i], strlen(argv[i]));
+        }
+        if (nl) (void)!write(1, "\n", 1);
+        return 0;
+    }
+    if (strcmp(a0, "true") == 0) return 0;
+    if (strcmp(a0, "false") == 0) return 1;
+    if (strcmp(a0, ":") == 0) return 0;
+    if (strcmp(a0, "cd") == 0) {
+        const char *dir = argc > 1 ? argv[1] : getenv("HOME");
+        if (!dir || !*dir) dir = "/";
+        if (chdir(dir) != 0) {
+            child_w2("cd: ", dir, "\n");
+            return 1;
+        }
+        return 0;
+    }
+    if (strcmp(a0, "pwd") == 0) {
+        char buf[4096];
+        if (getcwd(buf, sizeof(buf))) {
+            size_t l = strlen(buf);
+            (void)!write(1, buf, l);
+            (void)!write(1, "\n", 1);
+            return 0;
+        }
+        (void)!write(2, "pwd: cannot get cwd\n", 20);
+        return 1;
+    }
+    return -1;
+}
+
+/* is argv[0] a child-builtin name (exact match — no path components)?
+   Peek only, no side effects; used to decide in-process execution. */
+static int is_child_builtin(const char *a0) {
+    if (!a0) return 0;
+    return strcmp(a0, "echo") == 0 || strcmp(a0, "true") == 0 ||
+           strcmp(a0, "false") == 0 || strcmp(a0, ":") == 0 ||
+           strcmp(a0, "cd") == 0 || strcmp(a0, "pwd") == 0;
+}
+
+/* run_builtin_inprocess: execute a builtin command IN THE CURRENT process
+   with fds 0/1/2 saved and restored around it — POSIX simple-command
+   semantics for builtins inside a subshell: (cd /; pwd) must let the cd
+   affect the subshell process so the following pwd sees it.  Only ever
+   called with in_child==1 (a forked, disposable subshell child);
+   the parent exec-plan path forks instead, so the Shen VM process is
+   never mutated.  Returns the builtin's exit code, 1 on redirect failure,
+   -1 on resource failure. */
+static int run_builtin_inprocess(RCmd *c, int outfd, int errfd) {
+    int sav0 = dup(0), sav1 = dup(1), sav2 = dup(2);
+    if (sav0 < 0 || sav1 < 0 || sav2 < 0) {
+        if (sav0 >= 0) close(sav0);
+        if (sav1 >= 0) close(sav1);
+        if (sav2 >= 0) close(sav2);
+        return -1;
+    }
+    int rc;
+    dup2(outfd, STDOUT_FILENO);
+    dup2(errfd, STDERR_FILENO);
+    if (apply_redirects(c) < 0)
+        rc = 1;
+    else {
+        rc = child_builtin(c->argc, c->argv);
+        if (rc < 0) rc = 127;   /* caller pre-checked; defensive */
+    }
+    dup2(sav0, STDIN_FILENO);  close(sav0);
+    dup2(sav1, STDOUT_FILENO); close(sav1);
+    dup2(sav2, STDERR_FILENO); close(sav2);
+    return rc;
+}
+
+static void close_cmd_tmpfds(RCmd *c) {
+    for (int i = 0; i < c->nredir; i++) {
+        int fd = c->redirs[i].tmpfd;
+        if (fd >= 0) { close(fd); c->redirs[i].tmpfd = -1; }
+    }
+}
+
+static void close_pipe_tmpfds(const RPipe *pp) {
+    for (int i = 0; i < pp->n; i++) close_cmd_tmpfds(&pp->cmds[i]);
+}
+
+/* wire_pipe_tmpfds: pre-open heredoc/herestring bodies parent-side.
+   0 = ok, -1 = tmpfile failure (already-opened fds stay owned by the
+   RRedir fields; the caller closes them via close_pipe_tmpfds). */
+static int wire_pipe_tmpfds(const RPipe *pp) {
+    for (int j = 0; j < pp->n; j++)
+        for (int k = 0; k < pp->cmds[j].nredir; k++) {
+            RRedir *r = &pp->cmds[j].redirs[k];
+            if (r->kind == RR_HDOC || r->kind == RR_HSTR) {
+                r->tmpfd = open_body_tmpfile(r->body);
+                if (r->tmpfd < 0) return -1;
+            }
+        }
+    return 0;
+}
+
+static int wait_status_code(int st) {
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+}
+
+static int run_program(const RProg *prog, int outfd, int errfd, int in_child);
+
+/* run_pipeline: subshell (single Cmd with sub) -> fork + recursive
+   run_program; single builtin inside a CHILD process -> in-process (POSIX
+   simple-command semantics: (cd /; pwd) needs the cd to affect the
+   subshell); else N children with N-1 pipes.  Exit = LAST stage (POSIX).
+   Returns exit code, or -1 on resource failure. */
+static int run_pipeline(const RPipe *pp, int outfd, int errfd, int in_child) {
+    int n = pp->n;
+
+    /* Subshell: one Cmd carrying a nested program (Argv empty). */
+    if (n == 1 && pp->cmds[0].sub) {
+        RCmd *c = &pp->cmds[0];
+        if (wire_pipe_tmpfds(pp) != 0) { close_pipe_tmpfds(pp); return -1; }
+        pid_t pid = fork();
+        if (pid < 0) { close_pipe_tmpfds(pp); return -1; }
+        if (pid == 0) {
+            dup2(outfd, STDOUT_FILENO);
+            dup2(errfd, STDERR_FILENO);
+            if (apply_redirects(c) < 0) _exit(1);
+            /* The subshell's own redirects already bound fd 1/2; drop the
+               capture originals (they'd leak into exec'd grandchildren and
+               restore the tmpfile onto fd 1, undoing a subshell redirect). */
+            if (outfd > 2) close(outfd);
+            if (errfd > 2 && errfd != outfd) close(errfd);
+            _exit(run_program(c->sub, STDOUT_FILENO, STDERR_FILENO, 1));
+        }
+        close_pipe_tmpfds(pp);
+        int st;
+        waitpid(pid, &st, 0);
+        return wait_status_code(st);
+    }
+
+    /* Single builtin inside a forked child (subshell body):
+       run it in-process so stateful builtins (cd) affect the child shell
+       process, with fds 0/1/2 saved and restored.  Never reached from the
+       parent exec-plan path (in_child == 0 there forks instead). */
+    if (in_child && n == 1 && !pp->cmds[0].sub &&
+        is_child_builtin(pp->cmds[0].argv[0])) {
+        if (wire_pipe_tmpfds(pp) != 0) { close_pipe_tmpfds(pp); return -1; }
+        int rc = run_builtin_inprocess(&pp->cmds[0], outfd, errfd);
+        close_cmd_tmpfds(&pp->cmds[0]);
+        return rc;
+    }
+
+    /* Pre-open heredoc tmpfiles (parent side, pre-fork). */
+    if (wire_pipe_tmpfds(pp) != 0) { close_pipe_tmpfds(pp); return -1; }
+
+    int pfds[2 * PLAN_MAX_CMDS];
+    int npipes = n - 1;
+    for (int i = 0; i < npipes; i++)
+        if (pipe(&pfds[2 * i]) < 0) {
+            for (int j = 0; j < i; j++) { close(pfds[2 * j]); close(pfds[2 * j + 1]); }
+            close_pipe_tmpfds(pp);
+            return -1;
+        }
+
+    pid_t pids[PLAN_MAX_CMDS];
+    int forked = 0, fork_fail = 0;
+    for (int i = 0; i < n; i++) {
+        pid_t pid = fork();
+        if (pid < 0) { fork_fail = 1; break; }
+        if (pid == 0) {
+            RCmd *c = &pp->cmds[i];
+            /* CHILD ORDER (critical):
+               1. dup2 defaults (stdout->outfd, stderr->errfd; stdin inherited)
+               2. pipe wiring (stdin <- prev read end; stdout -> this write end)
+               3. close ALL pipe fds + other stages' heredoc tmpfds
+               4. apply_redirects (left-to-right)
+               5. subshell re-entry | child builtin | execvp
+            */
+            dup2(outfd, STDOUT_FILENO);
+            dup2(errfd, STDERR_FILENO);
+            if (i > 0) dup2(pfds[2 * (i - 1)], STDIN_FILENO);
+            if (i < n - 1) dup2(pfds[2 * i + 1], STDOUT_FILENO);
+            for (int j = 0; j < 2 * npipes; j++) close(pfds[j]);
+            for (int j = 0; j < n; j++)
+                if (j != i) close_cmd_tmpfds(&pp->cmds[j]);
+            if (apply_redirects(c) < 0) _exit(1);
+            if (c->sub) {
+                if (outfd > 2) close(outfd);
+                if (errfd > 2 && errfd != outfd) close(errfd);
+                _exit(run_program(c->sub, STDOUT_FILENO, STDERR_FILENO, 1));
+            }
+            /* exec path: the capture originals are dup'd onto 1/2 (or about
+               to be redirected); drop them so they don't leak into execvp. */
+            if (outfd > 2) close(outfd);
+            if (errfd > 2 && errfd != outfd) close(errfd);
+            int bcode = child_builtin(c->argc, c->argv);
+            if (bcode >= 0) _exit(bcode);
+            execvp(c->argv[0], c->argv);
+            if (errno == ENOENT) {
+                child_w2("shensh: ", c->argv[0], ": not found\n");
+                _exit(127);
+            }
+            child_w2("shensh: ", c->argv[0], ": cannot execute\n");
+            _exit(126);
+        }
+        pids[i] = pid;
+        forked++;
+    }
+
+    /* Parent: close every fd it opened. */
+    for (int j = 0; j < 2 * npipes; j++) close(pfds[j]);
+    close_pipe_tmpfds(pp);
+
+    if (fork_fail) {
+        for (int i = 0; i < forked; i++) {
+            kill(pids[i], SIGKILL);
+            waitpid(pids[i], NULL, 0);
+        }
+        return -1;
+    }
+
+    int exit_code = 0;
+    for (int i = 0; i < n; i++) {
+        int st;
+        waitpid(pids[i], &st, 0);
+        if (i == n - 1) exit_code = wait_status_code(st);
+    }
+    return exit_code;
+}
+
+/* run_program: chains with &&/||/; short-circuit.  op says how THIS
+   segment combines with the previous one (first is seq).  in_child marks
+   execution inside a forked child (subshell body), where
+   single-builtin pipelines run in-process (POSIX semantics for builtins).
+   Returns exit code, or -1 on resource failure. */
+static int run_program(const RProg *prog, int outfd, int errfd, int in_child) {
+    int last = 0;
+    for (int i = 0; i < prog->n; i++) {
+        const RChain *ch = &prog->chains[i];
+        if (i > 0) {
+            if (ch->op == ROP_AND && last != 0) continue;
+            if (ch->op == ROP_OR && last == 0) continue;
+        }
+        int code = run_pipeline(&ch->pipe, outfd, errfd, in_child);
+        if (code < 0) return -1;
+        last = code;
+    }
+    return last;
+}
+
+/* slurp_fd: lseek(0) + read a captured tmpfile to EOF.  malloc'd buffer
+   (caller frees), or NULL on failure (*outlen = 0). */
+static char *slurp_fd(int fd, size_t *outlen) {
+    size_t cap = 8192, n = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { *outlen = 0; return NULL; }
+    if (lseek(fd, 0, SEEK_SET) < 0) { free(buf); *outlen = 0; return NULL; }
+    for (;;) {
+        if (n + 4096 >= cap) {
+            size_t nc = cap * 2;
+            char *nb = (char *)realloc(buf, nc);
+            if (!nb) { free(buf); *outlen = 0; return NULL; }
+            buf = nb; cap = nc;
+        }
+        ssize_t r = read(fd, buf + n, 4096);
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        if (r == 0) break;
+        n += (size_t)r;
+    }
+    buf[n] = '\0';
+    *outlen = n;
+    return buf;
+}
 /* exec_primitive: dispatch a C primitive by name.
  *
  * Audit note (4a.6): several primitives here pop a Value from the stack,
@@ -1441,24 +2089,50 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             Value a = va_pop(stack);
             *acc = val_boolean(a.tag == VAL_NIL); return 0;
         }
-        /* exec-command: run `/bin/sh -c Cmd`, capture stdout+stderr to EOF.
-           Returns a TAGGED list [exit-code stdout stderr] for the interp.
-           Uses poll() to drain both pipes simultaneously — sequential reads
-           deadlock when one pipe fills (64KB) while the child blocks on the
-           other.  Result is built with make_tagged_* helpers; the 6 outer
-           roots keep each tagged piece alive across the next helper's
-           allocations. */
-        if (strcmp(name, "exec-command") == 0) {
-            Value cmd = va_pop(stack);
-            if (cmd.tag != VAL_STRING) vm_throw("exec-command: command must be a string");
-            char *c = strndup(cmd.str.data, cmd.str.len);
-            char *out, *err; size_t ol, el;
-            int code = run_capture(c, &out, &ol, &err, &el);
-            free(c);
-            if (code < 0) vm_throw("exec-command: fork/pipe failed");
-            Value tag_out = make_tagged_string(out, (int)ol);
+        /* exec-plan: run a decoded command PLAN natively (fork/dup2/execvp,
+           no /bin/sh).  Plan arrives as ONE tagged zinc-value argument (see
+           the plan-runner section above for the encoding).  stdout+stderr
+           default to two unlinked tmpfiles; the result is the TAGGED
+           [exit stdout stderr] list built with the make_tagged_* helpers
+           (rooted across each helper's allocations).  The plan Value is
+           rooted once at entry and popped
+           on every path (decode/run themselves perform no GC allocation). */
+        if (strcmp(name, "exec-plan") == 0) {
+            Value plan = va_pop(stack);
+            gc_root_push_value(&plan);
+            RProg prog;
+            memset(&prog, 0, sizeof(prog));
+            if (plan_decode(plan, &prog) != 0) {
+                plan_free(&prog);
+                gc_root_pop();
+                vm_throw("exec-plan: malformed plan");
+            }
+            char otmpl[] = "/tmp/shensh-out.XXXXXX";
+            char etmpl[] = "/tmp/shensh-err.XXXXXX";
+            int outfd = mkstemp(otmpl);
+            int errfd = outfd >= 0 ? mkstemp(etmpl) : -1;
+            if (outfd < 0 || errfd < 0) {
+                if (outfd >= 0) { close(outfd); unlink(otmpl); }
+                if (errfd >= 0) { close(errfd); unlink(etmpl); }
+                plan_free(&prog);
+                gc_root_pop();
+                vm_throw("exec-plan: tmpfile failed");
+            }
+            unlink(otmpl); unlink(etmpl);
+            int code = run_program(&prog, outfd, errfd, 0);
+            plan_free(&prog);
+            if (code < 0) {
+                close(outfd); close(errfd);
+                gc_root_pop();
+                vm_throw("exec-plan: fork/pipe failed");
+            }
+            size_t ol = 0, el = 0;
+            char *out = slurp_fd(outfd, &ol);
+            char *err = slurp_fd(errfd, &el);
+            close(outfd); close(errfd);
+            Value tag_out = make_tagged_string(out ? out : "", (int)ol);
             gc_root_push_value(&tag_out);
-            Value tag_err = make_tagged_string(err, (int)el);
+            Value tag_err = make_tagged_string(err ? err : "", (int)el);
             gc_root_push_value(&tag_err);
             Value empty = make_tagged_nil();
             gc_root_push_value(&empty);
@@ -1471,6 +2145,7 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             Value final = make_tagged_cons(tag_code, out_list);
             gc_root_pop(); gc_root_pop(); gc_root_pop();
             gc_root_pop(); gc_root_pop(); gc_root_pop();
+            gc_root_pop();   /* plan */
             free(out); free(err);
             *acc = final; return 0;
         }
@@ -1889,138 +2564,6 @@ int exec_primitive(const char *name, Value *acc, ValueArray *stack) {
             Value result; memset(&result, 0, sizeof(result));
             result.tag = VAL_STRING; result.str.data = buf; result.str.len = n;
             *acc = result; return 0;
-        }
-        /* shell-pipe: [Cmd1 Cmd2 ...] -> [exit output] (TAGGED). N children,
-           N-1 pipes, each stage `/bin/sh -c` so per-stage redirects come free.
-           Exit = LAST stage (POSIX). Walks the tagged list extracting C
-           strings (no GC during extraction — strndup is C-heap), then forks
-           the pipeline.  The capture pipe (last stage stdout) is drained via
-           drain_fd (single fd, no poll needed). */
-        if (strcmp(name, "shell-pipe") == 0) {
-            Value lst = va_pop(stack);
-            /* Extract C strings from the tagged list [cons [string S] ... [cons]].
-               The interp builds [cons A B] as a 3-element list (cons . (A . (B . nil))),
-               so the cdr tail is val_cons(next_tagged, nil) — a singleton we must
-               unwrap to continue.  The built-in test uses the older dotted format
-               (cons . (A . B)) where tail IS the next tagged cons directly.  Handle
-               both by checking whether the tail's car is itself a [cons ...] form. */
-            char *cmds[64]; int n = 0;
-            Value cur = lst;
-            while (cur.tag == VAL_CONS && n < 64) {
-                Value *car = cur.cons.car;
-                if (car->tag != VAL_SYMBOL || strcmp(car->sym.name, "cons") != 0) break;
-                Value cdr = *cur.cons.cdr;
-                if (cdr.tag == VAL_NIL) break;  /* [cons] = empty list, done */
-                if (cdr.tag != VAL_CONS) break;
-                Value elem = *cdr.cons.car;      /* [string S] */
-                Value tail = *cdr.cons.cdr;      /* singleton-wrapped rest, or rest directly */
-                if (elem.tag != VAL_CONS) break;
-                Value *etag = elem.cons.car;
-                if (etag->tag != VAL_SYMBOL || strcmp(etag->sym.name, "string") != 0)
-                    vm_throw("shell-pipe: list elements must be strings");
-                Value ecdr = *elem.cons.cdr;
-                Value s = *ecdr.cons.car;
-                if (s.tag != VAL_STRING) vm_throw("shell-pipe: list elements must be strings");
-                cmds[n++] = strndup(s.str.data, s.str.len);
-                if (tail.tag == VAL_NIL) break;
-                if (tail.tag != VAL_CONS) break;
-                /* Interp format: tail = val_cons(next_tagged_cons, nil) — unwrap it.
-                   Old format:    tail = next_tagged_cons directly. */
-                Value nxt = *tail.cons.car;
-                if (nxt.tag == VAL_CONS && nxt.cons.car->tag == VAL_SYMBOL &&
-                    strcmp(nxt.cons.car->sym.name, "cons") == 0)
-                    cur = nxt;
-                else
-                    cur = tail;
-            }
-            if (n == 0) {
-                vm_throw("shell-pipe: empty command list");
-            }
-            /* Set up pipeline: N-1 stage pipes + 1 capture pipe */
-            int stage_pipes[128];  /* n-1 pipes, 2 fds each */
-            int cap[2];
-            int n_pipes = n - 1;
-            int pipe_ok = 1;
-            for (int i = 0; i < n_pipes && pipe_ok; i++) {
-                if (pipe(&stage_pipes[2*i]) < 0) pipe_ok = 0;
-            }
-            if (pipe_ok && pipe(cap) < 0) pipe_ok = 0;
-            if (!pipe_ok) {
-                for (int i = 0; i < n_pipes; i++) {
-                    close(stage_pipes[2*i]); close(stage_pipes[2*i+1]);
-                }
-                for (int i = 0; i < n; i++) free(cmds[i]);
-                vm_throw("shell-pipe: pipe failed");
-            }
-            pid_t pids[64];
-            int fork_fail = 0;
-            for (int i = 0; i < n; i++) {
-                pid_t pid = fork();
-                if (pid < 0) { fork_fail = 1; break; }
-                if (pid == 0) {
-                    /* Child: NO malloc, NO GC, NO stdio. */
-                    if (i > 0) dup2(stage_pipes[2*(i-1)], STDIN_FILENO);
-                    if (i < n - 1) dup2(stage_pipes[2*i + 1], STDOUT_FILENO);
-                    else dup2(cap[1], STDOUT_FILENO);
-                    for (int j = 0; j < 2*n_pipes; j++) close(stage_pipes[j]);
-                    close(cap[0]); close(cap[1]);
-                    execl("/bin/sh", "sh", "-c", cmds[i], (char *)NULL);
-                    _exit(127);
-                }
-                pids[i] = pid;
-            }
-            /* Parent: close all pipe ends */
-            for (int i = 0; i < 2*n_pipes; i++) close(stage_pipes[i]);
-            close(cap[1]);
-            if (fork_fail) {
-                close(cap[0]);
-                for (int i = 0; i < n; i++) {
-                    if (pids[i] > 0) { kill(pids[i], SIGKILL); waitpid(pids[i], NULL, 0); }
-                }
-                for (int i = 0; i < n; i++) free(cmds[i]);
-                vm_throw("shell-pipe: fork failed");
-            }
-            /* Drain capture pipe */
-            char *out = NULL; size_t ol = 0;
-            drain_fd(cap[0], &out, &ol);
-            close(cap[0]);
-            /* Wait for all children; exit = LAST stage */
-            int exit_code = 0;
-            for (int i = 0; i < n; i++) {
-                int st;
-                waitpid(pids[i], &st, 0);
-                if (i == n - 1)
-                    exit_code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
-            }
-            for (int i = 0; i < n; i++) free(cmds[i]);
-            /* Build tagged result: [cons [number exit] [cons [string out] [cons]]] */
-            Value tag_out = make_tagged_string(out, (int)ol);
-            gc_root_push_value(&tag_out);
-            Value empty = make_tagged_nil();
-            gc_root_push_value(&empty);
-            Value out_list = make_tagged_cons(tag_out, empty);
-            gc_root_push_value(&out_list);
-            Value tag_code = make_tagged_number(exit_code);
-            gc_root_push_value(&tag_code);
-            Value final = make_tagged_cons(tag_code, out_list);
-            gc_root_pop(); gc_root_pop(); gc_root_pop(); gc_root_pop();
-            free(out);
-            *acc = final; return 0;
-        }
-        /* spawn: Cmd -> pid (raw number; interp rule wraps [number ...]).
-           Child inherits stdio.  No allocations between fork and execl. */
-        if (strcmp(name, "spawn") == 0) {
-            Value cmd = va_pop(stack);
-            if (cmd.tag != VAL_STRING) vm_throw("spawn: command must be a string");
-            char *c = strndup(cmd.str.data, cmd.str.len);
-            pid_t pid = fork();
-            if (pid < 0) { free(c); vm_throw("spawn: fork failed"); }
-            if (pid == 0) {
-                execl("/bin/sh", "sh", "-c", c, (char *)NULL);
-                _exit(127);
-            }
-            free(c);
-            *acc = val_number(pid); return 0;
         }
         /* setenv: Name Val -> true (raw boolean; interp rule wraps [boolean ...]).
            ZINC RTL: a1 = leftmost = Name (popped FIRST), a2 = Val. */

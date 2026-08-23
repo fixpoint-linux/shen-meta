@@ -1,4 +1,4 @@
-.PHONY: all vm test bundle pipeline interp setup clean gate gcdebug gc-verify qbe-gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qberepl qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test gen-symbol-static shensh
+.PHONY: all vm test bundle pipeline interp setup clean gate gcdebug gc-verify qbe-gc-verify tc-hm tc-hm-self tc-hm-tests gen-prims gen-qbe-subset qbe-tool qberun qberepl qbe-smoke qbe-gen qbe-gen-prims qbe-test diff-test gen-symbol-static shensh shensh-test shpar-verify
 
 SHEN   = vendor/shen-scheme/bin/shen-scheme
 CFLAGS = -Wall -Wextra -O2 -I vm
@@ -91,6 +91,34 @@ test-asan: zinctest-asan
 	./zinctest-asan
 
 gate: test test-asan
+
+# shensh-test: end-to-end tests for the shensh shell — feeds shell command
+# lines through the real REPL (stdin pipe) and checks quoting, field
+# splitting, redirections (incl. the 2>&1 >file ordering), pipelines,
+# chains, subshell cd isolation, the heredoc sh-continue protocol, and the
+# v1 rejects.  See tools/shensh-e2e.sh.  Needs globals.csexp (built on
+# demand via bundle).
+shensh-test: shensh
+	@if [ ! -f globals.csexp ]; then $(MAKE) bundle; fi
+	bash tools/shensh-e2e.sh
+
+# shpar-verify: prove /bin/sh is fully removed from the VM sources.  The
+# grep matches the execl call form specifically; zero matches passes, any
+# match fails the gate with the offending sites listed.
+shpar-verify:
+	@rc=0; for f in vm/zincvm.c vm/shensh.c; do \
+		n=$$(grep -c 'execl.*bin/sh' $$f 2>/dev/null || true); \
+		if [ "$$n" != "0" ]; then \
+			echo "shpar-verify: FAIL: $$n execl(/bin/sh) site(s) in $$f:"; \
+			grep -n 'execl.*bin/sh' $$f || true; \
+			rc=1; \
+		fi; \
+	done; \
+	if [ $$rc -eq 0 ]; then \
+		echo "shpar-verify: OK — zero execl(/bin/sh) sites in vm/zincvm.c vm/shensh.c"; \
+	fi; \
+	exit $$rc
+
 
 asan: zinctest-asan
 	./zinctest-asan globals.csexp

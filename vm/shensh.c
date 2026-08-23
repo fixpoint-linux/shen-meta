@@ -11,6 +11,14 @@
  * statics (meta_repl, read_stdin_line, print_shen, call_closure1, etc.)
  * are not reachable from a second translation unit.
  *
+ * Boot: shensh.c boots globals.csexp, initialises the bundled HM checker
+ * (tc-hm-init), then loads the shell in dependency order —
+ * shell/shlex.shen, shell/shparse.shen, shell/shexpand.shen,
+ * shell/shell.shen — each via shen_load_source (read -> HM-check ->
+ * compile -> interp-eval into namespace 2).  Command lines are parsed and
+ * expanded in Shen and executed by the C exec-plan primitive (fork/dup2/
+ * execvp); /bin/sh is never invoked anywhere.
+ *
  * No change to zincvm.c/gc.c runtime semantics: this is a NEW TU linked
  * only into the shensh binary, and it does not touch the native zincvm.
  */
@@ -140,6 +148,22 @@ static void print_shen(Value v) {
     printf("%s\n", pbuf);
     fflush(stdout);
     free(pbuf);
+}
+
+/* ---- print_raw_string (shpar-p2 U5) --------------------------------------
+ * Print a VAL_STRING result RAW — fwrite the exact bytes, no quotes or
+ * escaping: shell command output must appear exactly as the child wrote it
+ * (this REPLACES quoted print_shen for command output; print_shen stays
+ * for errors and non-string results).  When ensure_nl is set and the
+ * output is non-empty without a trailing newline, one is added (the REPL
+ * is line-oriented).  The prompt path passes ensure_nl=0 so the prompt
+ * and the user's typed input share a line. */
+static void print_raw_string_ex(Value v, int ensure_nl) {
+    if (v.tag != VAL_STRING) { print_shen(v); return; }
+    if (v.str.len > 0) fwrite(v.str.data, 1, v.str.len, stdout);
+    if (ensure_nl && v.str.len > 0 && v.str.data[v.str.len - 1] != '\n')
+        fputc('\n', stdout);
+    fflush(stdout);
 }
 
 /* ---- read_stdin_line (zincvm.c:3060) -----------------------------------
@@ -327,14 +351,25 @@ static Value eval_kl_form(Value form) {
  *   Returns a symbol result ('loaded' on success, or an error symbol/Value);
  *   individual form failures are tolerated (each interp-eval is independent). */
 static Value shen_load_source_ex(const char *path, int verbose) {
-    /* stage 0: type-check the whole file (type-check by default).  tc-hm-file
-       re-reads via shen-read-file internally; we just call it with the path.
+    /* stage 0: read the file into forms ONCE, then type-check.  (Previously
+       tc-hm-file read the file internally and stage 1 below read it AGAIN;
+       the second shen-read-file call was observed truncating the form list
+       for some inputs — heap-state-dependent corruption in the native read
+       path — while the first read in the pair is always clean.  Read once,
+       then hand the SAME forms list to the type checker (tc-hm-forms) and
+       the compiler (shen->kl-forms).)
        When verbose is set (the `shen-load` shell command) each define's
        [ok Name]/[fail Reason] is printed; when clear (boot) the check runs
        silently and only the final fail reason is returned on error. */
     Value p = val_string(path, (long)strlen(path));
     gc_root_push_value(&p);
-    Value tcs = call_bundled_1("tc-hm-file", p);
+    Value forms = call_bundled_1("shen-read-file", p);
+    gc_root_pop();  /* p */
+    if (forms.tag != VAL_CONS) {
+        return val_symbol("shen-load: read failed");
+    }
+    gc_root_push_value(&forms);
+    Value tcs = call_bundled_1("tc-hm-forms", forms);
     gc_root_push_value(&tcs);
     Value fail_res = val_nil();
     gc_root_push_value(&fail_res);
@@ -359,28 +394,17 @@ static Value shen_load_source_ex(const char *path, int verbose) {
         if (any_fail) {
             gc_root_pop();  /* fail_res */
             gc_root_pop();  /* tcs */
-            gc_root_pop();  /* p */
+            gc_root_pop();  /* forms */
             return fail_res;
         }
     }
     gc_root_pop();  /* fail_res */
     gc_root_pop();  /* tcs */
-    gc_root_pop();  /* p */
 
-    /* stage 1: read the file into forms.  Use shen-read-file (the .shen
-       extended reader) — it groups { A --> B } type sigs into one element so
-       shen->kl's strip-sig can remove them, and handles [X | Rest] list
-       syntax.  read-file-raw is only for .kl files and would break sigs. */
-    p = val_string(path, (long)strlen(path));
-    gc_root_push_value(&p);
-    Value forms = call_bundled_1("shen-read-file", p);
-    gc_root_pop();
-    if (forms.tag != VAL_CONS) {
-        return val_symbol("shen-load: read failed");
-    }
-    gc_root_push_value(&forms);
-
-    /* stage 2: compile Shen source forms -> KLambda defuns */
+    /* stage 2: compile Shen source forms -> KLambda defuns.  shen-read-file
+       (the .shen extended reader) groups { A --> B } type sigs into one
+       element so shen->kl's strip-sig can remove them, and handles
+       [X | Rest] list syntax; the forms list is the one read in stage 0. */
     Value kls = call_bundled_1("shen->kl-forms", forms);
     gc_root_push_value(&kls);
     if (kls.tag != VAL_CONS && kls.tag != VAL_NIL) {
@@ -399,6 +423,11 @@ static Value shen_load_source_ex(const char *path, int verbose) {
     Value cur = kls;
     Value last = val_symbol("loaded");
     gc_root_push_value(&last);
+    /* cur must stay rooted across interp-eval: it allocates (compiles the
+       defun, updates the namespace-2 global-table), and a GC there would
+       move the cons cell cur points at, leaving cur stale -> subsequent
+       defuns silently dropped (the "missing define" corruption). */
+    gc_root_push_value(&cur);
     while (cur.tag == VAL_CONS) {
         Value defun = *cur.cons.car;
         gc_root_push_value(&defun);
@@ -406,9 +435,9 @@ static Value shen_load_source_ex(const char *path, int verbose) {
         gc_root_pop();
         cur = *cur.cons.cdr;
     }
-
-    Value ret = (last.tag == VAL_ERROR) ? last : val_symbol("loaded");
+    gc_root_pop();  /* cur */
     gc_root_pop();  /* last */
+    Value ret = (last.tag == VAL_ERROR) ? last : val_symbol("loaded");
     gc_root_pop();  /* kls */
     gc_root_pop();  /* forms */
     return ret;
@@ -420,12 +449,28 @@ static Value shen_load_source(const char *path) {
     return shen_load_source_ex(path, 1);
 }
 
-/* Does the line (after leading whitespace) start with '(' ?  If so it is a
- * KLambda expression and shensh evaluates it through parse-exprs + eval-kl
- * (the meta_repl path, in C) rather than treating it as a shell command. */
+/* Does the line (after leading whitespace) start with '(' ?  If so it is
+ * EITHER a KLambda expression (shensh evaluates it through parse-exprs +
+ * eval-kl, the meta_repl path, in C) or a SHELL SUBSHELL — the grammar
+ * from shpar-p2 treats '(' at command position as a subshell
+ * ((cd /; pwd), (ls | head), ...).  KLambda has no ; | & operators, so a
+ * '(' line containing any of those outside quotes is a subshell, not
+ * KLambda.  A bare (cd /) with no chain/pipeline still parses as KLambda
+ * (KLambda probe) — documented v1 divergence. */
 static int line_is_klambda(const char *line) {
     while (*line && isspace((unsigned char)*line)) line++;
-    return *line == '(';
+    if (*line != '(') return 0;
+    int q = 0;   /* 0 = unquoted, '\'' or '"' inside quotes */
+    for (const char *p = line; *p; p++) {
+        if (q == '\'')      { if (*p == '\'') q = 0; }
+        else if (q == '"')  { if (*p == '"')  q = 0; }
+        else {
+            if (*p == '\'') q = '\'';
+            else if (*p == '"') q = '"';
+            else if (*p == ';' || *p == '|' || *p == '&') return 0;
+        }
+    }
+    return 1;
 }
 
 /* Evaluate a whole KLambda line (possibly several forms) via parse-exprs +
@@ -509,32 +554,17 @@ int main(int argc, char **argv) {
     }
     free(src);
 
-    /* Boot the shell source via shen_load_source: read shell/shell.shen,
-       type-check it through the bundled HM checker (tc-hm-file), then compile
-       each define through shen->kl-forms and register it into the interp's
-       namespace-2 global-table via interp-eval — where eval_form1 / eval-kl
-       reach.  shell.shen is the typed Shen port of the former flat-KLambda
-       shell/shell.kl; shen_load_source type-checks by default and returns
-       symbol 'loaded' on success, or a fail-reason symbol if a define fails
-       the HM check (the shell then refuses to load the ill-typed defun).  We
-       warn and continue so KLambda lines and shen-load still work. */
-    Value boot = shen_load_source_ex("shell/shell.shen", 0);
-    if (boot.tag != VAL_SYMBOL || strcmp(boot.sym.name, "loaded") != 0) {
-        fprintf(stderr, "shensh: warning: failed to load shell/shell.shen (got ");
-        print_shen(boot);
-        fprintf(stderr, ") — continuing without shell\n");
-    }
-
-    /* Initialise the HM type-checker state ONCE at boot so every subsequent
-       shen-load's tc-hm-file actually checks.  tc-hm-init (shen/tc-hm-runtime.shen)
-       builds tc-prim-table (via tc-build-prim-table) and zeroes the tc-* counters
-       and tc-global-sig-table.  Without this, tc-prim-lookup returns a fresh
-       unknown tvar for every prim and body/arg type errors silently pass (only
-       direct-return mismatches are caught).  This lives at startup, NOT inside
-       shen_load_source, so tc-global-sig-table accumulates across shen-load
-       calls (cross-file sigs — see tc-hm.shen:277).  tc-hm-init is a nullary
-       { --> symbol } bundled closure returning `done`; a missing/failed init
-       is non-fatal — warn and continue (do not abort the shell). */
+    /* Initialise the HM type-checker state ONCE, BEFORE the shell sources
+       load, so their boot-time tc-hm-forms checks are real (with the prim
+       table built).  tc-hm-init (shen/tc-hm-runtime.shen) builds
+       tc-prim-table (via tc-build-prim-table) and zeroes the tc-* counters
+       and tc-global-sig-table.  Without this, tc-prim-lookup returns a
+       fresh unknown tvar for every prim and body/arg type errors silently
+       pass (only direct-return mismatches are caught).  Running it first
+       also means tc-global-sig-table accumulates across the boot loads —
+       the shell files load in dependency order (shlex -> shparse ->
+       shexpand -> shell) so later files see earlier files' sigs.  A
+       missing/failed init is non-fatal — warn and continue. */
     Value tcinit = call_bundled_0("tc-hm-init");
     if (tcinit.tag != VAL_SYMBOL || strcmp(tcinit.sym.name, "done") != 0) {
         fprintf(stderr, "shensh: warning: tc-hm-init did not complete (got ");
@@ -542,10 +572,38 @@ int main(int argc, char **argv) {
         fprintf(stderr, ") — type-checker may be uninitialised; continuing\n");
     }
 
-    /* REPL loop: prompt via eval_form1("sh-prompt", val_string("",0)) → print + read_stdin_line();
-       each line → eval_form1("shell-eval-line", val_string(line, n)) → print_shen(result);
-       wrap per-line in a CatchFrame exactly like meta_repl (zincvm.c:3086-3116) with
-       gc_root_push_value_volatile(&result). EOF or *sh-exit* → break. */
+    /* Boot the shell sources via shen_load_source (read -> HM-check ->
+       shen->kl compile -> interp-eval into namespace 2, where eval_form1 /
+       eval-kl reach).  Dependency order matters: shparse uses shlex's
+       sp-prepend-list; shexpand uses the sp-* string helpers; shell.shen
+       (the driver) calls sp-lex/sp-parse/shx-plan — each file's defines
+       land in tc-global-sig-table as it loads, so HM cross-file sigs work.
+       Each load is warn-and-continue: KLambda lines and shen-load still
+       work without the shell grammar, though shell commands would fail. */
+    static const char *const boot_files[] = {
+        "shell/shlex.shen",
+        "shell/shparse.shen",
+        "shell/shexpand.shen",
+        "shell/shell.shen",
+    };
+    for (size_t bi = 0; bi < sizeof boot_files / sizeof boot_files[0]; bi++) {
+        Value boot = shen_load_source_ex(boot_files[bi], 0);
+        if (boot.tag != VAL_SYMBOL || strcmp(boot.sym.name, "loaded") != 0) {
+            fprintf(stderr, "shensh: warning: failed to load %s (got ",
+                    boot_files[bi]);
+            print_shen(boot);
+            fprintf(stderr, ") — continuing without it\n");
+        }
+    }
+
+    /* REPL loop: prompt via eval_form1("sh-prompt", val_string("",0)) → read_stdin_line();
+       each line → eval_form1("shell-eval-line", val_string(line, n));
+       VAL_STRING results print RAW (command output — no quotes); symbol
+       sh-continue enters the heredoc accumulate loop (see below); print_shen
+       stays for errors and non-string results.  Wrap per-line in a CatchFrame
+       exactly like meta_repl (zincvm.c:3086-3116) with the result rooted
+       (volatile + shadow stack) across any heredoc re-evaluation.
+       EOF or *sh-exit* → break. */
     while (1) {
         Value prompt = eval_form1("sh-prompt", val_string("", 0));
         if (prompt.tag == VAL_ERROR) {
@@ -553,8 +611,7 @@ int main(int argc, char **argv) {
             print_shen(prompt);
             break;
         }
-        print_shen(prompt);
-        fflush(stdout);
+        print_raw_string_ex(prompt, 0);   /* raw prompt, no newline */
 
         char *line = read_stdin_line();
         if (!line) break;  /* EOF */
@@ -590,24 +647,67 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        /* Otherwise: a shell command line, handled by shell.shen. */
-        Value result = eval_form1("shell-eval-line", val_string(line, (long)strlen(line)));
+        /* Otherwise: a shell command line, handled by shell/shell.shen.
+           The result stays rooted (volatile + shadow stack) across the
+           heredoc re-evaluations below — each eval_form1 allocates. */
+        volatile Value result; memset((void *)&result, 0, sizeof(result));
+        result.tag = VAL_NIL;
+        gc_root_push_value_volatile(&result);
+        result = eval_form1("shell-eval-line", val_string(line, (long)strlen(line)));
+
+        /* Heredoc continuation: shell-eval-line returned the symbol
+           sh-continue — the line ends inside an unterminated heredoc.
+           Read further lines, buffer = buffer + "\n" + line, and re-eval
+           the whole buffer until the delimiter closes (the lexer/parser
+           stay on the Shen side; this loop never parses).  Blank lines
+           are legitimate heredoc body, so nothing is skipped here.
+           EOF while still pending is an error and resets the buffer. */
+        while (result.tag == VAL_SYMBOL &&
+               strcmp(result.sym.name, "sh-continue") == 0) {
+            printf("> "); fflush(stdout);
+            char *more = read_stdin_line();
+            if (!more) {
+                fprintf(stderr, "shensh: heredoc: unexpected EOF\n");
+                result = val_string("", 0);
+                break;
+            }
+            size_t nlen = strlen(line) + 1 + strlen(more) + 1;
+            char *nb = (char *)malloc(nlen);
+            if (!nb) {
+                free(more);
+                fprintf(stderr, "shensh: out of memory\n");
+                result = val_string("", 0);
+                break;
+            }
+            snprintf(nb, nlen, "%s\n%s", line, more);
+            free(line);
+            line = nb;
+            free(more);
+            result = eval_form1("shell-eval-line",
+                                val_string(line, (long)strlen(line)));
+        }
         free(line);
 
+        int is_exit = 0;
         if (result.tag == VAL_ERROR) {
             fprintf(stderr, "shensh: eval error: ");
             print_shen(result);
+        } else if (result.tag == VAL_STRING) {
+            /* Command output prints RAW (see print_raw_string_ex) — the
+               display string built by shell.shen is exactly what the
+               program wrote (plus a synthesized "exit N"/"error: ..." when
+               there is no output). */
+            print_raw_string_ex(result, 1);
         } else {
             print_shen(result);
-            /* Check if result signals exit to terminate the shell (either the
-               symbol `exit` or the string "exit", returned by sh-builtin's
-               exit branch after setting *sh-exit*). */
-            int is_exit = (result.tag == VAL_SYMBOL && strcmp(result.sym.name, "exit") == 0) ||
-                          (result.tag == VAL_STRING && result.str.len == 4 &&
-                           memcmp(result.str.data, "exit", 4) == 0);
-            if (is_exit) {
-                break;
-            }
+            /* the exit builtin also signals via the symbol `exit` after
+               setting *sh-exit* */
+            is_exit = (result.tag == VAL_SYMBOL &&
+                       strcmp(result.sym.name, "exit") == 0);
+        }
+        gc_root_pop();  /* result */
+        if (is_exit) {
+            break;
         }
     }
 

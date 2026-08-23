@@ -51,8 +51,40 @@ make test     # run 34 built-in bytecode tests
 make pipeline # compile (+ 1 2) through full pipeline
 make bundle   # compile bundle .shen via shen->kl → globals.csexp
 make run-bundle  # run C VM with self-hosting bundle
+make shensh-test # run the 36-case shensh end-to-end shell tests
+make shpar-verify # gate: zero execl(/bin/sh) sites in the VM sources
 make gate     # test + test-asan
 ```
+
+## shensh — the shell
+
+`./shensh globals.csexp` is a POSIX-style shell with **no `/bin/sh` anywhere**:
+the lexer, parser, and expander are Shen sources (`shell/shlex.shen`,
+`shell/shparse.shen`, `shell/shexpand.shen`, `shell/shell.shen`) loaded into
+the meta-interpreter at boot and HM-type-checked; execution goes through the
+native `exec-plan` C primitive, which forks / dup2s / `execvp`s each stage
+directly (one exec call site in the whole VM).
+
+```sh
+./shensh globals.csexp        # from the repo root (boot paths are relative)
+pwd                           # /path/to/repo
+echo "a b" | cat              # quoting, pipelines
+ls | head -2
+echo hi > /tmp/x && cat /tmp/x
+somecmd 2>&1 | head           # dup redirects, POSIX ordering
+(cd /; pwd)                   # subshells — prints /, cwd unchanged after
+cat << EOF                    # heredocs via the sh-continue protocol
+multi-line
+EOF
+setenv GREET hello            # also: export GREET=hello
+echo $GREET / ${GREET}!
+false || echo "exit $? is tracked"
+exit
+```
+
+Backticks, `$( )`, and bare `&` are rejected with clean `error:` messages
+(the parser never leaves Shen — no host shell is consulted). Run
+`make shensh-test` for the full 36-case end-to-end suite.
 
 Requires [shen-scheme](https://github.com/tizoc/shen-scheme) (Shen 41.2 on Chez Scheme) at `vendor/shen-scheme/` (used to bootstrap the serializer; the shipped bundle is compiled by our own `shen->kl`).
 
@@ -176,6 +208,7 @@ The reduced bundle contains zero Shen OS `.kl` closures. Every bytecode closure 
 - [x] Per-closure instruction tracing (`--trace`)
 - [x] String stream support in `open` primitive
 - [x] **Own `shen->kl` compiler** — reduced bundle has no Shen OS `.kl` code
+- [x] **shensh shell** — POSIX-style shell with Shen lexer/parser/expander + native exec-plan runner; `/bin/sh` fully removed (`make shpar-verify`, 36-case e2e suite)
 - [ ] REPL with interactive terminal I/O
 - [ ] `shen.initialise` non-idempotency fix
 

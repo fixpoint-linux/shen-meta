@@ -362,14 +362,13 @@
   [prim <-address | C] [absvector A] E [[number A1] | S] R      -> (interp C (<-address A A1) E S R)
 
   \* ---- shensh process primitives ----
-     exec-command/shell-pipe/glob return TAGGED values (lists/strings) built
-     by the C primitive, so the interp rule is a pass-through.  The rest
-     return RAW values; the interp rule wraps them in the appropriate tagged
-     form ([number ...], [string ...], [boolean ...]).  ZINC RTL arg order:
-     for 2-arg prims, A = leftmost arg (accumulator), A1 = rightmost (stack). *\
-  [prim exec-command | C] [string A] E S R                   -> (interp C (exec-command A) E S R)
-  [prim shell-pipe | C] A E S R                              -> (interp C (shell-pipe A) E S R)
-  [prim spawn | C] [string A] E S R                          -> (interp C [number (spawn A)] E S R)
+     exec-plan/glob return TAGGED values (lists/
+     strings) built by the C primitive, so the interp rule is a
+     pass-through.  The rest return RAW values; the interp rule wraps them
+     in the appropriate tagged form ([number ...], [string ...],
+     [boolean ...]).  ZINC RTL arg order: for 2-arg prims, A = leftmost
+     arg (accumulator), A1 = rightmost (stack). *\
+  [prim exec-plan | C] A E S R                              -> (interp C (exec-plan A) E S R)
   [prim wait | C] [number A] E S R                           -> (interp C [number (wait A)] E S R)
   [prim kill | C] [number A] E [[number A1] | S] R           -> (interp C [boolean (kill A A1)] E S R)
   [prim cd | C] [string A] E S R                             -> (interp C [boolean (cd A)] E S R)

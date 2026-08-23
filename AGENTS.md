@@ -3,21 +3,23 @@
 ## Build & test
 
 ```sh
-make          # build C VM, zincdec, and zinctest (release; links Boehm GC via -lgc)
-make test     # build+run zinctest — 34 built-in bytecode tests
+make          # build C VM, zincdec, shensh, and zinctest (release)
+make test     # build+run zinctest — 48 built-in bytecode tests
 make gcdebug  # build zinctest-gc (-O0 -g) for GC observability flags
 make test-asan # build+run zinctest-asan (UBSan)
 make pipeline # compile (+ 1 2) through full pipeline
 make bundle   # serialize all safe wrappers → globals.csexp
 make run-bundle  # run zinctest with globals.csexp (self-hosting + GC stress tests)
                 # ./zinctest globals.csexp  is equivalent
+make shensh-test # build+run the shensh end-to-end shell tests (36 cases)
+make shpar-verify # grep gate: zero execl(/bin/sh) sites in vm/zincvm.c vm/shensh.c
 
 # Trace execution of specific closures:
 ./zincvm globals.csexp --trace + --trace reverse
 
 # ./zincvm with no args prints usage (tests moved to ./zinctest)
 ./zincvm                         # prints usage
-./zinctest                        # runs 34 built-in bytecode tests
+./zinctest                        # runs 48 built-in bytecode tests
 ./zinctest globals.csexp          # runs self-hosting + GC nursery + stress tests
 ```
 
@@ -26,6 +28,84 @@ make run-bundle  # run zinctest with globals.csexp (self-hosting + GC stress tes
 ```
 Shen source → kmacros → normalize-term → debruijn → zinc-c → compile-zinc → nat->csexp → C VM
 ```
+
+## shensh — the Shen shell (no /bin/sh)
+
+`./shensh globals.csexp` is an interactive POSIX-style shell whose **lexer,
+parser, and expander are Shen code** and whose **process runner is a native C
+primitive**. `/bin/sh` is fully removed: there is exactly ONE exec call site
+in the whole VM (`execvp(c->argv[0], c->argv)` in the exec-plan runner) and
+`make shpar-verify` gates on zero `execl("/bin/sh")` sites.
+
+### Pipeline
+
+```
+line → sp-lex (shell/shlex.shen) → sp-parse (shell/shparse.shen)
+     → shx-plan (shell/shexpand.shen)  → raw plan tree
+     → [prim exec-plan] (C, vm/zincvm.c) → fork/dup2/execvp per stage
+```
+
+- The four `shell/*.shen` files are **namespace-2 (Shen `global-table`)
+  closures**, NOT part of `globals.csexp`. `shensh.c` boots them at startup
+  via `shen_load_source_ex` in dependency order — `shlex` → `shparse` →
+  `shexpand` → `shell` — each warn-and-continue on failure, AFTER
+  `tc-hm-init`, so the HM sig table accumulates across files and the shell
+  sources are HM-checked at boot (this is why `shensh` must run from the
+  repo root: the boot paths `shell/*.shen` are relative).
+- Chain-op symbols in plan trees are **interned lowercase constants**
+  (`seq`/`and`/`or`) — never bare `and`/`or`/`append` (those are KLambda
+  macros and would macroexpand). `shx-plan` builds raw trees via `(intern ...)`.
+
+### exec-plan contract and plan encoding
+
+`exec-plan` takes ONE tagged plan value and returns the TAGGED
+`[exit stdout stderr]` (strings are captured program output). Plans are built
+by `shx-plan` in this encoding:
+
+| Value | Encoding |
+|---|---|
+| Program | `(list Chain)` — chain list |
+| Chain | `[op Pipeline]` where op ∈ {`seq`, `and`, `or`} (`;`, `&&`, `||`) |
+| Pipeline | `(list Cmd)` — `|` stages |
+| Cmd | `[Argv Redirs Sub]` |
+| Argv | `(list string)` — already field-split, quoted, `~`/`$VAR`-expanded |
+| Redirs | `(list [op fd target])`, op ∈ {`in`, `out`, `append`, `dup`, `hdoc`, `hstr`} |
+| Sub | subshell Program or empty — `( ... )` |
+
+Capture uses two **unlinked mkstemp tmpfiles** (out + err). One open fd is
+shared between parent (reads it back) and child (writes to it): no pipe
+buffer to deadlock on and no name to leak — the file vanishes when both
+sides close. `2>&1` is `dup 1 2` applied **after** earlier redirects, so
+`2>&1 >file` correctly leaves stderr on the old stdout (POSIX ordering,
+tested in zinctest 51 + e2e).
+
+### Builtins
+
+- **Parent-process (Shen, `shell/shell.shen`)** — `cd`, `pwd`,
+  `setenv`/`export` (`NAME VALUE` or `NAME=VALUE`), `exit` (sets `*sh-exit*`).
+  These must mutate the shell process itself.
+- **Child (C, `vm/zincvm.c`)** — `echo`, `true`, `false`, `:`, `cd`, `pwd`
+  run inside forked children (post-redirect), so they behave uniformly in
+  pipelines and subshells. Inside a forked subshell child a single builtin
+  runs **in-process** with fds 0/1/2 saved/restored — that is what makes
+  `(cd /; pwd)` print `/` (POSIX subshell semantics).
+- `$?` reads `*sh-exit-code*` (set from the last exec-plan result).
+
+### sh-continue heredoc protocol
+
+When a line ends inside an unterminated heredoc, `sp-parse` returns
+`[pending Delims]` and `shell-eval-line` returns the SYMBOL `sh-continue`.
+The `shensh.c` REPL then prints a `> ` continuation prompt, accumulates
+`buffer = buffer + "\n" + line`, and re-evaluates the whole buffer each
+line until the delimiter closes. EOF while pending prints
+`heredoc: unexpected EOF` and resets the buffer. Parsing never leaves Shen.
+
+### Known syntax rejections (clean `error:` messages)
+
+Backtick, `$( )`, bare `&`, field splitting inside redirect targets, and
+`$0`/positional parameters are rejected by the lexer/expander as
+`error: ... not supported` — caught by `shell-eval-line`'s trap-error.
+
 
 ## Partial application (metacircular interp only)
 
