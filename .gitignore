@@ -37,3 +37,8 @@ node_modules/
 elm-stuff/
 dist/
 vendor/@mfe/
+
+# Zig port build artifacts (shen/zig — the shensh-in-Zig port)
+zig/.zig-cache/
+zig/zig-out/
+zig/.scratch*
