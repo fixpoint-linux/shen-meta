@@ -121,7 +121,11 @@ pub fn vaPush(g: *Gc, a: *types.ValueArray, v: Value) void {
 pub fn vaPop(a: *types.ValueArray) Value {
     if (a.len <= 0) std.debug.panic("fatal: pop from empty stack", .{});
     a.len -= 1;
-    return a.data.?[@intCast(a.len)];
+    // Clear the vacated slot: the GC scans value_arrays by full capacity,
+    // so a stale ref here would retain popped Values (closure envs).
+    const v = a.data.?[@intCast(a.len)];
+    a.data.?[@intCast(a.len)] = values.valNil();
+    return v;
 }
 
 /// C: zincvm.c:437 va_peek.
@@ -198,7 +202,10 @@ pub fn envPop(vm: *Vm, env: *?[*]Value, env_len: *i32) VmError!Value {
         std.debug.panic("runtime: pop empty environment", .{});
     }
     env_len.* -= 1;
-    return env.*.?[@intCast(env_len.*)];
+    // Same capacity-scan concern as vaPop: clear the vacated env slot.
+    const v = env.*.?[@intCast(env_len.*)];
+    env.*.?[@intCast(env_len.*)] = values.valNil();
+    return v;
 }
 
 // =====================================================================

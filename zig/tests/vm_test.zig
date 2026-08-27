@@ -1074,11 +1074,12 @@ test "M4 apply missing pushmark hard-stops with the function in acc" {
 test "M4 deep 2000-level cur/apply chain churns collections (verbose probe)" {
     // OOM INVESTIGATION (will shrink once diagnosed): at depth 10000 a
     // 64 MB/256 MB-reserved heap OOM'd; at depth 5000 even 128 MB/1 GB
-    // reserved OOM'd — while the expected live set is only ~20 MB
-    // (2000..5000 frames x ~2.7 KB).  This run is instrumented: verbose
-    // GC banners print live_pages at each collect so the growth curve is
-    // visible; verify_collects is OFF to discriminate a verifier side
-    // effect from genuine retention.
+    // reserved OOM'd — the expected live set is ~85 MB (2000..5000 frames
+    // x ~2.7 KB, O(D^2) env semantics: each level's closure legitimately
+    // captures a copy of the growing env).  This run is instrumented:
+    // verbose GC banners print live_pages at each collect so the growth
+    // curve is visible; verify_collects is OFF to discriminate a verifier
+    // side effect from genuine retention.
     var g = try heap.Gc.init(.{
         .heap_bytes = 128 * 1024 * 1024,
         .reserve_bytes = 1024 * 1024 * 1024,
