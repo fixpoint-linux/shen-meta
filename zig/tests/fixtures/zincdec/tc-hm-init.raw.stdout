@@ -1,0 +1,30 @@
+=== tc-hm-init ===
+  code_len=27  env_len=0
+
+number 0
+symbol tc-counter
+prim set
+let
+pushmark
+number 0
+global tc-build-prim-table
+apply
+symbol tc-prim-table
+prim set
+let
+number 0
+symbol tc-sig-tvar-counter
+prim set
+let
+number 0
+prim emptylist
+symbol tc-sig-tvar-map
+prim set
+let
+number 0
+prim emptylist
+symbol tc-global-sig-table
+prim set
+let
+symbol done
+return

@@ -1,0 +1,22 @@
+[
+  pushmark
+  [access 0]
+  [global kmacros]
+  apply
+  let
+  pushmark
+  [access 0]
+  [global normalize-term]
+  apply
+  let
+  pushmark
+  pushmark
+  [access 0]
+  [number 0]
+  [prim emptylist]
+  [global debruijn]
+  apply
+  [global zinc-c]
+  appterm
+  return
+]

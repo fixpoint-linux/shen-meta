@@ -49,6 +49,17 @@ const ValueArray = types.ValueArray;
 const Vm = state.Vm;
 const VmError = state.VmError;
 
+/// Comptime wasm gate — true on wasm32-freestanding/wasi.  The process layer
+/// (fork/execvp/pipe/dup2/mkstemp/waitpid/fnmatch/...) has no wasm equivalent,
+/// so every prim handler + test accessor wraps its body in `if (is_wasm) {
+/// stub } else { real body }`.  Because `is_wasm` is comptime-known, the else
+/// branch (the real body, which references the libc externs + std.posix.W) is
+/// NOT analyzed on wasm — the extern declarations themselves compile fine on
+/// freestanding, and with the real bodies dropped they are never referenced,
+/// so the wasm link never needs to resolve them.  Native behavior is
+/// byte-identical (the if branch is dropped on native).
+const is_wasm = @import("builtin").cpu.arch.isWasm();
+
 // =====================================================================
 //  libc externs (the whole process/syscall layer — artifact-1)
 // =====================================================================
@@ -1130,6 +1141,9 @@ fn slurpFd(fd: i32) ?Slurp {
 /// GC allocation, and every exit path pops (the single defer is C's
 /// per-path gc_root_pop).
 pub fn primExecPlan(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    if (is_wasm) {
+        return vm.throwShen("exec-plan: not supported on wasm");
+    } else {
     const g = vm.gc;
     var plan = interp.vaPop(stack);
     g.rootPushValue(&plan); // C:2102
@@ -1199,6 +1213,7 @@ pub fn primExecPlan(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     // (the deferred rootPop for `plan` fires on return)
 
     acc.* = final;
+    }
 }
 
 // =====================================================================
@@ -1217,17 +1232,24 @@ fn strToBufZ(v: Value, buf: []u8) [:0]u8 {
 
 /// C: zincvm.c:1955-1962 cd: chdir to Path.  Returns raw boolean.
 pub fn primCd(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    if (is_wasm) {
+        return vm.throwShen("cd: not supported on wasm");
+    } else {
     const path = interp.vaPop(stack);
     if (path.tag != .string) return vm.throwShen("cd: path must be a string");
     var buf: [PATH_MAX]u8 = undefined;
     const p = strToBufZ(path, &buf);
     const rc = chdir(p.ptr);
     acc.* = values.valBoolean(rc == 0);
+    }
 }
 
 /// C: zincvm.c:2191-2199 getcwd.  Arity 0 — pop spurious arg if present
 /// (newvar precedent).
 pub fn primGetcwd(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    if (is_wasm) {
+        return vm.throwShen("getcwd: not supported on wasm");
+    } else {
     if (stack.len > 0) _ = interp.vaPop(stack);
     var buf: [PATH_MAX]u8 = undefined;
     if (getcwd(&buf, buf.len)) |p| {
@@ -1235,14 +1257,18 @@ pub fn primGetcwd(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     } else {
         acc.* = values.valString(vm.gc, "");
     }
+    }
 }
 
 /// C: zincvm.c:2205-2209 getpid.  Arity 0 with the same dummy-arg pop
 /// (nullary prim calls cannot compile; used by $$ shell expansion).
 pub fn primGetpid(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
-    _ = vm;
+    if (is_wasm) {
+        return vm.throwShen("getpid: not supported on wasm");
+    } else {
     if (stack.len > 0) _ = interp.vaPop(stack);
     acc.* = values.valNumber(getpid());
+    }
 }
 
 // =====================================================================
@@ -1252,6 +1278,9 @@ pub fn primGetpid(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
 
 /// C: zincvm.c:2211-2219 getenv: value or "".
 pub fn primGetenv(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    if (is_wasm) {
+        return vm.throwShen("getenv: not supported on wasm");
+    } else {
     const name_v = interp.vaPop(stack);
     if (name_v.tag != .string) return vm.throwShen("getenv: name must be a string");
     var buf: [PATH_MAX]u8 = undefined;
@@ -1261,11 +1290,15 @@ pub fn primGetenv(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
         values.valString(vm.gc, std.mem.sliceTo(p, 0))
     else
         values.valString(vm.gc, "");
+    }
 }
 
 /// C: zincvm.c:2580-2595 setenv: Name Val -> true.  ZINC RTL: a1 = Name
 /// (popped FIRST), a2 = Val.
 pub fn primSetenv(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    if (is_wasm) {
+        return vm.throwShen("setenv: not supported on wasm");
+    } else {
     const name_v = interp.vaPop(stack);
     const val_v = interp.vaPop(stack);
     if (name_v.tag != .string) return vm.throwShen("setenv: name must be a string");
@@ -1276,25 +1309,33 @@ pub fn primSetenv(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     const v = strToBufZ(val_v, &vbuf);
     _ = setenv(n.ptr, v.ptr, 1);
     acc.* = values.valBoolean(true);
+    }
 }
 
 /// C: zincvm.c:2294-2299 kill.  ZINC RTL: a1 = leftmost = Pid (popped
 /// FIRST), a2 = Sig.
 pub fn primKill(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
-    _ = vm;
+    if (is_wasm) {
+        return vm.throwShen("kill: not supported on wasm");
+    } else {
     const pidv = interp.vaPop(stack);
     const sigv = interp.vaPop(stack);
     _ = kill(@truncate(pidv.payload.number), @truncate(sigv.payload.number));
     acc.* = values.valBoolean(true);
+    }
 }
 
 /// C: zincvm.c:2693-2700 wait: Pid -> exit status (raw number).
 pub fn primWait(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    if (is_wasm) {
+        return vm.throwShen("wait: not supported on wasm");
+    } else {
     const pidv = interp.vaPop(stack);
     if (pidv.tag != .number) return vm.throwShen("wait: pid must be a number");
     var st: c_int = 0;
     _ = waitpid(@truncate(pidv.payload.number), &st, 0);
     acc.* = values.valNumber(waitStatusCode(@bitCast(st)));
+    }
 }
 
 // =====================================================================
@@ -1317,6 +1358,9 @@ fn strLessThan(_: void, a: [:0]const u8, b: [:0]const u8) bool {
 /// fnmatch; qsort; builds the tagged list inside-out (each makeTaggedCons
 /// roots its args; `result` is rooted across iterations — C:2256-2262).
 pub fn primGlob(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    if (is_wasm) {
+        return vm.throwShen("glob: not supported on wasm");
+    } else {
     const g = vm.gc;
     const pat = interp.vaPop(stack);
     if (pat.tag != .string) return vm.throwShen("glob: pattern must be a string");
@@ -1394,6 +1438,7 @@ pub fn primGlob(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     while (i < nmatch) : (i += 1) ca.free(matches[i]);
 
     acc.* = result;
+    }
 }
 
 // =====================================================================
@@ -1404,22 +1449,42 @@ pub fn primGlob(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
 // =====================================================================
 
 pub fn testFork() c_int {
-    return fork();
+    if (is_wasm) {
+        return -1;
+    } else {
+        return fork();
+    }
 }
 
 pub fn testExit(code: c_int) noreturn {
-    _exit(code);
+    if (is_wasm) {
+        @trap();
+    } else {
+        _exit(code);
+    }
 }
 
 pub fn testWaitpid(pid: c_int, st: *c_int) c_int {
-    return waitpid(pid, st, 0);
+    if (is_wasm) {
+        return -1;
+    } else {
+        return waitpid(pid, st, 0);
+    }
 }
 
 pub fn testKill(pid: c_int, sig: c_int) c_int {
-    return kill(pid, sig);
+    if (is_wasm) {
+        return -1;
+    } else {
+        return kill(pid, sig);
+    }
 }
 
 /// Raw status -> exit code, the same mapping `wait` and the runner use.
 pub fn testExitCode(st: c_int) i32 {
-    return waitStatusCode(@bitCast(st));
+    if (is_wasm) {
+        return 0;
+    } else {
+        return waitStatusCode(@bitCast(st));
+    }
 }

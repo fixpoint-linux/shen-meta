@@ -1,0 +1,132 @@
+=== interp-eval ===
+  code_len=129  env_len=0
+
+access 0
+prim cons?
+jmpf 40 (tgt=40)
+symbol defun
+access 0
+prim hd
+prim =
+jmpf 38 (tgt=38)
+access 0
+prim tl
+prim cons?
+jmpf 36 (tgt=36)
+access 0
+prim tl
+prim tl
+prim cons?
+jmpf 34 (tgt=34)
+access 0
+prim tl
+prim tl
+prim tl
+prim cons?
+jmpf 32 (tgt=32)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim tl
+prim tl
+prim =
+jmp 33 (tgt=33)
+boolean false
+jmp 35 (tgt=35)
+boolean false
+jmp 37 (tgt=37)
+boolean false
+jmp 39 (tgt=39)
+boolean false
+jmp 41 (tgt=41)
+boolean false
+jmpf 127 (tgt=127)
+symbol global-table
+prim value
+number 0
+prim emptylist
+pushmark
+pushmark
+pushmark
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim tl
+prim hd
+prim cons
+access 0
+prim tl
+prim tl
+prim hd
+prim cons
+access 0
+prim tl
+prim hd
+prim cons
+symbol defun
+prim cons
+global defun->lambda
+apply
+global kl->zinc
+apply
+global toplevel-interp
+apply
+prim cons
+access 0
+prim tl
+prim hd
+prim cons
+prim cons
+symbol global-table
+prim set
+let
+symbol global-table
+prim value
+number 0
+prim emptylist
+pushmark
+pushmark
+pushmark
+number 0
+prim emptylist
+access 1
+prim tl
+prim tl
+prim tl
+prim hd
+prim cons
+access 1
+prim tl
+prim tl
+prim hd
+prim cons
+access 1
+prim tl
+prim hd
+prim cons
+symbol defun
+prim cons
+global defun->lambda
+apply
+global kl->zinc
+apply
+global toplevel-interp
+apply
+prim cons
+access 1
+prim tl
+prim hd
+prim cons
+prim cons
+endlet
+let
+access 1
+prim tl
+prim hd
+jmp 128 (tgt=128)
+access 0
+return

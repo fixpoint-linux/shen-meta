@@ -44,6 +44,11 @@ const marshal = @import("marshal.zig");
 const hostcall = @import("hostcall.zig");
 const execplan = @import("execplan.zig");
 
+/// Diagnostic print — gated to non-freestanding targets (M2 wasm gate).
+const diag = if (@import("builtin").os.tag != .freestanding) std.debug.print else struct {
+    fn call(comptime _: []const u8, _: anytype) void {}
+}.call;
+
 const Gc = gc.Gc;
 const Value = types.Value;
 const ValueArray = types.ValueArray;
@@ -184,7 +189,7 @@ pub fn lookupDef(name: []const u8) ?*const PrimDef {
 /// error.Halt: the eval-loop call sites catch it and break to done with acc
 /// preserved (the C `exec_primitive() < 0 -> goto done`).
 fn unknownPrim(name: []const u8) VmError {
-    std.debug.print("runtime: unknown primitive '{s}'\n", .{name});
+    diag("runtime: unknown primitive '{s}'\n", .{name});
     return error.Halt;
 }
 
@@ -441,7 +446,7 @@ fn primErrorToString(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
 /// rooted slot (the caller's chain roots).
 fn evalKlStage(vm: *Vm, name: []const u8, arg: *Value) VmError!?Value {
     if (vm.defunGet(name).tag != .lambda) {
-        std.debug.print("runtime: eval-kl: {s} not found in bundle\n", .{name});
+        diag("runtime: eval-kl: {s} not found in bundle\n", .{name});
         return null;
     }
     return hostcall.applyBundledN(vm, name, &.{arg.*});

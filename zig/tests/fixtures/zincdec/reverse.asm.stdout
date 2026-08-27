@@ -1,0 +1,10 @@
+=== reverse ===
+  code_len=7  env_len=0
+
+0000: pushmark
+0001: number 0
+0002: prim emptylist
+0003: access 0
+0004: global reverse-help
+0005: appterm
+0006: return

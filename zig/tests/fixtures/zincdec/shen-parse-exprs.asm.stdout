@@ -1,0 +1,61 @@
+=== shen-parse-exprs ===
+  code_len=58  env_len=0
+
+0000: grab
+0001: grab
+0002: pushmark
+0003: access 0
+0004: access 1
+0005: access 2
+0006: global shen-skip-ws
+0007: apply
+0008: let
+0009: access 1
+000a: access 0
+000b: prim >=
+000c: jmpf 21  ; -> 0015
+000d: number 0
+000e: prim emptylist
+000f: access 0
+0010: prim cons
+0011: number 0
+0012: prim emptylist
+0013: prim cons
+0014: jmp 57   ; -> 0039
+0015: pushmark
+0016: access 1
+0017: access 0
+0018: access 3
+0019: global shen-parse-expr
+001a: apply
+001b: let
+001c: access 0
+001d: prim hd
+001e: let
+001f: access 1
+0020: prim tl
+0021: prim hd
+0022: let
+0023: pushmark
+0024: access 4
+0025: access 0
+0026: access 6
+0027: global shen-parse-exprs
+0028: apply
+0029: let
+002a: access 0
+002b: prim hd
+002c: let
+002d: access 1
+002e: prim tl
+002f: prim hd
+0030: let
+0031: number 0
+0032: prim emptylist
+0033: access 0
+0034: prim cons
+0035: access 1
+0036: access 4
+0037: prim cons
+0038: prim cons
+0039: return

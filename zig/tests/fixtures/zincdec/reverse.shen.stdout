@@ -1,0 +1,9 @@
+[
+  pushmark
+  [number 0]
+  [prim emptylist]
+  [access 0]
+  [global reverse-help]
+  appterm
+  return
+]

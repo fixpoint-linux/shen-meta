@@ -1,0 +1,18 @@
+=== toplevel-interp ===
+  code_len=15  env_len=0
+
+0000: pushmark
+0001: number 0
+0002: prim emptylist
+0003: number 0
+0004: prim emptylist
+0005: number 0
+0006: prim emptylist
+0007: number 0
+0008: prim emptylist
+0009: symbol cons
+000a: prim cons
+000b: access 0
+000c: global interp
+000d: appterm
+000e: return

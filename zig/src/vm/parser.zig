@@ -41,6 +41,16 @@ const Instr = types.Instr;
 const Value = types.Value;
 const SymbolInterner = symbols.SymbolInterner;
 
+/// Diagnostic print — gated to non-freestanding targets.  std.debug.print
+/// pulls std.Io (lockStderr → std.Options.debug_io) which on freestanding
+/// drags in getrandom/Threaded; the noop on freestanding keeps these
+/// bundle-error diagnostics compilable without changing native behavior.
+/// (std.debug.panic is NOT gated — on wasm32 stage2_wasm's defaultPanic
+/// short-circuits to @trap, pulling no Io; M2 adds the root panic override.)
+const diag = if (@import("builtin").os.tag != .freestanding) std.debug.print else struct {
+    fn call(comptime _: []const u8, _: anytype) void {}
+}.call;
+
 pub const ParseError = error{ ParseError };
 
 const ParseState = struct {
@@ -315,7 +325,7 @@ pub fn parseBundle(g: *Gc, sym: *SymbolInterner, v: *state.Vm, str: [:0]const u8
 
     skipWs(&ps);
     if (cur(&ps) != '(') {
-        std.debug.print("bundle error: expected outer '('\n", .{});
+        diag("bundle error: expected outer '('\n", .{});
         return 0;
     }
     advance(&ps);
@@ -328,7 +338,7 @@ pub fn parseBundle(g: *Gc, sym: *SymbolInterner, v: *state.Vm, str: [:0]const u8
             break; // end of bundle
         }
         if (cur(&ps) != '(') {
-            std.debug.print("bundle error: expected '(' for entry\n", .{});
+            diag("bundle error: expected '(' for entry\n", .{});
             return count;
         }
         advance(&ps);
@@ -337,11 +347,11 @@ pub fn parseBundle(g: *Gc, sym: *SymbolInterner, v: *state.Vm, str: [:0]const u8
         // C-heap, so `name` needs no rooting.  Keep the full safe.* name —
         // primitives stay under short names.
         const name_val = parseCsexpAtom(&ps, g, sym) catch {
-            std.debug.print("bundle error: name atom parse failed\n", .{});
+            diag("bundle error: name atom parse failed\n", .{});
             return count;
         };
         if (name_val.tag != .symbol) {
-            std.debug.print("bundle error: name must be a symbol\n", .{});
+            diag("bundle error: name must be a symbol\n", .{});
             return count;
         }
         const name = values.symSlice(name_val);
@@ -349,11 +359,11 @@ pub fn parseBundle(g: *Gc, sym: *SymbolInterner, v: *state.Vm, str: [:0]const u8
         // Parse the code list — a cur wrapping the closure body (C:3822-3827).
         var code: ?[*]Instr = null;
         const code_len = parseCsexpList(&ps, g, sym, &code) catch {
-            std.debug.print("bundle error: failed to parse code for '{s}'\n", .{name});
+            diag("bundle error: failed to parse code for '{s}'\n", .{name});
             return count;
         };
         if (code_len <= 0 or code == null) {
-            std.debug.print("bundle error: failed to parse code for '{s}'\n", .{name});
+            diag("bundle error: failed to parse code for '{s}'\n", .{name});
             return count;
         }
 
@@ -361,7 +371,7 @@ pub fn parseBundle(g: *Gc, sym: *SymbolInterner, v: *state.Vm, str: [:0]const u8
         // (C:3829-3835).  All wrapper reads happen before any potential alloc.
         const wrapper = &code.?[0];
         if (wrapper.op != .cur or wrapper.closure_code == null) {
-            std.debug.print("bundle error: expected cur wrapper for '{s}'\n", .{name});
+            diag("bundle error: expected cur wrapper for '{s}'\n", .{name});
             return count;
         }
         const body_code = wrapper.closure_code;
@@ -381,7 +391,7 @@ pub fn parseBundle(g: *Gc, sym: *SymbolInterner, v: *state.Vm, str: [:0]const u8
         // Consume the closing ')' of the entry (C:3845-3850).
         skipWs(&ps);
         if (cur(&ps) != ')') {
-            std.debug.print("bundle error: expected ')' to close entry '{s}'\n", .{name});
+            diag("bundle error: expected ')' to close entry '{s}'\n", .{name});
             return count;
         }
         advance(&ps);

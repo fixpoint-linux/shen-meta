@@ -1,0 +1,394 @@
+=== extract-kl ===
+  code_len=391  env_len=0
+
+access 0
+prim cons?
+jmpf 16 (tgt=16)
+symbol cons
+access 0
+prim hd
+prim =
+jmpf 14 (tgt=14)
+number 0
+prim emptylist
+access 0
+prim tl
+prim =
+jmp 15 (tgt=15)
+boolean false
+jmp 17 (tgt=17)
+boolean false
+jmpf 21 (tgt=21)
+number 0
+prim emptylist
+jmp 390 (tgt=390)
+access 0
+prim cons?
+jmpf 52 (tgt=52)
+symbol cons
+access 0
+prim hd
+prim =
+jmpf 50 (tgt=50)
+access 0
+prim tl
+prim cons?
+jmpf 48 (tgt=48)
+access 0
+prim tl
+prim tl
+prim cons?
+jmpf 46 (tgt=46)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim tl
+prim =
+jmp 47 (tgt=47)
+boolean false
+jmp 49 (tgt=49)
+boolean false
+jmp 51 (tgt=51)
+boolean false
+jmp 53 (tgt=53)
+boolean false
+jmpf 69 (tgt=69)
+pushmark
+access 0
+prim tl
+prim tl
+prim hd
+global extract-kl
+apply
+pushmark
+access 0
+prim tl
+prim hd
+global extract-kl
+apply
+prim cons
+jmp 390 (tgt=390)
+access 0
+prim cons?
+jmpf 92 (tgt=92)
+symbol number
+access 0
+prim hd
+prim =
+jmpf 90 (tgt=90)
+access 0
+prim tl
+prim cons?
+jmpf 88 (tgt=88)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim =
+jmp 89 (tgt=89)
+boolean false
+jmp 91 (tgt=91)
+boolean false
+jmp 93 (tgt=93)
+boolean false
+jmpf 98 (tgt=98)
+access 0
+prim tl
+prim hd
+jmp 390 (tgt=390)
+access 0
+prim cons?
+jmpf 121 (tgt=121)
+symbol symbol
+access 0
+prim hd
+prim =
+jmpf 119 (tgt=119)
+access 0
+prim tl
+prim cons?
+jmpf 117 (tgt=117)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim =
+jmp 118 (tgt=118)
+boolean false
+jmp 120 (tgt=120)
+boolean false
+jmp 122 (tgt=122)
+boolean false
+jmpf 127 (tgt=127)
+access 0
+prim tl
+prim hd
+jmp 390 (tgt=390)
+access 0
+prim cons?
+jmpf 150 (tgt=150)
+symbol string
+access 0
+prim hd
+prim =
+jmpf 148 (tgt=148)
+access 0
+prim tl
+prim cons?
+jmpf 146 (tgt=146)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim =
+jmp 147 (tgt=147)
+boolean false
+jmp 149 (tgt=149)
+boolean false
+jmp 151 (tgt=151)
+boolean false
+jmpf 156 (tgt=156)
+access 0
+prim tl
+prim hd
+jmp 390 (tgt=390)
+access 0
+prim cons?
+jmpf 179 (tgt=179)
+symbol boolean
+access 0
+prim hd
+prim =
+jmpf 177 (tgt=177)
+access 0
+prim tl
+prim cons?
+jmpf 175 (tgt=175)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim =
+jmp 176 (tgt=176)
+boolean false
+jmp 178 (tgt=178)
+boolean false
+jmp 180 (tgt=180)
+boolean false
+jmpf 185 (tgt=185)
+access 0
+prim tl
+prim hd
+jmp 390 (tgt=390)
+access 0
+prim cons?
+jmpf 216 (tgt=216)
+symbol lambda
+access 0
+prim hd
+prim =
+jmpf 214 (tgt=214)
+access 0
+prim tl
+prim cons?
+jmpf 212 (tgt=212)
+access 0
+prim tl
+prim tl
+prim cons?
+jmpf 210 (tgt=210)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim tl
+prim =
+jmp 211 (tgt=211)
+boolean false
+jmp 213 (tgt=213)
+boolean false
+jmp 215 (tgt=215)
+boolean false
+jmp 217 (tgt=217)
+boolean false
+jmpf 232 (tgt=232)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim hd
+prim cons
+access 0
+prim tl
+prim hd
+prim cons
+symbol lambda
+prim cons
+jmp 390 (tgt=390)
+access 0
+prim cons?
+jmpf 255 (tgt=255)
+symbol error
+access 0
+prim hd
+prim =
+jmpf 253 (tgt=253)
+access 0
+prim tl
+prim cons?
+jmpf 251 (tgt=251)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim =
+jmp 252 (tgt=252)
+boolean false
+jmp 254 (tgt=254)
+boolean false
+jmp 256 (tgt=256)
+boolean false
+jmpf 261 (tgt=261)
+access 0
+prim tl
+prim hd
+jmp 390 (tgt=390)
+access 0
+prim cons?
+jmpf 284 (tgt=284)
+symbol absvector
+access 0
+prim hd
+prim =
+jmpf 282 (tgt=282)
+access 0
+prim tl
+prim cons?
+jmpf 280 (tgt=280)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim =
+jmp 281 (tgt=281)
+boolean false
+jmp 283 (tgt=283)
+boolean false
+jmp 285 (tgt=285)
+boolean false
+jmpf 290 (tgt=290)
+access 0
+prim tl
+prim hd
+jmp 390 (tgt=390)
+access 0
+prim cons?
+jmpf 329 (tgt=329)
+symbol stream
+access 0
+prim hd
+prim =
+jmpf 327 (tgt=327)
+access 0
+prim tl
+prim cons?
+jmpf 325 (tgt=325)
+symbol in
+access 0
+prim tl
+prim hd
+prim =
+jmpf 323 (tgt=323)
+access 0
+prim tl
+prim tl
+prim cons?
+jmpf 321 (tgt=321)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim tl
+prim =
+jmp 322 (tgt=322)
+boolean false
+jmp 324 (tgt=324)
+boolean false
+jmp 326 (tgt=326)
+boolean false
+jmp 328 (tgt=328)
+boolean false
+jmp 330 (tgt=330)
+boolean false
+jmpf 336 (tgt=336)
+access 0
+prim tl
+prim tl
+prim hd
+jmp 390 (tgt=390)
+access 0
+prim cons?
+jmpf 375 (tgt=375)
+symbol stream
+access 0
+prim hd
+prim =
+jmpf 373 (tgt=373)
+access 0
+prim tl
+prim cons?
+jmpf 371 (tgt=371)
+symbol out
+access 0
+prim tl
+prim hd
+prim =
+jmpf 369 (tgt=369)
+access 0
+prim tl
+prim tl
+prim cons?
+jmpf 367 (tgt=367)
+number 0
+prim emptylist
+access 0
+prim tl
+prim tl
+prim tl
+prim =
+jmp 368 (tgt=368)
+boolean false
+jmp 370 (tgt=370)
+boolean false
+jmp 372 (tgt=372)
+boolean false
+jmp 374 (tgt=374)
+boolean false
+jmp 376 (tgt=376)
+boolean false
+jmpf 382 (tgt=382)
+access 0
+prim tl
+prim tl
+prim hd
+jmp 390 (tgt=390)
+symbol mark
+access 0
+prim =
+jmpf 389 (tgt=389)
+number 0
+prim emptylist
+jmp 390 (tgt=390)
+access 0
+return

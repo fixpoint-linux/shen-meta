@@ -247,18 +247,26 @@ pub fn assertWordsFits(words: usize, bytes: usize) void {
 // ---------------------------------------------------------------------
 //  load-bearing size classes (Phase 3/4 BiBOP) — MUST stay true.
 //  C: zinctypes.h _Static_asserts.  Verified on Zig 0.16.0 / LP64.
+//
+//  The Value/Instr/CallFrame/ValueArray/usize size + alignment asserts
+//  encode an LP64 layout and are skipped on wasm32 (32-bit usize, 32-bit
+//  pointers — the moving GC is 32-bit-clean, C wasm build proved it).  The
+//  TableEntry asserts below are usize-generic and stay active everywhere.
 // ---------------------------------------------------------------------
 comptime {
-    std.debug.assert(@sizeOf(Value) == 40);
-    std.debug.assert(@sizeOf(Instr) == 64);
-    std.debug.assert(@sizeOf(CallFrame) == 48);
-    std.debug.assert(@sizeOf(ValueArray) == 16);
-    std.debug.assert(@sizeOf(usize) == 8); // LP64
-    std.debug.assert(@alignOf(Value) == 8);
-    std.debug.assert(@alignOf(Instr) == 8);
-    std.debug.assert(@alignOf(CallFrame) == 8);
-    std.debug.assert(@alignOf(ValueArray) == 8);
+    if (@import("builtin").cpu.arch != .wasm32) {
+        std.debug.assert(@sizeOf(Value) == 40);
+        std.debug.assert(@sizeOf(Instr) == 64);
+        std.debug.assert(@sizeOf(CallFrame) == 48);
+        std.debug.assert(@sizeOf(ValueArray) == 16);
+        std.debug.assert(@sizeOf(usize) == 8); // LP64
+        std.debug.assert(@alignOf(Value) == 8);
+        std.debug.assert(@alignOf(Instr) == 8);
+        std.debug.assert(@alignOf(CallFrame) == 8);
+        std.debug.assert(@alignOf(ValueArray) == 8);
+    }
     // zincvm.h TableEntry asserts: word-multiple + word-aligned for GC scan.
+    // usize-generic — holds on both LP64 and wasm32.
     std.debug.assert(@sizeOf(TableEntry) % @sizeOf(usize) == 0);
     std.debug.assert(@alignOf(TableEntry) >= @sizeOf(usize));
 }

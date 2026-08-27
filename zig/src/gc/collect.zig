@@ -28,6 +28,16 @@ const roots = @import("roots.zig");
 const Gc = heap.Gc;
 const Trigger = heap.Trigger;
 
+/// Diagnostic print — gated to non-freestanding targets.  std.debug.print
+/// pulls std.Io (lockStderr → std.Options.debug_io) which on freestanding
+/// drags in getrandom/Threaded; the noop on freestanding keeps the verbose
+/// and verify-path call sites compilable without changing native behavior.
+/// (std.debug.panic is NOT gated — on wasm32 stage2_wasm's defaultPanic
+/// short-circuits to @trap, pulling no Io; M2 adds the root panic override.)
+const diag = if (@import("builtin").os.tag != .freestanding) std.debug.print else struct {
+    fn call(comptime _: []const u8, _: anytype) void {}
+}.call;
+
 // ---------------------------------------------------------------------
 //  M2: object movement + typed drain (not yet driven by a collector)
 // ---------------------------------------------------------------------
@@ -415,7 +425,7 @@ pub fn collect(gc: *Gc, trigger: Trigger) void {
     gc.full_collect_count += 1; // C: gc.c:622
     gc.collect_seq += 1; // C: gc.c:623
     if (gc.opts.verbose) {
-        std.debug.print(
+        diag(
             "[GC FULL #{d}] trigger={s} shadow_depth={d} live_pages={d}\n",
             .{ gc.collect_seq, @tagName(trigger), gc.shadow_len, gc.allocatedpages },
         );
@@ -580,7 +590,7 @@ pub fn collectNursery(gc: *Gc, trigger: Trigger) void {
     gc.nursery_scavenge_count += 1;
     gc.collect_seq += 1;
     if (gc.opts.verbose) {
-        std.debug.print(
+        diag(
             "[GC NURSERY #{d}] trigger={s} shadow_depth={d} nursery_free={d}\n",
             .{ gc.collect_seq, @tagName(trigger), gc.shadow_len, gc.nursery_end - gc.nursery_cur },
         );
@@ -745,17 +755,17 @@ fn verifyObject(gc: *const Gc, body: [*]usize, ty: u32, hw: usize, phase: Verify
                 if (ve != 0) {
                     const target = ptrWord(&arr[j].payload.cons.car); // first ptr field approx
                     const tpg = heap.gcpToPage(target);
-                    std.debug.print("    type2 elem {d} (of {d}) tag={d} target=0x{x} target_space={d}", .{ j, count, @intFromEnum(arr[j].tag), target, if (tpg >= gc.firstheappage and tpg <= gc.lastheappage) gc.space[gc.md(tpg)] else 99 });
+                    diag("    type2 elem {d} (of {d}) tag={d} target=0x{x} target_space={d}", .{ j, count, @intFromEnum(arr[j].tag), target, if (tpg >= gc.firstheappage and tpg <= gc.lastheappage) gc.space[gc.md(tpg)] else 99 });
                     // M5 debug: for string/cons elements, show content to ID the value.
                     switch (arr[j].tag) {
                         .string => if (arr[j].payload.str.data != null) {
                             const s: []const u8 = @ptrCast(arr[j].payload.str.data.?[0..@intCast(arr[j].payload.str.len)]);
-                            std.debug.print(" str=\"{s}\"", .{s});
+                            diag(" str=\"{s}\"", .{s});
                         },
-                        .symbol => std.debug.print(" sym={s}", .{@as([*:0]const u8, @ptrCast(arr[j].payload.sym.name.?))[0..]}),
+                        .symbol => diag(" sym={s}", .{@as([*:0]const u8, @ptrCast(arr[j].payload.sym.name.?))[0..]}),
                         else => {},
                     }
-                    std.debug.print("\n", .{});
+                    diag("\n", .{});
                 }
                 e += ve;
             }
@@ -800,7 +810,7 @@ pub fn debugVerifyHeap(gc: *const Gc, phase: VerifyPhase) usize {
 
         // Invariant 1: a free page must be untagged (C: gc.c:899-905).
         if (sp == 0 and tp != 0) {
-            std.debug.print("verify: free page {d} has type_page={d}\n", .{ pg, tp });
+            diag("verify: free page {d} has type_page={d}\n", .{ pg, tp });
             errors += 1;
         }
         // Invariant 2: a CONTINUED page must not follow a free page (C: gc.c
@@ -808,7 +818,7 @@ pub fn debugVerifyHeap(gc: *const Gc, phase: VerifyPhase) usize {
         if (tp == heap.CONTINUED and pg > gc.firstheappage and
             gc.space[gc.md(pg - 1)] == 0)
         {
-            std.debug.print("verify: CONTINUED page {d} follows a free page\n", .{pg});
+            diag("verify: CONTINUED page {d} follows a free page\n", .{pg});
             errors += 1;
         }
     }
@@ -834,7 +844,7 @@ pub fn debugVerifyHeap(gc: *const Gc, phase: VerifyPhase) usize {
                 ty > @intFromEnum(types.GcTypeTag.callframe_array)) break;
             const obj_errors = verifyObject(gc, cp + 1, ty, types.headerWords(hdr), phase);
             if (obj_errors != 0) {
-                std.debug.print("verify: object page {d} type {d} has {d} pointer violations\n", .{ p2, ty, obj_errors });
+                diag("verify: object page {d} type {d} has {d} pointer violations\n", .{ p2, ty, obj_errors });
             }
             errors += obj_errors;
             cp += types.headerWords(hdr);

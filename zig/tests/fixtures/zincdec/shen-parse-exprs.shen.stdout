@@ -1,0 +1,60 @@
+[
+  grab
+  grab
+  pushmark
+  [access 0]
+  [access 1]
+  [access 2]
+  [global shen-skip-ws]
+  apply
+  let
+  [access 1]
+  [access 0]
+  [prim >=]
+  [jmpf 21]
+  [number 0]
+  [prim emptylist]
+  [access 0]
+  [prim cons]
+  [number 0]
+  [prim emptylist]
+  [prim cons]
+  [jmp 57]
+  pushmark
+  [access 1]
+  [access 0]
+  [access 3]
+  [global shen-parse-expr]
+  apply
+  let
+  [access 0]
+  [prim hd]
+  let
+  [access 1]
+  [prim tl]
+  [prim hd]
+  let
+  pushmark
+  [access 4]
+  [access 0]
+  [access 6]
+  [global shen-parse-exprs]
+  apply
+  let
+  [access 0]
+  [prim hd]
+  let
+  [access 1]
+  [prim tl]
+  [prim hd]
+  let
+  [number 0]
+  [prim emptylist]
+  [access 0]
+  [prim cons]
+  [access 1]
+  [access 4]
+  [prim cons]
+  [prim cons]
+  return
+]

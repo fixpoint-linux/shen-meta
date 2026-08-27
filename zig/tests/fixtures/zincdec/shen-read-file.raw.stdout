@@ -1,0 +1,19 @@
+=== shen-read-file ===
+  code_len=16  env_len=0
+
+access 0
+prim read-file-as-string
+let
+pushmark
+access 0
+global strlen
+apply
+let
+pushmark
+access 0
+number 0
+access 1
+global shen-parse-exprs
+apply
+prim hd
+return

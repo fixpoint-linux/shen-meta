@@ -1,0 +1,19 @@
+=== + ===
+  code_len=16  env_len=0
+
+grab
+access 1
+prim number?
+jmpf 7 (tgt=7)
+access 0
+prim number?
+jmp 8 (tgt=8)
+boolean false
+jmpf 13 (tgt=13)
+access 0
+access 1
+prim +
+jmp 15 (tgt=15)
+string "+: invalid args"
+prim simple-error
+return

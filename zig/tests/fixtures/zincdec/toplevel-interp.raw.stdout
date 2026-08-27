@@ -1,0 +1,18 @@
+=== toplevel-interp ===
+  code_len=15  env_len=0
+
+pushmark
+number 0
+prim emptylist
+number 0
+prim emptylist
+number 0
+prim emptylist
+number 0
+prim emptylist
+symbol cons
+prim cons
+access 0
+global interp
+appterm
+return

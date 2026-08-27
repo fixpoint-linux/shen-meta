@@ -48,6 +48,13 @@ const state = @import("state.zig");
 const values = @import("values.zig");
 const prims = @import("prims.zig");
 
+/// Diagnostic print — gated to non-freestanding targets (M1 wasm gate).
+/// The true branch references `std.debug.print` directly (NOT `diag` — a
+/// self-referential `if (...) diag else ...` is a circular-declaration error).
+const diag = if (@import("builtin").os.tag != .freestanding) std.debug.print else struct {
+    fn call(comptime _: []const u8, _: anytype) void {}
+}.call;
+
 const Gc = gc.Gc;
 const Value = types.Value;
 const Vm = state.Vm;
@@ -292,7 +299,7 @@ pub fn vmExecEnv(
         // C:3204-3208 — hard instruction limit.
         instr_count += 1;
         if (instr_count >= instr_limit) {
-            std.debug.print(
+            diag(
                 "[HARD LIMIT] {d} instructions, aborting at pc={d} frames={d}\n",
                 .{ instr_limit, pc, frames_sp },
             );
@@ -410,7 +417,7 @@ pub fn vmExecEnv(
                     }
                     // Pop the required mark (zinc-c always emits pushmark).
                     if (stack.len == 0 or vaPeek(&stack).tag != .mark) {
-                        std.debug.print("runtime: apply missing pushmark\n", .{});
+                        diag("runtime: apply missing pushmark\n", .{});
                         break :run;
                     }
                     _ = vaPop(&stack);
@@ -482,10 +489,10 @@ pub fn vmExecEnv(
                     // trap-error, hard stop otherwise.
                     if (vm.catch_chain != null and vm.catch_chain.?.in_trap_error)
                         return vm.throwShen("apply non-callable");
-                    std.debug.print("runtime: apply non-callable tag={d}", .{@intFromEnum(acc.tag)});
+                    diag("runtime: apply non-callable tag={d}", .{@intFromEnum(acc.tag)});
                     if (acc.tag == .symbol)
-                        std.debug.print(" sym='{s}'", .{values.symSlice(acc)});
-                    std.debug.print(" at pc={d} depth={d}\n", .{ pc, frames_sp });
+                        diag(" sym='{s}'", .{values.symSlice(acc)});
+                    diag(" at pc={d} depth={d}\n", .{ pc, frames_sp });
                     break :run;
                 }
             },
@@ -579,7 +586,7 @@ pub fn vmExecEnv(
                 if (stack.len > 0) acc = vaPop(&stack); // pop function
                 if (acc.tag == .lambda) {
                     if (stack.len <= 0) {
-                        std.debug.print("runtime: appterm empty stack\n", .{});
+                        diag("runtime: appterm empty stack\n", .{});
                         break :run;
                     }
                     var nargs: i32 = 0;
@@ -594,12 +601,12 @@ pub fn vmExecEnv(
                     }
                     // zinc-t always emits pushmark — required.
                     if (stack.len == 0 or vaPeek(&stack).tag != .mark) {
-                        std.debug.print("runtime: appterm missing pushmark\n", .{});
+                        diag("runtime: appterm missing pushmark\n", .{});
                         break :run;
                     }
                     _ = vaPop(&stack); // pop mark
                     if (nargs == 0) {
-                        std.debug.print("runtime: appterm zero args\n", .{});
+                        diag("runtime: appterm zero args\n", .{});
                         break :run;
                     }
 
@@ -652,7 +659,7 @@ pub fn vmExecEnv(
                 } else {
                     if (vm.catch_chain != null and vm.catch_chain.?.in_trap_error)
                         return vm.throwShen("appterm non-lambda");
-                    std.debug.print("runtime: appterm non-lambda\n", .{});
+                    diag("runtime: appterm non-lambda\n", .{});
                     break :run;
                 }
             },
@@ -660,7 +667,7 @@ pub fn vmExecEnv(
             // C:3462 — unknown op (OP_COUNT never appears as a real opcode;
             // char_to_opcode maps unknown chars to it at parse time).
             .count => {
-                std.debug.print("runtime: unknown op {d} at pc={d}\n", .{ @intFromEnum(in.op), pc });
+                diag("runtime: unknown op {d} at pc={d}\n", .{ @intFromEnum(in.op), pc });
                 break :run;
             },
         }

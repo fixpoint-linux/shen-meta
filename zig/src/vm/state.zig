@@ -27,6 +27,15 @@ const prims = @import("prims.zig");
 const parser = @import("parser.zig");
 const streams = @import("streams.zig");
 
+/// Diagnostic print — gated to non-freestanding targets (M2 wasm gate).
+/// std.debug.print pulls std.Io (lockStderr → std.Options.debug_io →
+/// std.Io.Threaded → posix.system.getrandom) which is absent on freestanding.
+/// The noop on freestanding keeps the diagnostics compilable without changing
+/// native behavior.  Matches the M1 diag alias in collect/parser/streams/heap.
+const diag = if (@import("builtin").os.tag != .freestanding) std.debug.print else struct {
+    fn call(comptime _: []const u8, _: anytype) void {}
+}.call;
+
 const Gc = gc.Gc;
 
 /// Plan DECISION A: C's setjmp/longjmp CatchFrame chain (zincvm.c:706-720
@@ -221,12 +230,12 @@ pub const Vm = struct {
         var p: usize = 0;
         while (std.ascii.isWhitespace(buf[p])) p += 1;
         if (p + 1 >= buf.len or buf[p] != '(' or buf[p + 1] != '(') {
-            std.debug.print("bundle error: not a bundle (expected ((...)))\n", .{});
+            diag("bundle error: not a bundle (expected ((...)))\n", .{});
             return 0;
         }
 
         const n = parser.parseBundle(self.gc, &self.symbols, self, buf);
-        std.debug.print("Loaded {d} closures into global table\n", .{n});
+        diag("Loaded {d} closures into global table\n", .{n});
 
         // Register ZINC pattern keywords as symbols (C:4033-4051) — ONLY
         // when the bundle did not itself provide the entry: the bundled

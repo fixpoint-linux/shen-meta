@@ -1,0 +1,132 @@
+=== interp-eval ===
+  code_len=129  env_len=0
+
+0000: access 0
+0001: prim cons?
+0002: jmpf 40  ; -> 0028
+0003: symbol defun
+0004: access 0
+0005: prim hd
+0006: prim =
+0007: jmpf 38  ; -> 0026
+0008: access 0
+0009: prim tl
+000a: prim cons?
+000b: jmpf 36  ; -> 0024
+000c: access 0
+000d: prim tl
+000e: prim tl
+000f: prim cons?
+0010: jmpf 34  ; -> 0022
+0011: access 0
+0012: prim tl
+0013: prim tl
+0014: prim tl
+0015: prim cons?
+0016: jmpf 32  ; -> 0020
+0017: number 0
+0018: prim emptylist
+0019: access 0
+001a: prim tl
+001b: prim tl
+001c: prim tl
+001d: prim tl
+001e: prim =
+001f: jmp 33   ; -> 0021
+0020: boolean false
+0021: jmp 35   ; -> 0023
+0022: boolean false
+0023: jmp 37   ; -> 0025
+0024: boolean false
+0025: jmp 39   ; -> 0027
+0026: boolean false
+0027: jmp 41   ; -> 0029
+0028: boolean false
+0029: jmpf 127  ; -> 007f
+002a: symbol global-table
+002b: prim value
+002c: number 0
+002d: prim emptylist
+002e: pushmark
+002f: pushmark
+0030: pushmark
+0031: number 0
+0032: prim emptylist
+0033: access 0
+0034: prim tl
+0035: prim tl
+0036: prim tl
+0037: prim hd
+0038: prim cons
+0039: access 0
+003a: prim tl
+003b: prim tl
+003c: prim hd
+003d: prim cons
+003e: access 0
+003f: prim tl
+0040: prim hd
+0041: prim cons
+0042: symbol defun
+0043: prim cons
+0044: global defun->lambda
+0045: apply
+0046: global kl->zinc
+0047: apply
+0048: global toplevel-interp
+0049: apply
+004a: prim cons
+004b: access 0
+004c: prim tl
+004d: prim hd
+004e: prim cons
+004f: prim cons
+0050: symbol global-table
+0051: prim set
+0052: let
+0053: symbol global-table
+0054: prim value
+0055: number 0
+0056: prim emptylist
+0057: pushmark
+0058: pushmark
+0059: pushmark
+005a: number 0
+005b: prim emptylist
+005c: access 1
+005d: prim tl
+005e: prim tl
+005f: prim tl
+0060: prim hd
+0061: prim cons
+0062: access 1
+0063: prim tl
+0064: prim tl
+0065: prim hd
+0066: prim cons
+0067: access 1
+0068: prim tl
+0069: prim hd
+006a: prim cons
+006b: symbol defun
+006c: prim cons
+006d: global defun->lambda
+006e: apply
+006f: global kl->zinc
+0070: apply
+0071: global toplevel-interp
+0072: apply
+0073: prim cons
+0074: access 1
+0075: prim tl
+0076: prim hd
+0077: prim cons
+0078: prim cons
+0079: endlet
+007a: let
+007b: access 1
+007c: prim tl
+007d: prim hd
+007e: jmp 128   ; -> 0080
+007f: access 0
+0080: return

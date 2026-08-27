@@ -26,6 +26,17 @@ const collect_mod = @import("collect.zig");
 const roots_mod = @import("roots.zig");
 const scan_mod = @import("scan.zig");
 
+/// Diagnostic print — gated to non-freestanding targets.  std.debug.print
+/// pulls std.Io (lockStderr → std.Options.debug_io) which on freestanding
+/// drags in getrandom/Threaded that the target lacks; the noop on freestanding
+/// keeps the call sites compilable without changing native behavior.
+/// (std.debug.panic is NOT gated here — on wasm32 the stage2_wasm backend's
+/// defaultPanic short-circuits to @trap, pulling no Io; M2 adds the root
+/// panic override for the wasm front-end.)
+const diag = if (@import("builtin").os.tag != .freestanding) std.debug.print else struct {
+    fn call(comptime _: []const u8, _: anytype) void {}
+}.call;
+
 // ---------------------------------------------------------------------
 //  Constants — C: gc.c:28-54, 1798-1799; zincvm.h:38
 // ---------------------------------------------------------------------
@@ -265,31 +276,73 @@ pub const Gc = struct {
         const page_count = opts.heap_bytes / PAGEBYTES;
 
         // C: gc.c:2068-2070 — reserve max(heap*16, 4GB) rounded up to a page.
-        const four_gb: usize = 4096 * 1024 * 1024;
-        const default_reserve = if (opts.heap_bytes * 16 > four_gb)
-            opts.heap_bytes * 16 + PAGEBYTES - 1
-        else
-            four_gb + PAGEBYTES - 1;
-        const reserve_raw = opts.reserve_bytes orelse default_reserve;
-        const reserve = (reserve_raw + std.heap.page_size_min - 1) /
-            std.heap.page_size_min * std.heap.page_size_min;
+        //
+        // WASM32 GATE: the 4GB `four_gb` const OVERFLOWS wasm32 usize (32-bit),
+        // and there is no mmap — so the reserve MATH must be gated, not just
+        // the mmap call.  On wasm the page_allocator backs the heap directly
+        // at opts.heap_bytes (no over-reserve: wasm memory.grow is committed,
+        // not lazy-reserved like mmap).  artifact-1 proved this shim compiles
+        // and runs the moving GC on both wasm32-wasi and (with the rest of M1)
+        // freestanding.  The native path is byte-identical to the pre-gate code.
+        const native = @import("builtin").cpu.arch != .wasm32;
+        var heap_addr: usize = 0;
+        var mmap_size: usize = 0;
+        // Only one of these is non-null per branch; the errdefer at the end of
+        // init frees whichever was allocated.  Kept at function scope (not
+        // inside the if) so a LATER metadata-alloc failure still releases the
+        // heap reservation — matching the pre-gate errdefer semantics.
+        var mmap_slice: ?[]align(std.heap.page_size_min) u8 = null;
+        var wasm_slice: ?[]align(PAGEBYTES) u8 = null;
+        if (native) {
+            const four_gb: usize = 4096 * 1024 * 1024;
+            const default_reserve = if (opts.heap_bytes * 16 > four_gb)
+                opts.heap_bytes * 16 + PAGEBYTES - 1
+            else
+                four_gb + PAGEBYTES - 1;
+            const reserve_raw = opts.reserve_bytes orelse default_reserve;
+            const reserve = (reserve_raw + std.heap.page_size_min - 1) /
+                std.heap.page_size_min * std.heap.page_size_min;
 
-        // C: gc.c:2080-2089 mmap(PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON).
-        const mapping = try std.posix.mmap(
-            null,
-            reserve,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-            -1,
-            0,
-        );
-        errdefer std.posix.munmap(mapping);
+            // C: gc.c:2080-2089 mmap(PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON).
+            const mapping = try std.posix.mmap(
+                null,
+                reserve,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+                -1,
+                0,
+            );
+            mmap_slice = mapping;
 
-        // C: gc.c:2093-2096 — page-align the heap start to PAGEBYTES (mmap
-        // already returns >= 4096-aligned, so this is normally a no-op).
-        var heap_addr = @intFromPtr(mapping.ptr);
-        if (heap_addr & (PAGEBYTES - 1) != 0)
-            heap_addr += PAGEBYTES - (heap_addr & (PAGEBYTES - 1));
+            // C: gc.c:2093-2096 — page-align the heap start to PAGEBYTES (mmap
+            // already returns >= 4096-aligned, so this is normally a no-op).
+            heap_addr = @intFromPtr(mapping.ptr);
+            if (heap_addr & (PAGEBYTES - 1) != 0)
+                heap_addr += PAGEBYTES - (heap_addr & (PAGEBYTES - 1));
+            mmap_size = reserve;
+        } else {
+            // WASM: page_allocator.alignedAlloc returns 64KB-aligned memory
+            // (>= PAGEBYTES), committed at exactly opts.heap_bytes.  No mmap,
+            // no 4GB overflow.
+            const slice = std.heap.page_allocator.alignedAlloc(
+                u8,
+                .fromByteUnits(PAGEBYTES),
+                opts.heap_bytes,
+            ) catch return error.OutOfMemory;
+            wasm_slice = slice;
+            heap_addr = @intFromPtr(slice.ptr);
+            mmap_size = opts.heap_bytes;
+        }
+        // Function-scope errdefer: release the heap reservation if any LATER
+        // step (metadata allocs below) fails.  `native` is comptime-known so
+        // only the taken branch is analyzed on each target.
+        errdefer {
+            if (native) {
+                if (mmap_slice) |m| std.posix.munmap(m);
+            } else {
+                if (wasm_slice) |w| std.heap.page_allocator.free(w);
+            }
+        }
 
         const firstpage = gcpToPage(heap_addr);
 
@@ -320,8 +373,8 @@ pub const Gc = struct {
             .page_queued = pq,
             .current_space = 1, // C: gc.c:2148
             .next_space = 1, // C: gc.c:2149
-            .raw_heap_start = @intFromPtr(mapping.ptr),
-            .heap_mmap_size = reserve,
+            .raw_heap_start = heap_addr,
+            .heap_mmap_size = mmap_size,
             .opts = opts,
         };
 
@@ -352,8 +405,18 @@ pub const Gc = struct {
     /// Release the mmap reservation and all NON-GC metadata (C: gc.c:302-308
     /// kept raw pointers "for eventual teardown"; the port provides it).
     pub fn deinit(self: *Gc) void {
-        const mmap_slice = @as([*]align(std.heap.page_size_min) const u8, @ptrFromInt(self.raw_heap_start))[0..self.heap_mmap_size];
-        std.posix.munmap(mmap_slice);
+        // WASM32 GATE: native unmaps the mmap reservation; wasm frees the
+        // page_allocator slice (same alignment it was allocated with).  The
+        // `native` const is comptime-known so only the taken branch analyzes
+        // std.posix.munmap (native) / page_allocator.free (wasm).
+        const native = @import("builtin").cpu.arch != .wasm32;
+        if (native) {
+            const mmap_slice = @as([*]align(std.heap.page_size_min) const u8, @ptrFromInt(self.raw_heap_start))[0..self.heap_mmap_size];
+            std.posix.munmap(mmap_slice);
+        } else {
+            const slice = @as([*]align(PAGEBYTES) u8, @ptrFromInt(self.raw_heap_start))[0..self.heap_mmap_size];
+            std.heap.page_allocator.free(slice);
+        }
         const pa = std.heap.page_allocator;
         pa.free(self.space);
         pa.free(self.gc_link);
@@ -472,7 +535,7 @@ pub const Gc = struct {
         }
 
         // C: gc.c:1843-1845.
-        std.debug.print(
+        diag(
             "[gc] grow_heap: need {d} MB but reservation is {d} MB\n",
             .{ new_heap_size / (1024 * 1024), self.heap_mmap_size / (1024 * 1024) },
         );

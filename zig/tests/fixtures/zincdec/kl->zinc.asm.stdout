@@ -1,0 +1,23 @@
+=== kl->zinc ===
+  code_len=20  env_len=0
+
+0000: pushmark
+0001: access 0
+0002: global kmacros
+0003: apply
+0004: let
+0005: pushmark
+0006: access 0
+0007: global normalize-term
+0008: apply
+0009: let
+000a: pushmark
+000b: pushmark
+000c: access 0
+000d: number 0
+000e: prim emptylist
+000f: global debruijn
+0010: apply
+0011: global zinc-c
+0012: appterm
+0013: return

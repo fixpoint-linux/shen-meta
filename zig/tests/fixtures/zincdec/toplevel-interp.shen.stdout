@@ -1,0 +1,17 @@
+[
+  pushmark
+  [number 0]
+  [prim emptylist]
+  [number 0]
+  [prim emptylist]
+  [number 0]
+  [prim emptylist]
+  [number 0]
+  [prim emptylist]
+  [symbol cons]
+  [prim cons]
+  [access 0]
+  [global interp]
+  appterm
+  return
+]

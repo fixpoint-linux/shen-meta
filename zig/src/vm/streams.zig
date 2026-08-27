@@ -35,6 +35,55 @@ const ValueArray = types.ValueArray;
 const Vm = state.Vm;
 const VmError = state.VmError;
 
+/// Comptime wasm gate — true on wasm32-freestanding/wasi.  The file-stream
+/// prim handlers below branch on this so the std.posix calls (read/openat/
+/// system.write/close) are NOT analyzed on wasm (only the taken branch is).
+/// The string-stream registry path is pure (no posix) and stays active on
+/// every target — the wasm VM can still string-stream.
+const is_wasm = @import("builtin").cpu.arch.isWasm();
+
+/// Diagnostic print — gated to non-freestanding targets.  std.debug.print
+/// pulls std.Io (lockStderr → std.Options.debug_io) which on freestanding
+/// drags in getrandom/Threaded; the noop on freestanding keeps the stream
+/// diagnostics compilable without changing native behavior.
+const diag = if (@import("builtin").os.tag != .freestanding) std.debug.print else struct {
+    fn call(comptime _: []const u8, _: anytype) void {}
+}.call;
+
+/// WASM output drain — write-byte on fd 1 (*stoutput*) appends here on wasm
+/// (there is no real fd 1 to write to under freestanding).  M2's wasm
+/// front-end exports a `shen_take_out` that drains this buffer to JS.  On
+/// native targets this is dead (the std.posix.system.write path runs); the
+/// buffer costs only BSS.  Further writes past the cap are dropped (overflow
+/// flag set so M2 can detect truncation if it cares).
+const WASM_OUT_CAP: usize = 1 << 20; // 1 MiB
+var wasm_out: struct {
+    buf: [WASM_OUT_CAP]u8 = undefined,
+    len: usize = 0,
+    overflow: bool = false,
+} = .{};
+
+/// Drain the wasm output buffer to a caller-provided buffer (M2 front-end).
+/// Copies up to `cap` bytes from `wasm_out` into `out`, then shifts the
+/// remaining contents down.  Returns the number of bytes copied.  On wasm
+/// this is the ONLY path JS pulls VM output through (write-byte on fd 1
+/// appends to `wasm_out`; `shen_take_out` drains it).  On native this is dead
+/// code (the std.posix.system.write path runs) but costs only BSS + a few
+/// instructions.
+pub fn drainWasmOut(out: [*]u8, cap: c_int) c_int {
+    const c: usize = if (cap > 0) @intCast(cap) else 0;
+    const n: usize = @min(wasm_out.len, c);
+    if (n > 0) {
+        @memcpy(out[0..n], wasm_out.buf[0..n]);
+        const remaining = wasm_out.len - n;
+        if (remaining > 0) {
+            @memmove(wasm_out.buf[0..remaining], wasm_out.buf[n .. n + remaining]);
+        }
+        wasm_out.len = remaining;
+    }
+    return @intCast(n);
+}
+
 /// C: zincvm.c:360 MAX_STRING_STREAMS.
 pub const MAX_STRING_STREAMS = 8;
 
@@ -60,13 +109,13 @@ pub const StreamRegistry = struct {
     /// VAL_ERROR (C val_error) with a stderr note.
     pub fn valStringStreamIn(self: *StreamRegistry, g: *Gc, src: []const u8) Value {
         if (self.n_string_streams >= MAX_STRING_STREAMS) {
-            std.debug.print("runtime: too many string streams\n", .{});
+            diag("runtime: too many string streams\n", .{});
             return values.valError(g, "too many string streams");
         }
         const idx: usize = @intCast(self.n_string_streams);
         const a = std.heap.page_allocator;
         const data = a.alloc(u8, src.len + 1) catch {
-            std.debug.print("runtime: string stream alloc failed\n", .{});
+            diag("runtime: string stream alloc failed\n", .{});
             return values.valError(g, "out of memory");
         };
         @memcpy(data[0..src.len], src);
@@ -130,12 +179,27 @@ pub fn valStreamOutFd(fd: i32) Value {
 /// byte written.  C's stdout-fflush special-case is dead here: raw fd writes
 /// are unbuffered by construction.
 pub fn primWriteByte(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
-    _ = vm;
     const byte = interp.vaPop(stack);
     const s = interp.vaPop(stack);
     const fd = streamFd(s);
     const b: [1]u8 = .{@truncate(@as(u64, @bitCast(byte.payload.number)))};
-    _ = std.posix.system.write(fd, &b, 1);
+    if (is_wasm) {
+        // WASM: no real fds.  fd 1 (*stoutput*) drains to the wasm_out buffer
+        // (M2 exports shen_take_out to pull it).  fd 2 (*sterror*) is silently
+        // dropped; any other fd is a host-op we cannot satisfy.
+        if (fd == 1) {
+            if (wasm_out.len < WASM_OUT_CAP) {
+                wasm_out.buf[wasm_out.len] = b[0];
+                wasm_out.len += 1;
+            } else {
+                wasm_out.overflow = true;
+            }
+        } else if (fd != 2) {
+            return vm.throwShen("write-byte: stream op not supported on wasm");
+        }
+    } else {
+        _ = std.posix.system.write(fd, &b, 1);
+    }
     acc.* = byte;
 }
 
@@ -160,6 +224,14 @@ pub fn primReadByte(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
             ss.pos += 1;
             acc.* = values.valNumber(b);
         }
+        return;
+    }
+    if (is_wasm) {
+        // WASM: file-stream reads are unsupported (no real fds); stdin (fd 0)
+        // is meaningless in a browser line-eval.  Return EOF (C parity for a
+        // read failure on a dead fd) rather than throw so a polling reader
+        // terminates cleanly.
+        acc.* = values.valNumber(-1);
         return;
     }
     const fd = streamFd(s);
@@ -188,8 +260,15 @@ pub fn primReadFileAsString(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!vo
     const g = vm.gc;
     const path = interp.vaPop(stack);
     const p = values.strSlice(path);
+    if (is_wasm) {
+        // WASM: no host filesystem under freestanding; return "" (C parity for
+        // an open failure) rather than throw so a bundle that probes for an
+        // absent file via read-file-as-string degrades cleanly.
+        acc.* = values.valString(g, "");
+        return;
+    }
     const fd = std.posix.openat(std.posix.AT.FDCWD, p, .{}, 0) catch {
-        std.debug.print("runtime: cannot open file for read-file-as-string\n", .{});
+        diag("runtime: cannot open file for read-file-as-string\n", .{});
         acc.* = values.valString(g, "");
         return;
     };
@@ -223,6 +302,18 @@ pub fn primOpen(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     const dir = interp.vaPop(stack);
     const p = values.strSlice(path);
     const d = values.symSlice(dir);
+    if (is_wasm) {
+        // WASM: no host filesystem.  Preserve the C 'in' quirk (ENOENT → a
+        // STRING stream of the PATH bytes) since that path is pure and lets
+        // the wasm VM string-stream; 'out' and any actual file open are
+        // unsatisfiable → false (C parity for an open failure).
+        if (std.mem.eql(u8, d, "in")) {
+            acc.* = vm.streams.valStringStreamIn(vm.gc, p);
+            return;
+        }
+        acc.* = values.valBoolean(false);
+        return;
+    }
     if (std.mem.eql(u8, d, "in")) {
         const fd = std.posix.openat(std.posix.AT.FDCWD, p, .{}, 0) catch |e| {
             if (e == error.FileNotFound) {
@@ -260,7 +351,7 @@ pub fn primClose(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     if (s.payload.stream.is_string != 0) {
         const idx: i64 = @as(i64, @intCast(@intFromPtr(s.payload.stream.file.?))) - 1;
         if (idx < 0 or idx >= vm.streams.n_string_streams) {
-            std.debug.print("runtime: bad string stream idx\n", .{});
+            diag("runtime: bad string stream idx\n", .{});
             return error.Halt;
         }
         vm.streams.freeStringStream(@intCast(idx));
@@ -268,7 +359,13 @@ pub fn primClose(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
         return;
     }
     if (s.payload.stream.file != null) {
-        _ = std.posix.system.close(streamFd(s));
+        if (is_wasm) {
+            // WASM: no real fd to close; the file pointer is a logical handle
+            // we never actually opened.  No-op (matches C's "close succeeds"
+            // semantics for a stream we own).
+        } else {
+            _ = std.posix.system.close(streamFd(s));
+        }
     }
     acc.* = values.valNil();
 }

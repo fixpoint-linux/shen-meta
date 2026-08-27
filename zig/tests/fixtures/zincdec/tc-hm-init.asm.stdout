@@ -1,0 +1,30 @@
+=== tc-hm-init ===
+  code_len=27  env_len=0
+
+0000: number 0
+0001: symbol tc-counter
+0002: prim set
+0003: let
+0004: pushmark
+0005: number 0
+0006: global tc-build-prim-table
+0007: apply
+0008: symbol tc-prim-table
+0009: prim set
+000a: let
+000b: number 0
+000c: symbol tc-sig-tvar-counter
+000d: prim set
+000e: let
+000f: number 0
+0010: prim emptylist
+0011: symbol tc-sig-tvar-map
+0012: prim set
+0013: let
+0014: number 0
+0015: prim emptylist
+0016: symbol tc-global-sig-table
+0017: prim set
+0018: let
+0019: symbol done
+001a: return

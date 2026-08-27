@@ -1,0 +1,18 @@
+[
+  grab
+  [access 1]
+  [prim number?]
+  [jmpf 7]
+  [access 0]
+  [prim number?]
+  [jmp 8]
+  [boolean false]
+  [jmpf 13]
+  [access 0]
+  [access 1]
+  [prim +]
+  [jmp 15]
+  [string "+: invalid args"]
+  [prim simple-error]
+  return
+]

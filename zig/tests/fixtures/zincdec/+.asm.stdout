@@ -1,0 +1,19 @@
+=== + ===
+  code_len=16  env_len=0
+
+0000: grab
+0001: access 1
+0002: prim number?
+0003: jmpf 7  ; -> 0007
+0004: access 0
+0005: prim number?
+0006: jmp 8   ; -> 0008
+0007: boolean false
+0008: jmpf 13  ; -> 000d
+0009: access 0
+000a: access 1
+000b: prim +
+000c: jmp 15   ; -> 000f
+000d: string "+: invalid args"
+000e: prim simple-error
+000f: return

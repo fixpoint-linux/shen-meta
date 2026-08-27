@@ -1,0 +1,394 @@
+=== extract-kl ===
+  code_len=391  env_len=0
+
+0000: access 0
+0001: prim cons?
+0002: jmpf 16  ; -> 0010
+0003: symbol cons
+0004: access 0
+0005: prim hd
+0006: prim =
+0007: jmpf 14  ; -> 000e
+0008: number 0
+0009: prim emptylist
+000a: access 0
+000b: prim tl
+000c: prim =
+000d: jmp 15   ; -> 000f
+000e: boolean false
+000f: jmp 17   ; -> 0011
+0010: boolean false
+0011: jmpf 21  ; -> 0015
+0012: number 0
+0013: prim emptylist
+0014: jmp 390   ; -> 0186
+0015: access 0
+0016: prim cons?
+0017: jmpf 52  ; -> 0034
+0018: symbol cons
+0019: access 0
+001a: prim hd
+001b: prim =
+001c: jmpf 50  ; -> 0032
+001d: access 0
+001e: prim tl
+001f: prim cons?
+0020: jmpf 48  ; -> 0030
+0021: access 0
+0022: prim tl
+0023: prim tl
+0024: prim cons?
+0025: jmpf 46  ; -> 002e
+0026: number 0
+0027: prim emptylist
+0028: access 0
+0029: prim tl
+002a: prim tl
+002b: prim tl
+002c: prim =
+002d: jmp 47   ; -> 002f
+002e: boolean false
+002f: jmp 49   ; -> 0031
+0030: boolean false
+0031: jmp 51   ; -> 0033
+0032: boolean false
+0033: jmp 53   ; -> 0035
+0034: boolean false
+0035: jmpf 69  ; -> 0045
+0036: pushmark
+0037: access 0
+0038: prim tl
+0039: prim tl
+003a: prim hd
+003b: global extract-kl
+003c: apply
+003d: pushmark
+003e: access 0
+003f: prim tl
+0040: prim hd
+0041: global extract-kl
+0042: apply
+0043: prim cons
+0044: jmp 390   ; -> 0186
+0045: access 0
+0046: prim cons?
+0047: jmpf 92  ; -> 005c
+0048: symbol number
+0049: access 0
+004a: prim hd
+004b: prim =
+004c: jmpf 90  ; -> 005a
+004d: access 0
+004e: prim tl
+004f: prim cons?
+0050: jmpf 88  ; -> 0058
+0051: number 0
+0052: prim emptylist
+0053: access 0
+0054: prim tl
+0055: prim tl
+0056: prim =
+0057: jmp 89   ; -> 0059
+0058: boolean false
+0059: jmp 91   ; -> 005b
+005a: boolean false
+005b: jmp 93   ; -> 005d
+005c: boolean false
+005d: jmpf 98  ; -> 0062
+005e: access 0
+005f: prim tl
+0060: prim hd
+0061: jmp 390   ; -> 0186
+0062: access 0
+0063: prim cons?
+0064: jmpf 121  ; -> 0079
+0065: symbol symbol
+0066: access 0
+0067: prim hd
+0068: prim =
+0069: jmpf 119  ; -> 0077
+006a: access 0
+006b: prim tl
+006c: prim cons?
+006d: jmpf 117  ; -> 0075
+006e: number 0
+006f: prim emptylist
+0070: access 0
+0071: prim tl
+0072: prim tl
+0073: prim =
+0074: jmp 118   ; -> 0076
+0075: boolean false
+0076: jmp 120   ; -> 0078
+0077: boolean false
+0078: jmp 122   ; -> 007a
+0079: boolean false
+007a: jmpf 127  ; -> 007f
+007b: access 0
+007c: prim tl
+007d: prim hd
+007e: jmp 390   ; -> 0186
+007f: access 0
+0080: prim cons?
+0081: jmpf 150  ; -> 0096
+0082: symbol string
+0083: access 0
+0084: prim hd
+0085: prim =
+0086: jmpf 148  ; -> 0094
+0087: access 0
+0088: prim tl
+0089: prim cons?
+008a: jmpf 146  ; -> 0092
+008b: number 0
+008c: prim emptylist
+008d: access 0
+008e: prim tl
+008f: prim tl
+0090: prim =
+0091: jmp 147   ; -> 0093
+0092: boolean false
+0093: jmp 149   ; -> 0095
+0094: boolean false
+0095: jmp 151   ; -> 0097
+0096: boolean false
+0097: jmpf 156  ; -> 009c
+0098: access 0
+0099: prim tl
+009a: prim hd
+009b: jmp 390   ; -> 0186
+009c: access 0
+009d: prim cons?
+009e: jmpf 179  ; -> 00b3
+009f: symbol boolean
+00a0: access 0
+00a1: prim hd
+00a2: prim =
+00a3: jmpf 177  ; -> 00b1
+00a4: access 0
+00a5: prim tl
+00a6: prim cons?
+00a7: jmpf 175  ; -> 00af
+00a8: number 0
+00a9: prim emptylist
+00aa: access 0
+00ab: prim tl
+00ac: prim tl
+00ad: prim =
+00ae: jmp 176   ; -> 00b0
+00af: boolean false
+00b0: jmp 178   ; -> 00b2
+00b1: boolean false
+00b2: jmp 180   ; -> 00b4
+00b3: boolean false
+00b4: jmpf 185  ; -> 00b9
+00b5: access 0
+00b6: prim tl
+00b7: prim hd
+00b8: jmp 390   ; -> 0186
+00b9: access 0
+00ba: prim cons?
+00bb: jmpf 216  ; -> 00d8
+00bc: symbol lambda
+00bd: access 0
+00be: prim hd
+00bf: prim =
+00c0: jmpf 214  ; -> 00d6
+00c1: access 0
+00c2: prim tl
+00c3: prim cons?
+00c4: jmpf 212  ; -> 00d4
+00c5: access 0
+00c6: prim tl
+00c7: prim tl
+00c8: prim cons?
+00c9: jmpf 210  ; -> 00d2
+00ca: number 0
+00cb: prim emptylist
+00cc: access 0
+00cd: prim tl
+00ce: prim tl
+00cf: prim tl
+00d0: prim =
+00d1: jmp 211   ; -> 00d3
+00d2: boolean false
+00d3: jmp 213   ; -> 00d5
+00d4: boolean false
+00d5: jmp 215   ; -> 00d7
+00d6: boolean false
+00d7: jmp 217   ; -> 00d9
+00d8: boolean false
+00d9: jmpf 232  ; -> 00e8
+00da: number 0
+00db: prim emptylist
+00dc: access 0
+00dd: prim tl
+00de: prim tl
+00df: prim hd
+00e0: prim cons
+00e1: access 0
+00e2: prim tl
+00e3: prim hd
+00e4: prim cons
+00e5: symbol lambda
+00e6: prim cons
+00e7: jmp 390   ; -> 0186
+00e8: access 0
+00e9: prim cons?
+00ea: jmpf 255  ; -> 00ff
+00eb: symbol error
+00ec: access 0
+00ed: prim hd
+00ee: prim =
+00ef: jmpf 253  ; -> 00fd
+00f0: access 0
+00f1: prim tl
+00f2: prim cons?
+00f3: jmpf 251  ; -> 00fb
+00f4: number 0
+00f5: prim emptylist
+00f6: access 0
+00f7: prim tl
+00f8: prim tl
+00f9: prim =
+00fa: jmp 252   ; -> 00fc
+00fb: boolean false
+00fc: jmp 254   ; -> 00fe
+00fd: boolean false
+00fe: jmp 256   ; -> 0100
+00ff: boolean false
+0100: jmpf 261  ; -> 0105
+0101: access 0
+0102: prim tl
+0103: prim hd
+0104: jmp 390   ; -> 0186
+0105: access 0
+0106: prim cons?
+0107: jmpf 284  ; -> 011c
+0108: symbol absvector
+0109: access 0
+010a: prim hd
+010b: prim =
+010c: jmpf 282  ; -> 011a
+010d: access 0
+010e: prim tl
+010f: prim cons?
+0110: jmpf 280  ; -> 0118
+0111: number 0
+0112: prim emptylist
+0113: access 0
+0114: prim tl
+0115: prim tl
+0116: prim =
+0117: jmp 281   ; -> 0119
+0118: boolean false
+0119: jmp 283   ; -> 011b
+011a: boolean false
+011b: jmp 285   ; -> 011d
+011c: boolean false
+011d: jmpf 290  ; -> 0122
+011e: access 0
+011f: prim tl
+0120: prim hd
+0121: jmp 390   ; -> 0186
+0122: access 0
+0123: prim cons?
+0124: jmpf 329  ; -> 0149
+0125: symbol stream
+0126: access 0
+0127: prim hd
+0128: prim =
+0129: jmpf 327  ; -> 0147
+012a: access 0
+012b: prim tl
+012c: prim cons?
+012d: jmpf 325  ; -> 0145
+012e: symbol in
+012f: access 0
+0130: prim tl
+0131: prim hd
+0132: prim =
+0133: jmpf 323  ; -> 0143
+0134: access 0
+0135: prim tl
+0136: prim tl
+0137: prim cons?
+0138: jmpf 321  ; -> 0141
+0139: number 0
+013a: prim emptylist
+013b: access 0
+013c: prim tl
+013d: prim tl
+013e: prim tl
+013f: prim =
+0140: jmp 322   ; -> 0142
+0141: boolean false
+0142: jmp 324   ; -> 0144
+0143: boolean false
+0144: jmp 326   ; -> 0146
+0145: boolean false
+0146: jmp 328   ; -> 0148
+0147: boolean false
+0148: jmp 330   ; -> 014a
+0149: boolean false
+014a: jmpf 336  ; -> 0150
+014b: access 0
+014c: prim tl
+014d: prim tl
+014e: prim hd
+014f: jmp 390   ; -> 0186
+0150: access 0
+0151: prim cons?
+0152: jmpf 375  ; -> 0177
+0153: symbol stream
+0154: access 0
+0155: prim hd
+0156: prim =
+0157: jmpf 373  ; -> 0175
+0158: access 0
+0159: prim tl
+015a: prim cons?
+015b: jmpf 371  ; -> 0173
+015c: symbol out
+015d: access 0
+015e: prim tl
+015f: prim hd
+0160: prim =
+0161: jmpf 369  ; -> 0171
+0162: access 0
+0163: prim tl
+0164: prim tl
+0165: prim cons?
+0166: jmpf 367  ; -> 016f
+0167: number 0
+0168: prim emptylist
+0169: access 0
+016a: prim tl
+016b: prim tl
+016c: prim tl
+016d: prim =
+016e: jmp 368   ; -> 0170
+016f: boolean false
+0170: jmp 370   ; -> 0172
+0171: boolean false
+0172: jmp 372   ; -> 0174
+0173: boolean false
+0174: jmp 374   ; -> 0176
+0175: boolean false
+0176: jmp 376   ; -> 0178
+0177: boolean false
+0178: jmpf 382  ; -> 017e
+0179: access 0
+017a: prim tl
+017b: prim tl
+017c: prim hd
+017d: jmp 390   ; -> 0186
+017e: symbol mark
+017f: access 0
+0180: prim =
+0181: jmpf 389  ; -> 0185
+0182: number 0
+0183: prim emptylist
+0184: jmp 390   ; -> 0186
+0185: access 0
+0186: return
