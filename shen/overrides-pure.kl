@@ -1,7 +1,0 @@
-\\ overrides-pure.kl — host primitives needed by the standard Shen OS Kernel
-\\ that are not defined in any .kl file.  Each Shen port must provide these.
-\\ In our C VM, character streams are not supported, so both return false.
-
-(defun shen.char-stinput? (V528) false)
-
-(defun shen.char-stoutput? (V529) false)

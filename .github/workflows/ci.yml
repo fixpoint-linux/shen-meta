@@ -12,13 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgc-dev
+      - uses: mlugg/setup-zig@v1
 
-      - name: Build
-        run: make
-
-      - name: Test (built-in)
+      # Tests that don't need the bundle run first (fast feedback).
+      - name: Test (gc + vm suites, Debug)
         run: make test
 
   self-hosting:
@@ -28,11 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgc-dev
-
-      - name: Build C VM
-        run: make
+      - uses: mlugg/setup-zig@v1
 
       # The repo vendors a working shen-scheme binary (Makefile SHEN points at
       # vendor/shen-scheme/bin/shen-scheme), so the bundle builds directly.
@@ -42,5 +35,7 @@ jobs:
       - name: Bundle (vendored shen-scheme)
         run: make bundle
 
-      - name: Test (self-hosting)
-        run: timeout 120 make run-bundle
+      # M6b canary: load the real ../globals.csexp into the Zig VM and prove
+      # the bundled defuns stay callable (see zig/tests/vm_test.zig).
+      - name: Test with real bundle (Zig M6b realBundleLoad)
+        run: cd zig && zig build test -Doptimize=Debug --summary all

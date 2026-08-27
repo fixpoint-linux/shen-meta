@@ -12,7 +12,7 @@ assignees: ''
 **Why does it matter?**
 
 **Relevant area**
-- [ ] C VM (zincvm.c)
+- [ ] Zig VM (`zig/src/vm/`)
 - [ ] Shen compiler (shen/*.shen)
 - [ ] Serialization / bundle format
 - [ ] Build / tooling

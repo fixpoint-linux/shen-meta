@@ -8,7 +8,8 @@
 
 ### 1.1 "Only vectors mutable" claim — VERIFIED CORRECT (with one nuance)
 
-I traced every write to GC-managed memory in `vm/zincvm.c`:
+I traced every write to GC-managed memory in the (C-era, now deleted) `zincvm.c`;
+the design below is implemented by the Zig GC (`zig/src/gc/`):
 
 **Confirmed mutation sites (GC-managed heap):**
 1. `address->` primitive, line 927: `vec.vector.data[i] = val;` — the ONLY write to any GC-managed pointer array.
@@ -31,7 +32,7 @@ I traced every write to GC-managed memory in `vm/zincvm.c`:
 **BiBOP old-gen is over-engineered for v1.** BiBOP (Big Bag of Pages) size-class pages are excellent for workloads with many size classes and frequent old-gen allocation. Shen's old gen is populated almost entirely at startup (bundle load) and then stable. A simpler mark-sweep with lazy sweeping, or even a stop-the-world copying collector for the whole heap (no generations), would be easier to get correct first.
 
 **Recommendation (updated for Phase 2):** Phase 1 chose a single-space
-Cheney mostly-copying collector (done, in `vm/gc.c`). Phase 2 adds a **nursery
+Cheney mostly-copying collector (done; now `zig/src/gc/collect.zig`). Phase 2 adds a **nursery
 fast lane + the existing full-copy `collect()` as the old-gen collector** — NOT
 mark-sweep. The existing pinning + Cheney-queue machinery extends naturally to a
 nursery scavenge, and full collect compacts old gen for free. Mark-sweep old gen
@@ -46,7 +47,7 @@ redundant since `global_table` is conservatively pinned as an extra_root).
 
 The pattern `Value *ne = GC_VALUE_ARRAY(n); memcpy(ne, X.lambda.env, ...)` appears at lines 983, 998, 1197, 1210, 1223, 1616, 1714, 2047, 2070, 2284, 2315. The `GC_VALUE_ARRAY` call can trigger a collection that moves `X.lambda.env`. Then `X.lambda.env` (read from a local `Value` copy) is a stale pointer.
 
-**With Boehm:** Safe (non-moving).
+**With Boehm (the C-era baseline):** safe — non-moving.
 **With moving GC:** The local `Value` (e.g., `acc` in OP_APPLY, `body`/`handler` in trap-error, `extkl`/`klzinc`/`tli` in eval-kl) must be a **precise root** that the GC finds on the C stack and updates in-place. This requires:
 - The GC to scan the C stack in word-sized increments.
 - For each word that looks like a `Value*` or is inside a `Value` struct, know whether it's a GC pointer and update it.
@@ -118,7 +119,7 @@ See Hazard 3 above. The key risk is `Value` locals in callee-saved registers bei
 - `run_test_timeout` (line 1799-1818): `code`, `len` (not Values, but `Instr*` is a GC pointer — must be `volatile`).
 - `alarm_handler` longjmp (line 1779): jumps out of vm_exec recursion. All `Value` locals in the vm_exec_env frame are abandoned — the GC must not try to scan them (they're dead). This is fine as long as the GC runs BEFORE the longjmp (it won't — `alarm_handler` is a signal handler that longjmps directly).
 
-**Signal handler + GC:** `alarm_handler` (line 1773-1780) does `longjmp` from a signal handler. If a GC is in progress when SIGALRM fires, the longjmp corrupts the GC state. **Mitigation:** block SIGALRM during GC, or use `sigprocmask` to defer the signal. This is a new concern that Boehm doesn't have (Boehm blocks signals internally).
+**Signal handler + GC:** `alarm_handler` (line 1773-1780) does `longjmp` from a signal handler. If a GC is in progress when SIGALRM fires, the longjmp corrupts the GC state. **Mitigation:** block SIGALRM during GC, or use `sigprocmask` to defer the signal. This is a concern a GC library like Boehm handles internally (it blocks signals); a custom collector must do it itself.
 
 ---
 
@@ -129,14 +130,14 @@ See Hazard 3 above. The key risk is `Value` locals in callee-saved registers bei
 **Goal:** Make the codebase moving-GC-ready without changing the collector.
 
 **Step 0.1: Add `volatile` to all `Value` locals read after `longjmp`.**
-- File: `vm/zincvm.c`
+- File: the C-era `zincvm.c` (locus now in `zig/src/vm/interp.zig`)
 - `trap-error` handler (line 997): `volatile Value handler` — but `handler` is set at line 969 before `setjmp`, read at 997-1003 after `longjmp`. Make it `volatile`.
 - `eval-kl` (line 1185): `volatile Value result` — set before `setjmp`, read after `longjmp`.
 - `run_test_timeout` (line 1787-1788): `Instr *code` is GC-managed. Make `volatile Instr *code`.
-- Test: `make test` — should pass (volatile doesn't change behavior with Boehm).
+- Test: `make test` — should pass.
 
 **Step 0.2: Add a `scan_value(Value *v)` function.**
-- File: `vm/zincvm.c`, new function before `vm_exec_env`.
+- Locus: the interpreter loop (now `zig/src/vm/interp.zig`, before the exec-env entry point).
 - Switches on `v->tag`, scans the appropriate pointer fields.
 - For `VAL_CONS`: scan `*v.cons.car` and `*v.cons.cdr` (recursively, or enqueue for the scavenger).
 - For `VAL_LAMBDA`: scan `v.lambda.code` (Instr array — scan `operand` and `closure_code` fields) and `v.lambda.env` (Value array).
@@ -154,10 +155,10 @@ See Hazard 3 above. The key risk is `Value` locals in callee-saved registers bei
 
 ### Phase 1: Single-space stop-and-copy (Cheney) collector
 
-**Goal:** Replace Boehm with the simplest possible moving collector. No generations, no barrier.
+**Goal:** Replace the baseline Boehm setup with the simplest possible moving collector. No generations, no barrier.
 
 **Step 1.1: Implement the collector core.**
-- New file: `vm/gc.c` (or inline in `zincvm.c` for now).
+- New file: a dedicated GC module (now `zig/src/gc/heap.zig` + `collect.zig`).
 - Two semi-spaces: `from_space` and `to_space`, each a contiguous mmap'd region.
 - Bump-pointer allocation in `from_space`.
 - `gc_collect()`: Cheney-style copy from `from_space` to `to_space`, then swap.
@@ -175,10 +176,10 @@ See Hazard 3 above. The key risk is `Value` locals in callee-saved registers bei
 **Step 1.3: Implement root scanning.**
 - C stack: scan from `__builtin_frame_address(0)` to the stack base. For each word, check if it's a `Value*` pointing into `from_space`. If so, evacuate it and update the pointer.
   - **Problem:** This is conservative, not precise. For a precise collector, we need to know which stack words are `Value` structs. This requires either (a) compiler support (DWARF, frame layout), or (b) explicit root registration.
-  - **Pragmatic approach:** Use `__builtin_setjmp` / `__builtin_unwind_init()` to capture registers, then scan the register save area + stack conservatively. This is what Boehm does. For a MOVING collector, conservative scanning is dangerous (a non-pointer that looks like a GC pointer gets "evacuated" to a bogus location, corrupting the non-pointer).
+  - **Pragmatic approach (C era):** use `__builtin_setjmp` / `__builtin_unwind_init()` to capture registers, then scan the register save area + stack conservatively. This is what Boehm does. For a MOVING collector, conservative scanning is dangerous (a non-pointer that looks like a GC pointer gets "evacuated" to a bogus location, corrupting the non-pointer).
   - **Better approach:** Register all `Value` locals explicitly as roots. This is invasive but correct. Use a `GC_ROOT(value)` macro that pushes the address of a `Value` local onto a thread-local root stack. The GC scans the root stack precisely (knows each entry is a `Value*`).
   - **Even better:** Use `setjmp` at the top of `vm_exec_env` to capture registers into a known buffer, then scan the buffer + stack conservatively but ONLY evacuate objects that are definitely GC-managed (address in `from_space` range). Non-pointers that happen to look like GC pointers will be "evacuated" but the original will be left in place — this is the "ambiguous root" problem. For a copying collector, ambiguous roots must PIN the object (not evacuate). So: conservative scan → pin found objects → precise scan of known roots → evacuate. This is the Bartlett "mostly copying" approach.
-  - **Recommendation:** Use the Bartlett approach (conservative stack scan with pinning) for v1. The `vm/gc.c` collector implements this (conservative stack scan with pinning of ambiguous roots). Add precise scanning for `global_table`, `frame_stack`, and `vm_catch_chain` (which have known layouts).
+  - **Recommendation:** Use the Bartlett approach (conservative stack scan with pinning) for v1. The C-era collector implemented this (conservative stack scan with pinning of ambiguous roots); superseded by precise roots (Phase 4a). Add precise scanning for `global_table`, `frame_stack`, and `vm_catch_chain` (which have known layouts).
 
 **Step 1.4: Handle the `val_cons` nested allocation hazard.**
 - After `v.cons.car = gc_alloc(...); *v.cons.car = car;`, the next `gc_alloc()` for `v.cons.cdr` may trigger a collection that moves `v.cons.car`.
@@ -200,7 +201,7 @@ See Hazard 3 above. The key risk is `Value` locals in callee-saved registers bei
 
 **Step 1.6: Test.**
 - `make test` (34 tests) — all must pass.
-- `make run-bundle` (self-hosting tests) — all must pass.
+- `make test` / `make gate` (self-hosting + GC suites; the C-era command was `make run-bundle`) — all must pass.
 - Add a GC stress test: allocate 100K cons cells in a tight loop, verify no corruption.
 - Add a forwarding-pointer test: allocate, trigger GC, verify moved objects are accessible via old pointers (forwarding).
 
@@ -229,7 +230,7 @@ for free).
 
 **Step 2.3: Write barrier — site 1 required, site 2 deferred.**
 
-**Site 1: `address->` primitive (zincvm.c:912) — REQUIRED for correctness.**
+**Site 1: `address->` primitive — REQUIRED for correctness.**
 ```c
 vec.vector.data[i] = val;
 // WRITE BARRIER (must record the HEAP vector object, not the by-value pop):
@@ -245,7 +246,7 @@ if (gc_in_oldgen(&heap_vec) && gc_in_nursery(&val)) {
   each (the drain then scans the array's elements). Clear after each scavenge
   and at the start of each full collect.
 
-**Site 2: `set` primitive → `global_set` (zincvm.c:324) — DEFERRED for v1.**
+**Site 2: `set` primitive → `global_set` — DEFERRED for v1.**
 ```c
 global_table[i].closure = v;  // or new entry
 // OPTIONAL barrier (redundant for v1):
@@ -307,7 +308,7 @@ if (gc_in_nursery(&v)) gc_remember_global(i);
 
 ## 4. RECOMMENDATION
 
-**Do NOT jump straight to Appel-style generational + BiBOP.** The 5 critical hazards above make a moving collector significantly harder than the current Boehm setup. The right path is:
+**Do NOT jump straight to Appel-style generational + BiBOP.** The 5 critical hazards above made a moving collector significantly harder than the then-current Boehm setup. The right path is:
 
 1. **Phase 0:** Make the code moving-GC-ready (volatile, scan_value, root registration). No collector change. All tests pass.
 2. **Phase 1:** Single-space Cheney stop-and-copy with Bartlett-style conservative stack scan (pin ambiguous roots). All tests pass. **DONE.**

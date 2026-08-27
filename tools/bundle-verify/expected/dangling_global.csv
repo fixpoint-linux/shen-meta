@@ -1,9 +1,1 @@
 name,idx,target
-interp-load,3,read-file
-interp-load-safe.15,3,read-file
-set-toplevel,13,ps
-set-toplevel,48,ps
-shen.interp-load,3,read-file
-shen.interp-load-safe.5,3,read-file
-shen.set-toplevel,13,ps
-shen.set-toplevel,48,ps

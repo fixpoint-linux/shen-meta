@@ -91,7 +91,7 @@ unknown_prim(name, idx, prim) :-
 //
 // Two adjacent apply/appterm opcodes with no intervening instruction.
 // This is the hallmark of a curried partial-application call that the
-// C VM cannot run (it would crash with "apply non-callable").
+// VM cannot run (it would abort with "apply non-callable").
 // Equivalent to zincdec's --curried scan.
 
 .decl curried_call(name:symbol, idx:number)

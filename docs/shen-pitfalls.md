@@ -1,7 +1,7 @@
 # Shen quirks & pitfalls
 
 Source: `AGENTS.md`. Language quirks, pitfalls, and self-hosting gotchas for
-working on the Shen source and the C VM.
+working on the Shen source and the VM.
 
 ## Shen quirks
 
@@ -25,7 +25,7 @@ working on the Shen source and the C VM.
 - `.kl` files use raw KLambda constructs: `defun`, `lambda`, `let`, `cond`, `@p`,
   `where`, `freeze`, `thaw`, `cons?`, `=`, `if`, etc.
 
-## Self-hosting & C VM gotchas
+## Self-hosting & VM gotchas
 
 - `GLOBAL_TABLE_MAX` was 256 — bumped to 2048 to hold all ~1200 closures.
 - `global_get` falls back to `val_prim(name)` for missing names — can cause

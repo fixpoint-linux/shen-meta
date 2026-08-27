@@ -1,6 +1,0 @@
-f,stmt_id,dst_expr
-main,61,env_driver
-main,91,env_driver
-main,121,env_driver
-main,151,env_init
-vm_exec_env,12,env

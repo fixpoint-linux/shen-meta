@@ -1,5 +1,11 @@
 # Bugs & known issues
 
+> **Retargeting note:** the C-era VM (`vm/zincvm.c`, `vm/gc.c`, `zinctest`) has been
+> deleted; the runtime is now the Zig port (`zig/src/vm/`, `zig/src/gc/`). Bugs #1-#8
+> below were found and fixed in the C implementation (or in the Shen pipeline, which is
+> unchanged) and are kept as a historical record — the relevant designs live on in the
+> Zig port (`CatchFrame` error chain, GC drain invariant, tail-threaded `zinc-c`).
+
 ## 1. Test 7e / typed-define: `read-from-string` hangs on `{ }` type annotations
 
 **Status: FIXED.**
@@ -10,7 +16,7 @@
 
 The typed-define path runs `find-arities → store-arity → arity(id) → get → shen.<-dict → assoc`. Because `id` is not yet in the dict, `shen.<-dict` raises `simple-error "value id not found in dict"`. `arity` wraps this in `trap-error` whose handler returns `-1`.
 
-The bug was in how that handler was executed. In `vm/zincvm.c`, the `trap-error` primitive's error path:
+The bug was in how that handler was executed. In the (retired) C `zincvm.c`, the `trap-error` primitive's error path:
 
 1. `te_pop()` restores the enclosing `vm_error_jmp` (sp 2→1).
 2. Runs the handler via `vm_exec_env(...)`.
@@ -32,7 +38,7 @@ restored by plain frame unlink on every exit. An earlier intermediate fix (commi
 `b2b1988`: clear `vm_error_pending` before running the handler) resolved the
 immediate hang but was superseded by this refactor.
 
-**Earlier (partial) fixes kept:** `overrides.kl` → `overrides-pure.kl` (removes `scm.*` dependencies), and switching the KLambda source to the standard Shen OS Kernel 41.2 distribution. These removed the broken `scm.*`-based `shen.<-dict`/`hash` that could not run in the C VM, but the hang persisted until the stale-jmp fix above.
+**Earlier (partial) fixes kept:** `overrides.kl` → `overrides-pure.kl` (removes `scm.*` dependencies), and switching the KLambda source to the standard Shen OS Kernel 41.2 distribution. These removed the broken `scm.*`-based `shen.<-dict`/`hash` that could not run in the VM of the time, but the hang persisted until the stale-jmp fix above.
 
 **Regression test:** Added `read-from-string-typed-define` to the self-hosting suite: `(read-from-string "(define id { A --> A } X -> X)")` now returns `[[define id { A --> A } X -> X]]`. Note: it prints a benign `runtime: apply non-callable tag=5` warning during define macroexpansion (a NIL value is applied), which does not affect the result.
 
@@ -44,7 +50,7 @@ immediate hang but was superseded by this refactor.
 
 ## 3. `eval_kl` error swallowing
 
-**File:** `vm/zincvm.c`  
+**File:** the retired C `zincvm.c` (now the Zig VM, `zig/src/vm/interp.zig` + `prims.zig`)  
 **Symptom:** On error, `eval_kl` returns identity instead of re-raising.  
 **Reason:** Shen's `load` doesn't wrap forms in `trap-error`.  
 **Status:** Intentional but fragile. Now uses a `CatchFrame` (see AGENTS.md trap-error section).
@@ -69,14 +75,16 @@ immediate hang but was superseded by this refactor.
 These are deliberate, preserved behaviors that the CatchFrame refactor (`3ed45b1`) did not change. Not regressions.
 
 - **`eval-kl` swallows all pipeline errors** and returns the input unchanged (identity). `Shen`'s `load` path doesn't wrap forms in `trap-error`, so re-raising would expose pre-existing pipeline errors. This hides real user-code errors and compiler-pipeline bugs. A future fix would propagate a `VAL_ERROR` or rethrow via the catch chain and let callers wrap in `trap-error`.
-- **C-level primitive type guards removed.** The guard-enabled debug build (`ZINCVM_DEBUG`, `PRIM_TYPE_ERROR`) was removed — the full OS bundle that needed it is gone. Primary ownership of catchable runtime errors is the Shen safe-wrapper layer (`shen/primitives.shen`): each `safe.X` validates its args and raises a catchable `simple-error` before the raw primitive is ever called. The release C VM has no primitive type guards (there is no debug build to enable them). Always-on (not safe-wrapper-protected, not type guards): `simple-error`, `fail`, `apply`/`appterm` non-callable + too-many-args, `env_pop`, `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-of-string), and eval-kl's catch.
-- **The guard-free release VM only runs the REDUCED, type-safe bundle.** The canonical `make bundle` now produces `globals.csexp` = the **reduced self-contained interpreter** (meta-interpreter `.shen` + the type-safe `.kl` base `core/declarations/types/macros/load/toplevel/sys/dict/track/reader/writer`, excluding the heavy OS). It self-hosts guard-free (exit 0). The full Shen OS is **not** a second bundle (the full-OS bundle was removed): it is loaded from `.kl` at **runtime** by the C VM's `--repl` mode (`interp-load-raw` into the meta-interpreter, then `shen.initialise`/`shen.repl`). It is type-unsafe (`shen.initialise` does `+ - * /` on non-numbers), which is why it is interpreted rather than compiled into the guard-free release VM.
-- **Close-the-loop (runtime `.kl` loading) is PARTIAL — defun registration does not yet work.** The bundled meta-interpreter reads and parses a `.kl` file at runtime via `(read-file-raw ...)` correctly (this required `pos` out-of-bounds to throw inside `trap-error` unconditionally — see above). But `(interp-load-raw "file.kl")` does NOT register the loaded `defun`: `interp-eval` swallows a compile error via `interp-eval-safe` and returns `loaded`, so the defun never appears in the global table. The failure is inside the bundled `kl->zinc` NON-primitive compile path (CPS continuation): compiling `[lambda V 42]` hits `apply non-callable tag=5` (nil) in `kl->zinc`'s bytecode (pc=36) before `toplevel-interp` runs. The eval-kl tests only exercise the primitive-headed path (which bypasses normalize/debruijn), so they pass. Two real fixes landed while debugging: bundling `idx`/`index_h` (they were val_prim placeholders — `util.shen` is loaded via `interp-load-raw`, which only compiles `defun` not `define`, so these compiler helpers were missing and `debruijn` couldn't resolve variable indices) — but another missing helper or a CPS-compile bug remains. Next step: find which global the non-primitive compile path applies as nil (the `(function id)` continuation) and bundle it, or fix the CPS compile.
+- **Native-level primitive type guards removed.** The guard-enabled debug build (`ZINCVM_DEBUG`, `PRIM_TYPE_ERROR`) was removed — the full OS bundle that needed it is gone. Primary ownership of catchable runtime errors is the Shen safe-wrapper layer (`shen/primitives.shen`): each `safe.X` validates its args and raises a catchable `simple-error` before the raw primitive is ever called. The release VM has no primitive type guards (there is no debug build to enable them). Always-on (not safe-wrapper-protected, not type guards): `simple-error`, `fail`, `apply`/`appterm` non-callable + too-many-args, `env_pop`, `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-of-string), and eval-kl's catch.
+- **The guard-free release VM only runs the REDUCED, type-safe bundle.** The canonical `make bundle` now produces `globals.csexp` = the **reduced self-contained interpreter** (meta-interpreter `.shen` + safe-subset helpers, excluding the heavy OS). It self-hosts guard-free (exit 0). *(The full Shen OS, previously loaded at runtime via `--repl`/`interp-load-raw`, has since been REMOVED entirely — see below.)*
+- **Close-the-loop (runtime `.kl` loading) is PARTIAL — defun registration does not yet work.** *(HISTORICAL — the runtime OS-load machinery has since been REMOVED.)* The bundled meta-interpreter reads and parses a `.kl` file at runtime via `(read-file-raw ...)` correctly (this required `pos` out-of-bounds to throw inside `trap-error` unconditionally — see above). But `(interp-load-raw "file.kl")` does NOT register the loaded `defun`: `interp-eval` swallows a compile error via `interp-eval-safe` and returns `loaded`, so the defun never appears in the global table. The failure is inside the bundled `kl->zinc` NON-primitive compile path (CPS continuation): compiling `[lambda V 42]` hits `apply non-callable tag=5` (nil) in `kl->zinc`'s bytecode (pc=36) before `toplevel-interp` runs. The eval-kl tests only exercise the primitive-headed path (which bypasses normalize/debruijn), so they pass. Two real fixes landed while debugging: bundling `idx`/`index_h` (they were val_prim placeholders — `util.shen` is loaded via `interp-load-raw`, which only compiles `defun` not `define`, so these compiler helpers were missing and `debruijn` couldn't resolve variable indices) — but another missing helper or a CPS-compile bug remains. Next step: find which global the non-primitive compile path applies as nil (the `(function id)` continuation) and bundle it, or fix the CPS compile.
 - **Routing the eval-kl path through the safe wrappers (via the metacircular interp rules) was attempted and REVERTED.** Two mechanisms were tried: `((function X) ...)` compiled back to `[prim X]` (not `[global X]`) and introduced a nil-arg regression; `(apply X [args])` failed because `apply` is not a callable global in this context (`apply non-callable sym='apply'`). Both broke self-hosting. The interp rules are back to the original `(X ...)` form, so eval-kl'd dynamic code does NOT yet route through the safe wrappers — the design intent is documented in AGENTS.md but not implemented.
 - **Safe wrappers now cover:** all the arithmetic (`+ - * /`, incl. division-by-zero), list (`hd`/`tl`/`fst`/`snd`/`cons`/`emptylist`), string (`n->string`/`string->n`/`tlstr`/`hdstr`/`str`), symbol (`intern`/`value`/`set`), vector (`absvector` incl. negative, `<-address`/`address->`), I/O (`open` incl. genuine open-failure, `close`, `read-byte`, `write-byte`), `get-time`, `pos`, `cn`, comparisons, `trap-error`, `simple-error`, `error-to-string`, and the type predicates. (`hdstr` and `read-file-as-string` required adding metacircular-interp `[prim ...]` rules so the eval-kl path can wrap them.)
 - `val_error` messages are GC-allocated (no `strdup` leak). All error state is file-scope C statics (not thread-safe); the VM is single-threaded by design.
 
 ## 7. Self-hosting bootstrap: `.kl` defun registration now compiles correctly (4 fixes)
+
+**HISTORICAL — the runtime `.kl` OS-load machinery (and section 8 below) was subsequently REMOVED; kept for bug-log record.**
 
 **Status: 4 root causes FIXED and committed. One blocker remains (OOM in `interp-load-raw`).**
 
@@ -116,7 +124,7 @@ the closure (`lookup-global my-add` finds it). `make test` 34/34.
 symptom: `interp-load-raw` exhausted the 4 GB GC heap reservation (`grow_heap: need 8192 MB but
 reservation is 4096 MB`); `allocatedpages` (logged as `live_pages`) doubled at every FULL collect
 (~137K → 268K → 530K → 1054K → 2098K). Reproduced even in the normal self-hosting run
-(`./zinctest globals.csexp --gc-verbose`), so it was a general runtime issue, not OS-load-specific.
+(a C-era `--gc-verbose` probe run), so it was a general runtime issue, not OS-load-specific.
 
 **Root cause:** `collect()` swapped semi-spaces and reset `allocatedpages=0` (gc.c:612) but NEVER
 reset the dead from-space pages' `space[]` tags back to 0. Dead pages kept their tag forever.
@@ -136,8 +144,8 @@ million dead-tagged `space=2`; the real reachable set was only ~6138 pages (~3 M
 all pages and reset any page tagged `current_space` (the now-dead from-space) back to `space=0`
 and clear `type_page`. After the fix `live_pages` stays stable at ~135K across all FULL collects,
 no `grow_heap` fires, `interp-load-raw` of the probe `.kl` completes and `(my-add 2 3)` evaluates.
-`make test` 34/34. Diagnostic probes live in `vm/zinctest.c` under
-`#ifdef ZINC_TEST_OS_LOAD` (build with `-DZINCTEST -DZINC_TEST_OS_LOAD`).
+`make test` 34/34. The diagnostic probes lived in the retired C `zinctest.c` under
+`#ifdef ZINC_TEST_OS_LOAD` (the probe build itself is gone with the C VM).
 
 ## 8. OS-load: `stlib.kl` compiler O(n²) `append` — FIXED (tail-threaded zinc-c/zinc-t); now a kmacros `cond` blocker
 
@@ -151,7 +159,7 @@ burning instructions compiling the 231 KB `initialise-sources` defun. Files 0-19
 `(do X (do Y ...))` chain. `kmacros` rewrites each `(do X Y)` into `(let (newvar) X Y)`, so
 post-normalization it is a 339-deep left-nested let-chain. `zinc-c`'s `[let X Y]` rule used nested
 `append` — each nesting level copies the entire accumulator, so compiling the chain was O(n²):
-~39M cons allocations ≈ ~400M metacircular instructions ≈ 3-4B C VM instructions. NOTE: Tier-3
+~39M cons allocations ≈ ~400M metacircular instructions ≈ 3-4B VM instructions. NOTE: Tier-3
 `fold-append` in `util.shen` was NOT the primary culprit (only used for multi-arg calls); the
 quadratic lived in the `[let X Y]` / `[if X Y Z]` append chains.
 
@@ -165,7 +173,7 @@ compiles in O(n). Registered `zinc-c-args`/`zinc-c-tail`/`zinc-t-tail` via `set-
 
 **Verification:** Only `zinc-c` and `zinc-t` closures differ from the baseline bundle; all other
 427 bundled closures are byte-identical (semantics preserved on the reduced bundle). `make test`
-34/34, `make run-bundle` (self-hosting + GC stress) pass. The OS-load
+34/34 and the self-hosting + GC stress suites pass. The OS-load
 probe now gets past the hard limit quickly.
 
 **Bonus correctness fix (same session):** `kmacros`' `[open X out]` rule

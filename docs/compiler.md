@@ -8,7 +8,7 @@ the pipeline.
 ## Role in the pipeline
 
 ```
-Shen source (.shen) → shen->kl → KLambda → (kl->zinc) → ZINC → nat->csexp → C VM
+Shen source (.shen) → shen->kl → KLambda → (kl->zinc) → ZINC → nat->csexp → Zig VM
 ```
 
 `shen->kl` (implemented in `shen/shen->kl.shen` + `shen/shen-kl-helpers.shen`)
@@ -18,7 +18,7 @@ itself**. Its purpose is to let the reduced self-contained bundle
 compiled by **our own toolchain** instead of host `shen-scheme`.
 
 Why it exists: the host compiler emits curried partial-application calls
-(e.g. `((debruijn []) N)`) that the C VM cannot run — the C VM has **no
+(e.g. `((debruijn []) N)`) that the VM cannot run — the Zig VM has **no
 partial application**. Our compiler emits **full-arity** bytecode only.
 
 ## What it supports (the safe subset)
@@ -76,7 +76,7 @@ load) plus the serialization helpers.
 - `<-` guarded clauses use a right-nested `if` tree with a `fail`-backtrack
   sentinel; `cond` for unguarded-only functions. A guarded clause whose body
   is `(if Cond RHS (fail))` folds the condition into the test (eliminating
-  the `fail`, which throws on the C VM).
+  the `fail`, which throws on the VM).
 
 ### Explicitly out of scope
 
@@ -90,13 +90,11 @@ load) plus the serialization helpers.
 - **No partial application** — by design, the compiler produces full-arity
   calls only.
 
-### Readers (two, deliberately separate)
+### Reader (flat-shen)
 
-- `.kl` reader (`read-file-raw` in `load.shen`) treats `{ } [ ] |` as ordinary
-  **atoms** (needed for e.g. `(= { (hd ...))` in `shen.typetable`).
-- `.shen` reader (`shen-read-file` in `shen-kl-helpers.shen`) treats `{ }`
-  as a grouped type signature, `[ ]` as lists, `|` as dotted cdr.
-- They MUST stay separate — merging them corrupts one or the other.
+- The `.shen` reader (`shen-read-file` in `shen-kl-helpers.shen`) treats `{ }`
+  as a grouped type signature, `[ ]` as lists, `|` as dotted cdr. (The former
+  runtime `.kl` reader `read-file-raw` was removed with the OS-load path.)
 
 ### Bundle composition
 
@@ -150,7 +148,6 @@ load) plus the serialization helpers.
 
 ```sh
 make bundle             # 0 FAILs expected
-make test               # 34/34 built-in bytecode tests
-timeout 120 ./zinctest globals.csexp   # Self-hosting proven + Test F + GC
-./zincdec globals.csexp --curried      # expect 0 curried calls
+make test               # gc + vm zig test suites (incl. self-hosting)
+zig/zig-out/bin/zincdec globals.csexp --curried   # expect 0 curried calls
 ```

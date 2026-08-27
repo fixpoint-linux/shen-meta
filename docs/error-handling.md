@@ -83,7 +83,8 @@ macroexpansion (a NIL value is applied), which does not affect the result.
 - **C primitive type-errors are debug-only defense** (see above).
 - **The guard-free release VM only runs the REDUCED, type-safe bundle.**
 - **Close-the-loop (runtime `.kl` loading) is PARTIAL** — defun registration does
-  not yet work. See `docs/loading.md`.
+  not yet work. *(HISTORICAL — the runtime OS-load machinery was subsequently
+  removed.)* See `docs/loading.md`.
 - **Safe wrappers now cover:** all arithmetic (`+ - * /`, incl. division-by-zero),
   list (`hd`/`tl`/`fst`/`snd`/`cons`/`emptylist`), string (`n->string`/`string->n`/
   `tlstr`/`hdstr`/`str`), symbol (`intern`/`value`/`set`), vector (`absvector`

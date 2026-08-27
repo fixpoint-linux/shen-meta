@@ -38,7 +38,9 @@ CALL_OPCODES = set("pt")  # apply, appterm
 
 # ── Primitive arity table ────────────────────────────────────────────
 # Maps primitive name to expected argument count.
-# Source: vm/zincvm.c exec_primitive() dispatch + type signatures.
+# Source: zig/src/vm/prims.zig (PrimTableEntry .name/.arity) +
+#         zig/src/vm/execplan.zig (exec-plan/wait/kill/cd/getcwd/getenv/
+#         setenv/glob process prims).
 PRIM_ARITY = {
     # Unary primitives (1 arg)
     "hd": 1, "tl": 1, "number?": 1, "string?": 1, "symbol?": 1,
@@ -67,14 +69,14 @@ PRIM_ARITY = {
     "write-byte": 2,  # write-byte Byte Stream
     "read-file-as-string": 1,
     "@p": 2,  # tuple constructor
-    # prims.def entries not currently inlined as `P` but present in the C VM
-    # table (default arity=0 would silently over-count the stack if ever inlined).
-    "nth": 2,              # vm/prims.def PRIM("nth",2)
-    "shen.str->bytes": 1,  # vm/prims.def PRIM("shen.str->bytes",1)
-    "shen.bytes->string": 1,  # vm/prims.def PRIM("shen.bytes->string",1)
-    "shen.fail!": 1,       # vm/prims.def PRIM("shen.fail!",1)
-    "stinput": 0,          # vm/prims.def PRIM("stinput",0)  (0 = pop0/push1, already default)
-    "stoutput": 0,         # vm/prims.def PRIM("stoutput",0)
+    # Zig prims.zig entries not currently inlined as `P` but present in the
+    # VM table (default arity=0 would silently over-count the stack if ever inlined).
+    "nth": 2,              # legacy C table entry (arity kept, VM removed)
+    "shen.str->bytes": 1,  # zig/src/vm/prims.zig PRIM("shen.str->bytes",1)
+    "shen.bytes->string": 1,  # zig/src/vm/prims.zig PRIM("shen.bytes->string",1)
+    "shen.fail!": 1,       # zig/src/vm/prims.zig PRIM("shen.fail!",1)
+    "stinput": 0,          # legacy C table entry (0 = pop0/push1)
+    "stoutput": 0,         # legacy C table entry (0 = pop0/push1)
     # Inline-prim helpers used by the metacircular interp / reduced bundle.
     # These are dispatched via `P` (inline OP_PRIM) in the bundle, so the
     # stack simulation MUST know their arity to keep stack depth balanced.
@@ -82,11 +84,11 @@ PRIM_ARITY = {
     # inflates the simulated stack by +1 V per occurrence and makes
     # downstream apply/appterm sites over-count supplied_args (e.g. shen.interp
     # self-calls reported as 6-9 args instead of the true 5).
-    "reverse": 1,  # C VM zincvm.c:1451 — pops 1
-    "append": 2,   # C VM zincvm.c:986  — pops 2
-    "assoc": 2,    # C VM zincvm.c:962  — pops 2
-    "empty?": 1,   # C VM zincvm.c:1225 — pops 1
-    "length": 1,   # C VM zincvm.c:1304 — pops 1
+    "reverse": 1,  # zig/src/vm/prims.zig — pops 1
+    "append": 2,   # zig/src/vm/prims.zig — pops 2
+    "assoc": 2,    # zig/src/vm/prims.zig — pops 2
+    "empty?": 1,   # zig/src/vm/prims.zig — pops 1
+    "length": 1,   # legacy C table entry (arity kept, VM removed)
     "hash": 2,     # Shen OS arity table (init.kl): hash Key Size — 2 args
     "shen.assoc-set": 3,  # sys.kl: (defun shen.assoc-set V3875 V3876 V3877) — 3 args
     "c-tag": 1,       # interp constructor-tag helper — 1 arg
@@ -106,6 +108,9 @@ ALLOWED_PRIMS = {
     "c-strlen", "char-code", "substring", "element?",
     "append", "empty?", "reverse", "assoc", "length", "nth",
     "fail",
+    "exec-plan",
+    # process prims (zig/src/vm/execplan.zig) used by the shensh shell sources
+    "wait", "kill", "cd", "getcwd", "getpid", "getenv", "setenv", "glob",
 }
 
 # Instruction keywords (from shen/util.shen instruction-keyword?)
@@ -139,7 +144,7 @@ CSV_SCHEMAS = {
 }
 
 
-# ── Fact writer (mirrors gc-verify's FactWriter) ────────────────────
+# ── Fact writer ──────────────────────────────────────────────────────
 
 class FactWriter:
     """Manages output CSV files for all fact relations.

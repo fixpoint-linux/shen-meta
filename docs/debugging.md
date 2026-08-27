@@ -1,16 +1,23 @@
 # GC debugging — tooling & open investigation
 
-Working notes for the custom moving generational collector (`vm/gc.c`, `vm/gc.h`,
-`vm/zinctypes.h`). This documents the GC debugging tooling we built, the open
-precise-root-miss investigation it serves, and the **deferred tooling items**.
+Working notes for the custom moving generational collector. **Retargeting note:**
+the C-era VM (`vm/gc.c`, `vm/gc.h`, `vm/zinctypes.h`, `zinctest`) has been deleted;
+the runtime is the Zig port (`zig/src/vm/`, `zig/src/gc/`). The opt-in `--gc-*`
+argv flags and the C-stack stale-scan described below were part of the retired C
+tooling — for GC debugging in the Zig port, use the zig test suites (`make test`)
+and `docs/moving-gc-validation.md`. This document is kept as a historical bug-log;
+the GC design knowledge (drain invariant, precise roots, write barrier) is current.
 
 ## Context
 
-The C VM loads a reduced self-contained bundle (`globals.csexp`) containing the
-metacircular Shen interpreter. Loading a Shen OS `.kl` file at runtime via the
-bundled `interp-load-raw` triggers deep Shen recursion
+The VM loads a reduced self-contained bundle (`globals.csexp`) containing the
+metacircular Shen interpreter. *(The Shen-OS `.kl` runtime-load path that this
+investigation served — `interp-load-raw` / `read-file-raw` and the
+`ZINC_TEST_OS_LOAD` probe — has since been REMOVED; the notes below are kept for
+bug-log record.)* Loading a Shen OS `.kl` file at runtime via the
+bundled `interp-load-raw` triggered deep Shen recursion
 (`read-file-raw → parse-exprs → parse-expr → parse-list → … → strlen-acc`) that
-produces **trace-dependent corruption** (classic precise-root-miss signature).
+produced **trace-dependent corruption** (classic precise-root-miss signature).
 
 ## GC debugging tooling (built, opt-in)
 
@@ -23,40 +30,45 @@ observability, no GC correctness/semantics change. Release build and default
 | Per-collection stats | `--gc-verbose` | One line per collect: trigger, `shadow_depth`, `nursery_free` / `live_pages` |
 | Closure-header guard | `--gc-check-closures` | `gc_check_closure` validates every `VAL_LAMBDA` code/env header at `APPLY`/`APPTERM` entry |
 | Root-set dump | `--gc-dump-roots` | Dumps the shadow stack at each collection (now cross-checks each root's pointee page liveness — flags `DEAD-SPACE` roots) |
-| Stale-ref scan | `--gc-stale-scan` | Walks the native C stack after each collection, flagging words that point into the just-abandoned old-gen semi-space or the nursery. `FORWARDED` header = smoking-gun root-miss (object moved, this ref not updated). Prints per-frame attribution so the owning C function can be resolved. |
+| Stale-ref scan | `--gc-stale-scan` | Walked the native C stack after each collection, flagging words that point into the just-abandoned old-gen semi-space or the nursery. `FORWARDED` header = smoking-gun root-miss (object moved, this ref not updated). Prints per-frame attribution so the owning C function can be resolved. |
 | GC log file | `--gc-log <path>` | Routes opt-in GC diagnostics to a file instead of interleaving with Shen `fn`/`run time` stderr noise |
 | Live-heap pointer verifier | `--gc-verify-live` / `--gc-verify-live-from N` | After each collection, walks every object on the pages the collector just scanned/evacuated and checks each GC-managed pointer field: dead-space pointers, unpromoted nursery refs after a scavenge, and un-followed FORWARDED nursery aliases (Phase-0 misses) are flagged WITH owner attribution (object address, GC type, field; CallFrame index for frame arrays) plus a reverse-reference search naming the holder. `--gc-verify-live-from N` enables it only from collect #N onward (it is O(live heap) per collection). This is the tool that cracked Bug 2. |
 | Fixed heap address | `GC_FIXED_HEAP_ADDR=0x...` env | Pins the heap mmap at a fixed address so object addresses are stable across runs (ASLR defeats `--gc-watch-alloc`). Debug aid only. |
 
-### Where things live
+### Where things lived (C-era)
 
-- `vm/gc.c` / `vm/gc.h` — new statics (`gc_verbose`, `gc_check_closures`,
+- the retired `vm/gc.c` / `vm/gc.h` — statics (`gc_verbose`, `gc_check_closures`,
   `gc_dump_roots`, `gc_collect_seq`) + setters; `gc_check_closure(Value*, const
   char *where)`; `collect()`/`collect_nursery()` now take a `const char *trigger`
   (`PREEMPTIVE`/`REACTIVE`/`THRESHOLD`/`ALLOC`/`LASTRESORT`); root-set dump at the
   top of `gc_scan_roots()`.
-- `vm/zincvm.c:216` — `#define check_closure(cl, where)` replaced with
+- the retired `zincvm.c:216` — `#define check_closure(cl, where)` replaced with
   `gc_check_closure(&(cl), where)` (was a no-op); call sites `APPLY` (~1752) and
   `APPTERM` (~1859) now invoke the real check. Flag scan added to both `main()`
   argv loops.
-- `Makefile` — `gcdebug` convenience target (uses `zinctest-gc`, a plain `-O0 -g`
-  build; the guard-enabled `zinctest-debug` was removed).
+- the retired C-era `Makefile` had a `gcdebug` convenience target (`zinctest-gc`,
+  a plain `-O0 -g` build); gone with the C VM.
 
-### Build / run
+### Build / run (historical)
+
+All of the following were C-era commands; the binaries and flags no longer exist.
+Current equivalents: `make` (build shensh + zincdec), `make test` (gc + vm suites),
+`make gate` (Debug + ReleaseSafe + ReleaseFast).
 
 ```sh
-make                      # release (zincvm, zincdec, zinctest)
-make test                 # 34/34 built-in tests
-make gcdebug              # builds zinctest-gc and prints available flags
-
-# Probe build (runtime .kl load experiment):
-cosmocc -Wall -Wextra -O2 -I vm -DZINCTEST -DZINC_TEST_OS_LOAD \
-  -o zinctest-osload vm/zinctest.c vm/zincvm.c vm/gc.c
-./zinctest-osload.com.dbg globals.csexp \
-  --gc-verbose --gc-check-closures --gc-dump-roots
+# C-era probe build (runtime .kl load experiment — REMOVED, historical):
+# cosmocc -Wall -Wextra -O2 -I vm -DZINCTEST -DZINC_TEST_OS_LOAD \
+#   -o zinctest-osload vm/zinctest.c vm/zincvm.c vm/gc.c
+# ./zinctest-osload.com.dbg globals.csexp \
+#   --gc-verbose --gc-check-closures --gc-dump-roots
 ```
 
 ## Open investigation — precise-root-miss (GC bug confirmed in compile path)
+
+**Historical note:** these bugs were investigated against the now-removed runtime
+`.kl` OS-load path (`interp-load-raw`/`read-file-raw`, `ZINC_TEST_OS_LOAD` probe).
+The GC verifier tooling (`--gc-verify-live`, Bug 2's crack) remains and is still
+useful for the reduced bundle.
 
 **Two distinct bugs.** The first (a compiler bug, below) was resolved; the second
 (a genuine precise-root-miss GC bug in the defun-compile path) is still open.
@@ -146,7 +158,7 @@ because the miss needs the drain/queue interleaving to line up.
   the env array was promoted from the nursery during Phase 0 but its
   promoted copy was never scanned.
 
-**Fix (vm/gc.c):** the three drain loops now share `drain_scan_object` /
+**Fix (now `zig/src/gc/collect.zig`, then `vm/gc.c`):** the three drain loops now share `drain_scan_object` /
 `drain_walk_page` / `cheney_drain`.  When a walk ends at `cp == freep`
 mid-page with pages still queued, the page is **deferred** (only the freep
 page can receive new objects, so at most one page is mid-catch-up at any
@@ -167,13 +179,12 @@ the live set still above the threshold.
 **Verification:** cumulative 22-file audit at 256MB → **0/1111 fail**
 (46s, no perf regression); same with `--gc-verify-live-from 2000` → 536
 verifier passes, all `bad=0`; 1GB → 0/1111; `make test` 34/34;
-`make run-bundle` green (self-hosting + GC
-stress + retention).
+the self-hosting + GC stress/retention suite green (`make test`, today).
 
 ### Bug 2 — stale-scan localization (commit `---`) [historical: the C-stack attribution below was a red herring — the miss was heap-internal, see the RESOLVED section above]
 
 `--gc-stale-scan` now pinpoints the root-miss precisely. On the probe
-(`./zinctest-osload globals.csexp --gc-stale-scan --gc-check-closures --gc-log /tmp/gc.log`):
+(on the C-era probe build, `./zinctest-osload globals.csexp --gc-stale-scan --gc-check-closures --gc-log /tmp/gc.log`):
 
 - **108 scans** (one per collection; 42 NURSERY + 12 FULL + threshold), **509
   FORWARDED + 637 dead-space** stale hits total. Most early hits are nursery
@@ -223,7 +234,7 @@ call). The stale-scan's frame map turns the root-miss into a nameable C site.
   loading through the metacircular interpreter now compiles all 22 OS files
   (1111/1111 forms) at the default 256MB heap.
 - The two-namespace split (AGENTS.md): runtime-loaded defuns live in the interp's
-  Shen `global-table` (namespace 2), not the C VM native `global_table[]`
+  Shen `global-table` (namespace 2), not the VM native global table (`zig/src/vm/tables.zig`)
   (namespace 1). Drive loaded closures through `eval-kl`/`interp`, not raw
   `global` bytecode. The probe now does this correctly.
 - The GC tooling (3 flags) is in place and actively used to catch Bug 2.
@@ -243,10 +254,11 @@ call). The stale-scan's frame map turns the root-miss into a nameable C site.
 
 Not built. Revisit only if the tools above don't crack it.
 
-### Deferred: real heap verifier (`--gc-verify`)
+### Deferred: real heap verifier (`--gc-verify`) [C-era]
 
-`verify_heap()` is currently a **no-op** macro (`((void)0)` in `zincvm.h:25`);
-call sites exist (e.g. `zinctest.c:81`, `:1271`) but do nothing.
+In the retired C code, `verify_heap()` was a **no-op** macro; its call sites
+(e.g. `zinctest.c:81`, `:1271`) did nothing. Superseded in spirit by
+`--gc-verify-live` (itself C-era) and by the zig GC test suite (`make test`).
 
 - Replace with a real `gc_verify_heap()` guarded by a flag.
 - What to check: header type tag in `[0,4]`; header word count nonzero and within
@@ -263,16 +275,14 @@ call sites exist (e.g. `zinctest.c:81`, `:1271`) but do nothing.
 
 - Bounded ring buffer (e.g. 4096 entries), each:
   `{seq, type_tag, bytes, addr, is_nursery, shadow_depth_at_alloc}`.
-- Written on every `gc_alloc`/`gc_alloc_oldgen`; dump the tail after a crash
-  (SIGSEGV handler or `atexit`).
+- Written on every `gc_alloc`/`gc_alloc_oldgen`; dump the tail after a crash.
+  (C-era idea; never built, tooling gone with the C VM.)
 - **Cost:** a few writes per allocation — measurable.
 - **Value:** post-mortem trail ("closure X allocated at addr Y → collection Z →
   used & crashed"), but doesn't directly pinpoint a root-miss. Heavier; lowest ROI.
 
 ### Deferred: AddressSanitizer (`-fsanitize=address`)
 
-- **Does NOT link under cosmocc** — `undefined reference to __asan_*`
-  (`__asan_init`, `__asan_report_*`). The cosmopolitan toolchain ships no `libasan`
-  runtime. Instrumentation compiles but linking fails.
-- Only `-fsanitize=undefined` links (existing `*-asan` Makefile targets).
-- Revisit only if a native-compiler build path (non-cosmocc) is introduced.
+- C-era finding only: ASan did NOT link under cosmocc (`undefined reference to
+  __asan_*`); only `-fsanitize=undefined` linked. Moot — the cosmocc build path
+  is gone; Zig builds are sanitized via the Debug/ReleaseSafe gate (`make gate`).

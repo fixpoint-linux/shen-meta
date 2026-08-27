@@ -3,9 +3,9 @@
 \* shell.shen - shpar-p2 U5: the shell driver.
    Boots AFTER shlex.shen / shparse.shen / shexpand.shen (shensh.c boot list,
    dependency order - the HM sig table accumulates across files) and drives
-   them: sp-lex -> sp-parse -> shx-plan -> C exec-plan.  There is NO /bin/sh
+   them: sp-lex -> sp-parse -> shx-plan -> exec-plan.  There is NO /bin/sh
    anywhere: exec-plan decodes the plan tree and forks/execvp's natively
-   (see the plan-runner section in vm/zincvm.c).
+   (see the plan-runner section in zig/src/vm/execplan.zig).
    Builtins kept Shen-level because they must mutate the PARENT process:
    cd, pwd, setenv/export, exit.  echo/true/false/:/cd/pwd additionally
    exist as C CHILD builtins (apply post-redirect inside forked children)

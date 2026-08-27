@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/jmars/shen-meta/actions/workflows/ci.yml/badge.svg)](https://github.com/jmars/shen-meta/actions/workflows/ci.yml)
 
-**Shen evaluates Shen, compiles itself to native bytecode, runs on a native C VM.** The full eval-kl chain is working: `(+ 1 2)` marshalled to tagged form, compiled through the metacircular pipeline, executed by the metacircular interpreter, demarshalled back to native — returns `3`. Pure self-hosting, no C bypass.
+**Shen evaluates Shen, compiles itself to native bytecode, runs on a native Zig VM.** The full eval-kl chain is working: `(+ 1 2)` marshalled to tagged form, compiled through the metacircular pipeline, executed by the metacircular interpreter, demarshalled back to native — returns `3`. Pure self-hosting, no native bypass.
 
-The meta-circular evaluator is the core — the ZINC abstract machine implemented in ~100 lines of Shen pattern-matching rules, serialized to ~0.33MB of bytecode, and loaded by a ~2600-line C VM with a custom moving generational garbage collector. The VM is self-contained: a working Shen runtime that depends only on a C compiler and our own GC (no Boehm, no host runtime).
+The meta-circular evaluator is the core — the ZINC abstract machine implemented in ~100 lines of Shen pattern-matching rules, serialized to ~0.33MB of bytecode, and loaded by the Zig VM (`zig/src/vm/`) with a custom moving generational garbage collector (`zig/src/gc/`). The VM is self-contained: a working Shen runtime that depends only on a Zig toolchain and our own GC (no Boehm, no host runtime).
 
 The reduced self-contained bundle is compiled entirely by **our own `shen->kl` compiler** — a minimal Shen→KLambda front-end written in the type-safe Shen subset itself. It contains **no Shen OS `.kl` code**; the few list helpers the meta-interpreter needs (`append`, `reverse`, `empty?`, `assoc`, `element?`, `variable?`) are re-implemented in the safe subset.
 
@@ -16,11 +16,11 @@ Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```
 Shen source → shen->kl (own compiler) → KLambda → kmacros → normalize → debruijn
-            → zinc-c → csexp → C VM
+            → zinc-c → csexp → Zig VM
                                             ↑
                  interp.shen (meta-circular ZINC VM on Shen/Chez)
                         ↓
-      serialize-reduced → globals.csexp → C VM (self-hosting)
+      serialize-reduced → globals.csexp → Zig VM (self-hosting)
 ```
 
 | Layer | File | Description |
@@ -35,9 +35,9 @@ Shen source → shen->kl (own compiler) → KLambda → kmacros → normalize �
 | **Eval/load** | `shen/toplevel.shen`, `shen/load.shen` | `interp-eval` / `interp-load` + raw s-expression parser |
 | **Utilities** | `shen/util.shen` | `defun->lambda`, `primitive?`, `dedupe-globals` |
 | **Native compiler** | `shen/compile.shen` | ZINC → canonical s-expression bytecode |
-| **C VM** | `vm/zincvm.c` | Native parser + VM (~2600 lines, custom GC, all primitives, closures, tail calls) |
-| **GC** | `vm/gc.c`, `vm/gc.h`, `vm/zinctypes.h` | Custom moving generational collector (2MB nursery + old-gen) |
-| **Decompiler** | `vm/zincdec.c` | Standalone bytecode decompiler (4 formats + `--curried` scan) |
+| **Zig VM** | `zig/src/vm/` | Native parser + VM (interp, prims, execplan, marshal — custom GC, all primitives, closures, tail calls) |
+| **GC** | `zig/src/gc/` | Custom moving generational collector (2MB nursery + old-gen; heap.zig, collect.zig, types.zig) |
+| **Decompiler** | `zig/src/zincdec_main.zig` | Standalone bytecode decompiler (4 formats + `--curried` scan) |
 | **Serializer** | `shen/serialize-reduced.shen` | Compiles bundle `.shen` via `shen-load` into `globals.csexp` |
 
 ## Build & Run
@@ -46,14 +46,12 @@ Shen source → shen->kl (own compiler) → KLambda → kmacros → normalize �
 git clone --recurse-submodules https://github.com/jmars/shen-meta.git
 cd shen-meta
 make setup    # clone shen-scheme if not already present
-make          # build C VM + decompiler (uses cosmocc, Cosmopolitan)
-make test     # run 48 built-in bytecode tests
-make pipeline # compile (+ 1 2) through full pipeline
+make          # build shensh + zincdec into zig/zig-out/bin/
+make test     # run the gc + vm zig test suites
 make bundle   # compile bundle .shen via shen->kl → globals.csexp
-make run-bundle  # run C VM with self-hosting bundle
+make gate     # zig build gate (Debug + ReleaseSafe + ReleaseFast)
 make shensh-test # run the 67-case shensh end-to-end shell tests
-make shpar-verify # gate: zero execl(/bin/sh) sites in the VM sources
-make gate     # test + test-asan
+make bundle-verify # Soufflé safe-subset gate on globals.csexp
 ```
 
 ## shensh — the shell
@@ -62,8 +60,8 @@ make gate     # test + test-asan
 the lexer, parser, and expander are Shen sources (`shell/shlex.shen`,
 `shell/shparse.shen`, `shell/shexpand.shen`, `shell/shell.shen`) loaded into
 the meta-interpreter at boot and HM-type-checked; execution goes through the
-native `exec-plan` C primitive, which forks / dup2s / `execvp`s each stage
-directly (one exec call site in the whole VM).
+native `exec-plan` Zig primitive, which forks / dup2s / `execvp`s each stage
+directly (one exec call site in the whole VM, `zig/src/vm/execplan.zig`).
 
 ```sh
 ./shensh globals.csexp        # from the repo root (boot paths are relative)
@@ -88,7 +86,7 @@ convention); `"$@"` keeps separate fields, `"$*"` joins; `$$` is the live
 PID, `$!` is empty (no background jobs in v1), `$-` is `i`/`c`. Backticks,
 `$( )`, and bare `&` are rejected with clean `error:` messages (the parser
 never leaves Shen — no host shell is consulted). Run `make shensh-test` for
-the full 57-case end-to-end suite.
+the full 67-case end-to-end suite.
 
 Requires [shen-scheme](https://github.com/tizoc/shen-scheme) (Shen 41.2 on Chez Scheme) at `vendor/shen-scheme/` (used to bootstrap the serializer; the shipped bundle is compiled by our own `shen->kl`).
 
@@ -107,16 +105,16 @@ Standalone binary for inspecting bundled bytecode:
 | `--asm` | Disassembly w/ addresses | `0003: jmpf 7  ; -> 0007` |
 | `--shen` | Shen list for `interp.shen` | `[access 0]`, `[global +]`, `apply` |
 | `--csexp` | Raw wire format (round-trippable) | `(ra[1:n]1P[1:s]+p)` |
-| `--curried` | Flag curried partial-application calls (C VM can't run them); exit 1 if any | — |
+| `--curried` | Flag curried partial-application calls (the VM can't run them); exit 1 if any | — |
 
-The old `./zincvm globals.csexp -d <name>` flag still works.
+Run from the repo root with the built binary (`zig/zig-out/bin/zincdec`).
 
 ## Tracing
 
 Trace execution of specific closures as they run:
 
 ```sh
-./zincvm globals.csexp --trace + --trace reverse
+./shensh globals.csexp --trace + --trace reverse
 ```
 
 Output shows each instruction in raw format with PC numbers:
@@ -147,11 +145,11 @@ Example: `(+ 1 2)` → `(mn[1:n]2n[1:n]1g[1:s]+p)`
 (open "Makefile" in) → (s[2:s]inS[8:S]MakefileP[4:s]open)
 ```
 
-There is no `push` (`u`) opcode — all value-producing instructions auto-push their result, and the compiler relies on this (see AGENTS.md). To call an unchecked C primitive that a safe wrapper shadows in the global table, use the inline `P[...]` opcode (`P[4:s]open`, `P[7:s]eval-kl`), which dispatches via `exec_primitive` and bypasses the global table.
+There is no `push` (`u`) opcode — all value-producing instructions auto-push their result, and the compiler relies on this (see AGENTS.md). To call an unchecked primitive that a safe wrapper shadows in the global table, use the inline `P[...]` opcode (`P[4:s]open`, `P[7:s]eval-kl`), which dispatches via the prim table and bypasses the global table.
 
 ## Self-hosting
 
-The C VM loads `globals.csexp` — a ~0.33MB reduced self-contained bundle of **~295 closures** (340 compiled by the meta-interpreter at load) compiled by **our own `shen->kl`** from the type-safe `.shen` sources. There is **no Shen OS `.kl` code**: the six list/utility helpers the interpreter needs are re-implemented in `shen/os-helpers.shen` (`append`, `reverse`, `empty?`, `assoc`, `element?`) plus `safe.variable?` in `primitives.shen`. The full eval-kl chain is proven: native values marshalled to tagged forms, compiled through `extract-kl → kl→zinc → toplevel-interp`, and demarshalled back. Shen compiles Shen, which runs on Shen, on the C VM.
+The Zig VM loads `globals.csexp` — a ~0.33MB reduced self-contained bundle of **~295 closures** (340 compiled by the meta-interpreter at load) compiled by **our own `shen->kl`** from the type-safe `.shen` sources. There is **no Shen OS `.kl` code**: the six list/utility helpers the interpreter needs are re-implemented in `shen/os-helpers.shen` (`append`, `reverse`, `empty?`, `assoc`, `element?`) plus `safe.variable?` in `primitives.shen`. The full eval-kl chain is proven: native values marshalled to tagged forms, compiled through `extract-kl → kl→zinc → toplevel-interp`, and demarshalled back. Shen compiles Shen, which runs on Shen, on the Zig VM.
 
 **Self-hosting tests all pass:**
 
@@ -177,17 +175,17 @@ The C VM loads `globals.csexp` — a ~0.33MB reduced self-contained bundle of **
 
 ### Custom moving generational GC
 
-A custom **moving generational collector** (`vm/gc.c`, `vm/gc.h`, shared types in `vm/zinctypes.h`). A 2MB nursery (pages marked `space==3`) is the allocation fast lane; the full-copy `collect()` is the (rare) old-gen collector and compacts old gen. Typed headers drive a tag-dispatch scavenger; roots are precise-only via the shadow stack + typed walkers (no conservative C-stack scan). A write barrier at `address->` vector writes keeps the old-gen→nursery references correct. No Boehm, no libgc.
+A custom **moving generational collector** (`zig/src/gc/` — `heap.zig`, `collect.zig`, shared types in `types.zig`). A 2MB nursery (pages marked `space==3`) is the allocation fast lane; the full-copy `collect()` is the (rare) old-gen collector and compacts old gen. Typed headers drive a tag-dispatch scavenger; roots are precise-only via the shadow stack + typed walkers (no conservative stack scan). A write barrier at `address->` vector writes keeps the old-gen→nursery references correct. No Boehm, no libgc.
 
 See `docs/gc.md` and `docs/moving-gc-validation.md` for the design and validation.
 
-### Calling C primitives past safe wrappers
+### Calling native primitives past safe wrappers
 
-`parse_bundle` overwrites C primitives with compiled safe wrapper closures. `%%` escapes and the inline `P[...]` opcode both dispatch via `OP_PRIM` → `exec_primitive`, bypassing the global table. There is no `raw.X` namespace — bytecode reaches an unchecked C primitive directly through `P[...]`.
+`parse_bundle` overwrites primitives with compiled safe wrapper closures. `%%` escapes and the inline `P[...]` opcode both dispatch via `OP_PRIM` → the primitive dispatcher, bypassing the global table. There is no `raw.X` namespace — bytecode reaches an unchecked primitive directly through `P[...]`.
 
 ### No Shen OS code in the bundle
 
-The reduced bundle contains zero Shen OS `.kl` closures. Every bytecode closure is compiled by our own `shen->kl` (full-arity, no partial application). This also removes OS closures that shadowed C primitives in the global table (e.g. `variable?` was shadowed by a buggy `sys.kl` closure that returned `false`; it's now `safe.variable?` → the correct C primitive).
+The reduced bundle contains zero Shen OS `.kl` closures. Every bytecode closure is compiled by our own `shen->kl` (full-arity, no partial application). This also removes OS closures that shadowed primitives in the global table (e.g. `variable?` was shadowed by a buggy `sys.kl` closure that returned `false`; it's now `safe.variable?` → the correct native primitive).
 
 ### Recursive eval-kl
 
@@ -197,12 +195,12 @@ The reduced bundle contains zero Shen OS `.kl` closures. Every bytecode closure 
 
 - [x] 34 built-in VM tests (arithmetic, types, closures, error handling, I/O, trap-error routing)
 - [x] ~295 bundled closures loaded and executing (reduced self-contained bundle; 340 compiled by the meta-interpreter)
-- [x] **Self-hosting proven**: eval-kl chain returns `3` for `(+ 1 2)` — no C bypass
+- [x] **Self-hosting proven**: eval-kl chain returns `3` for `(+ 1 2)` — no host bypass
 - [x] Custom moving generational GC (nursery + old-gen, precise roots, write barrier) — 18 nursery scavenge/retention tests pass
 - [x] `deep_equal` for cons==cons structural comparison
-- [x] `P[...]` inline OP_PRIM dispatch — bytecode calls C primitives directly
+- [x] `P[...]` inline OP_PRIM dispatch — bytecode calls VM primitives directly
 - [x] Recursive `eval-kl` delegating to bundled closure
-- [x] Raw I/O from C VM
+- [x] Raw I/O from the VM
 - [x] KLambda primitives: `gensym`, `@p`, `fst`, `snd`, `variable?`
 - [x] Full read-compile-eval round-trip (bundled `load` works)
 - [x] `read-from-string` via YACC parser
@@ -212,7 +210,7 @@ The reduced bundle contains zero Shen OS `.kl` closures. Every bytecode closure 
 - [x] Per-closure instruction tracing (`--trace`)
 - [x] String stream support in `open` primitive
 - [x] **Own `shen->kl` compiler** — reduced bundle has no Shen OS `.kl` code
-- [x] **shensh shell** — POSIX-style shell with Shen lexer/parser/expander + native exec-plan runner; `/bin/sh` fully removed (`make shpar-verify`, 57-case e2e suite)
+- [x] **shensh shell** — POSIX-style shell with Shen lexer/parser/expander + native exec-plan runner; `/bin/sh` fully removed (67-case e2e suite)
 - [ ] REPL with interactive terminal I/O
 - [ ] `shen.initialise` non-idempotency fix
 

@@ -1,7 +1,7 @@
-# ZINC bytecode & C VM conventions
+# ZINC bytecode & VM conventions
 
 Source: `AGENTS.md`. Opcodes, calling/argument conventions, primitive semantics,
-and C VM gotchas.
+and VM gotchas.
 
 ## ZINC calling convention (STANDARD — fully aligned)
 
@@ -26,7 +26,7 @@ auto-push (see "Compiler changes" below).
 
 **Compiler changes:** `shen/zinc.shen` (`zinc-c` and `zinc-t`) relies on
 auto-push — multi-arg primitives and function calls emit bare operand sequences,
-no `push` opcode. The `push` (`u`) opcode has been REMOVED from the C VM, the
+no `push` opcode. The `push` (`u`) opcode has been REMOVED from the VM, the
 compiler pipeline, and the metacircular interp: the compiler never emits it, and
 the bundle/test bytecode contain no `u`. `pushmark` (`m`) remains.
 
@@ -88,7 +88,7 @@ transformation is needed — the interp natively handles standard ZINC output.
   returns false, breaking `macroexpand-h`'s fixed-point check.
 - **`=` symbol comparison** is strict `strcmp` — no prefix awareness. Reference
   shen-scheme's `kl:=` uses plain `eq?` (pointer identity on symbols); `foo` and
-  `shen.foo` are different symbols. The C VM MUST NOT add `shen.` prefix handling
+  `shen.foo` are different symbols. The VM MUST NOT add `shen.` prefix handling
   to `=` — prefix consistency is a pipeline concern (see loading doc). If
   `(= define shen.define)` ever returns false at runtime, the bug is in
   `shen.initialise` not completing, NOT in `=`.
@@ -109,15 +109,12 @@ transformation is needed — the interp natively handles standard ZINC output.
   stream from Path. String stream data stored externally (not in Value union) to
   keep sizeof(Value) small.
 
-## C VM conventions
+## Zig VM conventions
 
-- **GC**: Boehm GC (libgc) — non-moving conservative collector. `GC_MALLOC`/
-  `GC_MALLOC_ATOMIC` via macros `GC_VALUE()`, `GC_STR()`, `GC_VALUE_ARRAY()`.
-  No gcinit, no extra roots, no pointer counts. Objects never move, so
-  stack-local Value pointers are always safe across allocations. (See `docs/gc.md`
-  for the plan to replace this with a moving generational collector.)
-- The old Bartlett copying GC has been removed; the current collector is the
-  single-space Cheney mostly-copying GC in `vm/gc.c` (see `docs/gc.md`).
+- **GC**: the custom moving generational GC in `zig/src/gc/` (2MB nursery +
+  old-gen, precise typed roots, write barrier — see `docs/gc.md`). No
+  Boehm/libgc dependency. Objects move, so values held across allocations must
+  go through the precise root stack / typed walkers.
 - `global` loads from table then falls back to `val_prim(name)`.
 - Primitives dispatch via `exec_primitive()` — apply-mode pops mark + args from
   stack. Inline `OP_PRIM` (`P`) executes primitive with args from stack +

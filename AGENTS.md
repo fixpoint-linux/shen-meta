@@ -2,52 +2,43 @@
 
 ## Build & test
 
+The runtime is the **Zig port** (`zig/`). The only non-Zig build step is
+`make bundle`, which compiles the Shen sources through the vendored
+shen-scheme host and serialises the reduced bundle to `globals.csexp`.
+
 ```sh
-make          # build C VM, zincdec, shensh, and zinctest (release)
-make test     # build+run zinctest — 48 built-in bytecode tests
-make gcdebug  # build zinctest-gc (-O0 -g) for GC observability flags
-make test-asan # build+run zinctest-asan (UBSan)
-make pipeline # compile (+ 1 2) through full pipeline
-make bundle   # serialize all safe wrappers → globals.csexp
-make run-bundle  # run zinctest with globals.csexp (self-hosting + GC stress tests)
-                # ./zinctest globals.csexp  is equivalent
-make shensh-test # build+run the shensh end-to-end shell tests (67 cases)
-make shpar-verify # grep gate: zero execl(/bin/sh) sites in vm/zincvm.c vm/shensh.c
-
-# Trace execution of specific closures:
-./zincvm globals.csexp --trace + --trace reverse
-
-# ./zincvm with no args prints usage (tests moved to ./zinctest)
-./zincvm                         # prints usage
-./zinctest                        # runs 48 built-in bytecode tests
-./zinctest globals.csexp          # runs self-hosting + GC nursery + stress tests
+make            # build shensh + zincdec into zig/zig-out/bin/
+make test       # zig build test -Doptimize=Debug (gc + vm suites)
+make gate       # zig build gate (Debug + ReleaseSafe + ReleaseFast)
+make bundle     # serialize all safe wrappers → globals.csexp (vendored shen-scheme)
+make shensh-test# run the shensh end-to-end shell tests (tools/shensh-e2e-zig.sh, 67 cases)
+make bundle-verify # Soufflé safe-subset gate on globals.csexp (opt-in, needs souffle)
 ```
 
 ## Architecture
 
 ```
-Shen source → kmacros → normalize-term → debruijn → zinc-c → compile-zinc → nat->csexp → C VM
+Shen source → kmacros → normalize-term → debruijn → zinc-c → compile-zinc → nat->csexp → Zig VM
 ```
 
 ## shensh — the Shen shell (no /bin/sh)
 
 `./shensh globals.csexp` is an interactive POSIX-style shell whose **lexer,
-parser, and expander are Shen code** and whose **process runner is a native C
+parser, and expander are Shen code** and whose **process runner is a native
 primitive**. `/bin/sh` is fully removed: there is exactly ONE exec call site
-in the whole VM (`execvp(c->argv[0], c->argv)` in the exec-plan runner) and
-`make shpar-verify` gates on zero `execl("/bin/sh")` sites.
+in the whole VM (`execvp` in the exec-plan runner, `zig/src/vm/execplan.zig`).
 
 ### Pipeline
 
 ```
 line → sp-lex (shell/shlex.shen) → sp-parse (shell/shparse.shen)
      → shx-plan (shell/shexpand.shen)  → raw plan tree
-     → [prim exec-plan] (C, vm/zincvm.c) → fork/dup2/execvp per stage
+     → [prim exec-plan] (zig, zig/src/vm/execplan.zig) → fork/dup2/execvp per stage
 ```
 
 - The four `shell/*.shen` files are **namespace-2 (Shen `global-table`)
-  closures**, NOT part of `globals.csexp`. `shensh.c` boots them at startup
-  via `shen_load_source_ex` in dependency order — `shlex` → `shparse` →
+  closures**, NOT part of `globals.csexp`. The front-end boots them at startup
+  in dependency order — `shlex` → `shparse` →
   `shexpand` → `shell` — each warn-and-continue on failure, AFTER
   `tc-hm-init`, so the HM sig table accumulates across files and the shell
   sources are HM-checked at boot (this is why `shensh` must run from the
@@ -77,14 +68,14 @@ shared between parent (reads it back) and child (writes to it): no pipe
 buffer to deadlock on and no name to leak — the file vanishes when both
 sides close. `2>&1` is `dup 1 2` applied **after** earlier redirects, so
 `2>&1 >file` correctly leaves stderr on the old stdout (POSIX ordering,
-tested in zinctest 51 + e2e).
+tested in the VM tests + e2e).
 
 ### Builtins
 
 - **Parent-process (Shen, `shell/shell.shen`)** — `cd`, `pwd`,
   `setenv`/`export` (`NAME VALUE` or `NAME=VALUE`), `exit` (sets `*sh-exit*`).
   These must mutate the shell process itself.
-- **Child (C, `vm/zincvm.c`)** — `echo`, `true`, `false`, `:`, `cd`, `pwd`
+- **Child (Zig, `zig/src/vm/execplan.zig`)** — `echo`, `true`, `false`, `:`, `cd`, `pwd`
   run inside forked children (post-redirect), so they behave uniformly in
   pipelines and subshells. Inside a forked subshell child a single builtin
   runs **in-process** with fds 0/1/2 saved/restored — that is what makes
@@ -94,7 +85,7 @@ tested in zinctest 51 + e2e).
 ### The `(` escape (Shen surface at the prompt)
 
 A line starting with `(` (no unquoted `;` `|` `&` — those are shell subshells)
-routes through `eval_klambda_line` (vm/shensh.c): the **bundled flat-Shen
+routes through the front-end's eval-klambda-line path: the **bundled flat-Shen
 reader/compiler** — `shen-parse-exprs` (the .shen surface reader: `{ A --> B }`
 sigs grouped, `[X | Y]` consified, `->` an atom) parses, then each form is
 compiled by `shen->kl` (the same dispatcher `shen-load` uses) and dispatched:
@@ -102,13 +93,12 @@ a compiled `(defun ...)` registers into namespace 2 via `interp-eval`
 (`; registered <name>`), anything else evaluates via `eval-kl` (`=> <result>`).
 So BOTH Shen surface (`(define sq { number --> number } X -> (* X X))` then
 `(sq 7)` → `49`) and raw KLambda (`(defun f (X) ...)`) work at the prompt.
-`vm/zincvm.c`'s `--meta-repl` uses the identical pipeline.
 
 ### sh-continue heredoc protocol
 
 When a line ends inside an unterminated heredoc, `sp-parse` returns
 `[pending Delims]` and `shell-eval-line` returns the SYMBOL `sh-continue`.
-The `shensh.c` REPL then prints a `> ` continuation prompt, accumulates
+The `shensh` REPL then prints a `> ` continuation prompt, accumulates
 `buffer = buffer + "\n" + line`, and re-evaluates the whole buffer each
 line until the delimiter closes. EOF while pending prints
 `heredoc: unexpected EOF` and resets the buffer. Parsing never leaves Shen.
@@ -117,9 +107,9 @@ line until the delimiter closes. EOF while pending prints
 
 `$0` `$1`..`$9` `$#` `$@` `$*` `$$` `$!` `$-` are supported (lexed as
 one-char var parts in `shlex.shen`, expanded in `shexpand.shen`'s
-`shx-var-value` dispatch). `shensh.c` sets `*sh-argv0*`, `*sh-posargs*`,
-`*sh-flags*`, `*sh-pid*` in the C values table at boot (via `eval_kl_form`
-on `(set ...)` forms, so they land TAGGED — see the note below) and
+`shx-var-value` dispatch). The front-end sets `*sh-argv0*`, `*sh-posargs*`,
+`*sh-flags*`, `*sh-pid*` in the values table at boot (via `(set ...)`
+forms, so they land TAGGED — see the note below) and
 `shexpand.shen` reads them via `value`, falling back to honest defaults
 when unbound:
 
@@ -131,7 +121,7 @@ when unbound:
 - `$#` = decimal count of positional args.
 - `$@`/`$*` = the positional args: `"$@"` produces separate quoted fields,
   `"$*"` one joined field; unquoted both join with spaces and re-split.
-- `$$` = the shell's live PID (C `getpid` prim, 5-registry registered).
+- `$$` = the shell's live PID (Zig `getpid` prim, 5-registry registered).
 - `$!` = empty string (v1 has no background jobs — honest, not an error).
 - `$-` = `"i"` in the interactive REPL, `"c"` under `-c`.
 
@@ -153,21 +143,21 @@ the closure body, it creates a new closure capturing the provided arguments. Thi
 is implemented via the `arity`, `count-args`, and `drop-grabs` helpers in `interp.shen`,
 with arity checks in the `apply` and `appterm` rules.
 
-**The C VM does NOT support partial application** — it is intentionally simpler.
-The C VM runs only the subset of ZINC required for the meta-interpreter (the
+**The Zig VM does NOT support partial application** — it is intentionally simpler.
+It runs only the subset of ZINC required for the meta-interpreter (the
 reduced self-contained bundle), where all call sites are proven full-arity.  If
 a bundled closure calls another with a short argument list, the metacircular
-interp (which runs ON the C VM) handles it — the C VM never sees partial
+interp (which runs ON the Zig VM) handles it — the VM never sees partial
 application directly.  This split is intentional: the metacircular interp runs
-full KLambda; the C VM runs only the statically-proven subset.
+full KLambda; the Zig VM runs only the statically-proven subset.
 
 ## Design intent (why static sites skip safe wrappers)
 
 **The end goal:** the meta-circular interpreter (`interp` in `shen/interp.shen`) is
 written in Shen and is meant to be PROVEN type-safe using the Shen sequent-calculus
-type rules, and the C interpreter is meant to be GENERATED from that proven
+type rules, and the VM is meant to be GENERATED from that proven
 interpreter (a static compiler that only compiles that subset, or by specialising
-the interpreter). The C VM in `vm/zincvm.c` is a hand-written stand-in for that
+the interpreter). The Zig VM in `zig/src/vm/` is a hand-written stand-in for that
 generated interpreter.
 
 Consequence — call sites split into two kinds:
@@ -185,15 +175,11 @@ Consequence — call sites split into two kinds:
 
 `[global X]` → `safe.X` only fires on the dynamic path (a primitive used *as a
 value*, higher-order, or explicit `(function X)`). Normal direct calls use
-`[prim X]`. The C primitives have NO runtime type guards (the guard-enabled
-`ZINCVM_DEBUG` build and its `PRIM_TYPE_ERROR` machinery were removed — the full
-OS bundle that needed them is gone). Type validation is owned entirely by the
-Shen safe-wrapper layer. This is safe ONLY for a type-safe bundle: the canonical
-bundle (`make bundle` → `globals.csexp`) is the **reduced self-contained
-interpreter** (meta-interpreter + safe-subset helpers), which never passes bad
-types. The full Shen OS is not serialized into a second bundle — it runs by
-loading its `.kl` files at **runtime** into the meta-interpreter via
-`interp-load-raw` (`./zincvm globals.csexp --repl`).
+`[prim X]`. The VM primitives have NO runtime type guards. Type validation is
+owned entirely by the Shen safe-wrapper layer. This is safe ONLY for a
+type-safe bundle: the canonical bundle (`make bundle` → `globals.csexp`) is the
+**reduced self-contained interpreter** (meta-interpreter + safe-subset helpers),
+which never passes bad types.
 
 Always-on throw sites that are NOT type guards and stay in release: `simple-error`,
 `fail`, `apply`/`appterm` non-callable + too-many-args, `env_pop`, `eval-kl` catch,
@@ -212,7 +198,7 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
 | 7b | read-from-string | Pass (returns [[+ 1 2]]) |
 | 7b' | read-from-string typed define `{ A --> A }` | Pass (returns [[define id ...]]) — regression test for Bug #1 |
 | 7c | read via string stream | Pass |
-| 8-10 | id, newvar, defun->lambda (bundled via interp-load-raw) | Pass |
+| 8-10 | id, newvar, defun->lambda (bundled in the reduced bundle) | Pass |
 | 10b | lambda-as-value application: `((lambda (X) (+ X 100)) 5)` → 105, multi-param `((lambda (X Y) (- X Y)) 10 3)` → 7, `(let F (lambda (X Y) (+ X Y)) (F 3 4))` → 7 | Pass — regression for the kmacros param-list fix (`fix(interp)` 9bc7300). Raw KLambda `(lambda (X ...) Body)` must be unwrapped/curried by `kmacros` (normalize.shen) before debruijn, else body refs don't resolve and the interp dies with `interp: unknown prim`. Use KLambda syntax `(defun F (X) Body)`, not Shen `(defun F X -> ...)`. |
 
 ## Key files (under `shen/` unless noted):
@@ -221,10 +207,11 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
 - `shen/zinc.shen` — KLambda → ZINC bytecode compiler
 - `shen/compile.shen` — ZINC → canonical s-expression (csexp)
 - `shen/primitives.shen` — 37 type-checked safe wrappers
-- `vm/zincvm.c` — native C parser + VM (~1800 lines, includes GC)
+- `zig/src/vm/` — the Zig VM (interp.zig, prims.zig, execplan.zig, marshal.zig, ...)
+- `zig/src/gc/` — the Zig moving generational collector (heap.zig, collect.zig, roots.zig, ...)
 - `shen/serialize-reduced.shen` — serialize reduced bundle's global-table to csexp (`globals.csexp`)
 - `shen/toplevel.shen` — `interp-eval` — compiles defun forms through interpreter
-- `shen/load.shen` — `interp-load` / `interp-load-raw` — file loading
+- `shen/load.shen` — flat-shen reader helpers (parse-string, skip-ws, strlen, …)
 - `shen/util.shen` — `defun->lambda`, `primitive?` (single source of truth), `dedupe-globals`
 - `shen/types.shen` — type definitions + DUPLICATE `primitive?` list (must stay synced!)
 
@@ -239,54 +226,33 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
 - `-q` sets `*hush*` which gates `print` but not `write-byte`
 - `%%` escapes to host Shen primitives; compiles to `[prim X]` in ZINC
 
-## C VM conventions
+## Zig VM conventions
 
-- **GC**: custom generational collector (`vm/gc.c`, `vm/gc.h`, shared types in
-  `vm/zinctypes.h`). A 2MB nursery (pages marked `space==3`) is the allocation
-  fast lane; the existing full-copy `collect()` is the (rare) old-gen collector
-  and compacts old gen. Typed headers drive a tag-dispatch scavenger; roots are
-  precise-only via the shadow stack + typed walkers (no conservative C-stack
-  scan since 4a.6); typed `gc_scan_value`/`gc_evacuate` in `zincvm.c` handle
-  interior pointers. Write barrier at `address->` vector writes (site 1,
-  required); `global_set` barrier deferred (see `docs/gc.md`).
-  **Drain invariant (Bug 2 fix):** the shared page-queue Cheney drain
-  (`cheney_drain` in `vm/gc.c`) must never treat `cp == freep` as end-of-page
-  while the queue is non-empty — objects allocated into a dequeued page's bump
-  slack would never be scanned (stale interior pointers → heap corruption).
-  Only the freep page can receive new objects, so the drain defers that one
-  page and resumes its walk later. `gc_alloc`/`gc_alloc_oldgen` grow the heap
-  when a collect leaves the live set above `oldgen_collect_threshold()`
-  (anti-thrash; the pre-fix collector only avoided the thrash by dropping
-  live objects).
-  A static-analysis verifier (`tools/gc-verify/`, opt-in via
-  `make gc-verify`) cross-checks root discipline and write barriers
-  against this design: it runs `clang -Xclang -ast-dump=json` over
-  `vm/zincvm.c` + `vm/gc.c`, extracts facts to CSV, and runs Soufflé
-  Datalog rules (`gc_safety.dl`) that flag (a) GC-managed locals live
-  across an allocating call without a shadow-stack push (`root_miss`)
-  and (b) raw `memcpy` into a fresh `Value` array with no
-  `gc_dirty_vectors_add` before the next allocation
-  (`memcpy_unbarriered`). It is a **verifier + candidate generator,
-  not a gate**: requires clang ≥ 14 + souffle on the host (not part of
-  `make`/`make test`), `make gc-verify` runs end-to-end (regression
-  fixtures + real-VM baseline diff against `expected/`), and a flagged
-  site is a review prompt, not a build break. See
-  `tools/gc-verify/README.md` for the soundness scope (catches
-  named-slot + missing-barrier classes; cannot catch register-cached
-  temps, collector-invariant bugs, or non-GC-typed flows).
+- **GC**: custom generational collector (`zig/src/gc/`). A 2MB nursery (pages
+  marked `space==3`) is the allocation fast lane; the existing full-copy
+  `collect()` is the (rare) old-gen collector and compacts old gen. Typed
+  headers drive a tag-dispatch scavenger; roots are precise-only via the shadow
+  stack + typed walkers (no conservative stack scan); typed
+  `gc_scan_value`/`gc_evacuate` handle interior pointers. Write barrier at
+  `address->` vector writes (site 1, required); `global_set` barrier deferred
+  (see `docs/gc.md`).
+  **Drain invariant (Bug 2 fix):** the shared page-queue Cheney drain must
+  never treat `cp == freep` as end-of-page while the queue is non-empty —
+  objects allocated into a dequeued page's bump slack would never be scanned
+  (stale interior pointers → heap corruption). Only the freep page can receive
+  new objects, so the drain defers that one page and resumes its walk later.
+  `gc_alloc`/`gc_alloc_oldgen` grow the heap when a collect leaves the live set
+  above `oldgen_collect_threshold()` (anti-thrash; the pre-fix collector only
+  avoided the thrash by dropping live objects).
 
 - csexp atoms: `[len:type]value` — type is `s`/`n`/`S`/`b`
 - Opcodes are single chars: `m` pushmark, `p` apply, `r` grab, `v` return, etc.
-- `global` loads from table then falls back to `val_prim(name)`
-- Primitives dispatch via `exec_primitive()` — apply-mode pops mark + args from stack
+- `global` loads from table then falls back to the prim table
+- Primitives dispatch via the prim table — apply-mode pops mark + args from stack
 - Inline `OP_PRIM` (`P`) executes primitive with args from stack + accumulator (ZINC semantics)
-- `trap-error`/`simple-error` use `setjmp`/`longjmp`
-- `eval_kl_depth` recursion guard: setjmp guard ensures depth always decremented even on
-  longjmp from simple-error. Without this, a failed eval-kl blocks all subsequent calls.
-- `--trace <name>`: trace every instruction of a specific closure as it executes.
-  Repeatable. Output in raw format with PC numbers. E.g. `./zincvm globals.csexp --trace +`
-  shows `[+]   0000  grab`, `[+]   0003  jmpf 7 (tgt=7)`, etc.
-  Traces only the named function — not functions it calls (unless also --traced).
+- `trap-error`/`simple-error` use setjmp/longjmp semantics
+- `eval_kl_depth` recursion guard: ensures depth always decremented even on
+  a raised error. Without this, a failed eval-kl blocks all subsequent calls.
 
 ## Primitive semantics (critical — must match Shen)
 
@@ -295,7 +261,7 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
   fixed-point check.  Depth-limited to 1000 for cycle safety.
 - **`=` symbol comparison** is strict `strcmp` — no prefix awareness.  Reference
   shen-scheme's `kl:=` uses plain `eq?` (pointer identity on symbols); `foo` and
-  `shen.foo` are different symbols and must compare unequal.  The C VM MUST NOT
+  `shen.foo` are different symbols and must compare unequal.  The VM MUST NOT
   add `shen.` prefix handling to `=` — prefix consistency is a pipeline concern.
   The pipeline enforces it via: `%% set` in normalize.shen → `shen.initialise`
   completes → `shen.external-symbols` populated → `sysfunc?` returns true for
@@ -307,7 +273,7 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
   `(= hd(Code) define)`), so flat `(= [define ...] define)` no longer occurs.
 - **`%%` in normalize**: ALL primitives must use `%%` prefix in normalize.shen.
   `[set S E]` was missing `%%`, causing `set` to go through `global set` + `apply`
-  (safe wrapper) instead of `prim set` (direct C primitive).  This broke
+  (safe wrapper) instead of `prim set` (direct primitive).  This broke
   `shen.initialise`'s deeply nested `do` chain.  Always use `[%% set S T]`.
 - `n->string N`: number → single-character string via ASCII code. `(n->string 40)` → `"("`
 - `string->n S`: first character → ASCII code. `(string->n "(")` → `40`
@@ -341,43 +307,36 @@ and `pos` out-of-bounds inside `trap-error` (semantic, needed for `strlen`/end-o
 
 - `interp-eval` in `toplevel.shen` compiles `defun` forms and stores closures in
   `global-table` via `defun->lambda → kl->zinc → toplevel-interp`
-- `interp-load` in `load.shen` reads a file with `read-file`, feeds each `defun`
-  through `interp-eval`; errors in individual forms are caught and skipped
 - The **reduced** self-contained bundle (`make bundle` → `globals.csexp`) is
   `serialize-reduced.shen` — it walks the deduped `global-table` and serializes
   all closures (~340 in the reduced build).
-  The full Shen OS is NOT a second bundle: it is loaded from `.kl` at **runtime**
-  by the C VM's `--repl` mode (`./zincvm globals.csexp --repl` loads the OS
-  kernel `.kl` into the meta-interpreter via `interp-load-raw`, then runs
-  `shen.initialise`/`shen.repl`).
 
 ### Two global namespaces (critical to understand)
 
 There are **two separate global namespaces**, and confusing them is the #1 source
-of "why can't the C VM see my closure?" bugs:
+of "why can't the VM see my closure?" bugs:
 
-1. **C VM native `global_table[]`** (`vm/zincvm.c`). Populated by
-   `parse_bundle` from the bundle `((name code) ...)` and by `init_globals`
-   (C primitives, `safe.X` wrappers, `*stinput*`/`*stoutput*`/`*sterror*`,
-   keywords). Read by the `[global X]` opcode (`OP_GLOBAL` → `global_get`).
-   This is what raw C bytecode `g[6:s]foo` reaches.
+1. **VM native global table** (`zig/src/vm/tables.zig`). Populated by bundle load
+   from the bundle `((name code) ...)` and by init (primitives, `safe.X`
+   wrappers, `*stinput*`/`*stoutput*`/`*sterror*`, keywords). Read by the
+   `[global X]` opcode.
 2. **Metacircular interp's Shen `global-table`** (`shen/interp.shen:6`,
    `(set global-table [])`). A Shen **variable** holding an assoc list
-   `[name . closure]`. The interp resolves `[global G]` **not** via the C VM
+   `[name . closure]`. The interp resolves `[global G]` **not** via the VM
    table but via `lookup-global` (`interp.shen:8`) which reads
-   `(value global-table)`. `interp-eval`/`interp-load`/`interp-load-raw`
-   (`toplevel.shen`/`load.shen`) `(set global-table (cons [Name Closure] ...))`
+   `(value global-table)`. `interp-eval`
+   (`toplevel.shen`) `(set global-table (cons [Name Closure] ...))`
    to register a compiled defun.
 
 **Which one does a loaded `.kl` defun land in?** The Shen `global-table`
-(namespace 2) — NOT the C VM `global_table[]` (namespace 1). The C-level
-`set` primitive (`zincvm.c:1227`) writes into `global_table["global-table"]`,
-so the interp's list is *stored as* a C global named `"global-table"`, but a
-runtime-loaded closure (`shen.foo`) is **not** its own C global entry.
+(namespace 2) — NOT the VM native table (namespace 1). The `set`
+primitive writes into the global named `"global-table"`, so the interp's list is
+*stored as* a global named `"global-table"`, but a runtime-loaded closure
+(`shen.foo`) is **not** its own native global entry.
 
 Consequences:
-- C bytecode `[global shen.foo] apply` (namespace 1) will NOT find a
-  runtime-loaded closure — `global_get` falls back to `val_symbol`, giving
+- Bytecode `[global shen.foo] apply` (namespace 1) will NOT find a
+  runtime-loaded closure — the lookup falls back to the symbol, giving
   "apply non-callable"/`appterm non-lambda`.
 - To call a runtime-loaded closure, drive it **through the metacircular interp**:
   `eval-kl`, `toplevel-interp`, or a bundled closure that resolves names via
@@ -388,51 +347,40 @@ Consequences:
   reaching OS closures works *as long as execution flows through the interp*.
 
 **Debugging a wrong-value `or`/`appterm non-lambda` at runtime?** First check
-whether the closure you're calling is in the C VM table or only the Shen
+whether the closure you're calling is in the VM table or only the Shen
 `global-table`. A `[global X]` reaching a non-primitive, non-registered name
 returns the symbol `X` — not an error. If you see the symbol coming back as a
 "result", you are reading the wrong namespace.
 
-**Tagged vs raw values in the C values table (`set`/`value` asymmetry).** The
+**Tagged vs raw values in the values table (`set`/`value` asymmetry).** The
 metacircular interp's `[prim set]` rule (interp.shen) passes the interpreter's
-TAGGED representation (`[string S]`/`[number N]` cons cells) to the C `set`
-primitive, so every REPL/shensh-boot `(set ...)` lands TAGGED in
-`global_table`/values table; `[prim value]` returns it as-is and downstream
-interp rules pattern-match the tagged forms (`[prim string?] [string _]`...).
-But a RAW C `value_set(name, val_string(...))` writes UNTAGGED — a bundled
-closure reading it via `value` then fails its tagged pattern matches and
-silently falls to the catch-all/default arm (symptom: C-boot globals look set
-from the REPL `(value ...)` yet shell closures always take their defaults).
-**Rule: from C, set Shen-visible globals through `eval_kl_form` on a
-`(set ...)` KLambda form** (see `boot_set_kl_string`/`boot_set_kl_posargs` in
-vm/shensh.c), never raw `value_set` — and unwrap both raw and `[number N]`
-forms when reading them back from C (`sh_exit_code_num`).
+TAGGED representation (`[string S]`/`[number N]` cons cells) to the `set`
+primitive, so every REPL/shensh-boot `(set ...)` lands TAGGED in the values
+table; `[prim value]` returns it as-is and downstream interp rules pattern-match
+the tagged forms (`[prim string?] [string _]`...). But a RAW `value_set` writing
+a plain string is UNTAGGED — a bundled closure reading it via `value` then fails
+its tagged pattern matches and silently falls to the catch-all/default arm
+(symptom: boot globals look set from the REPL `(value ...)` yet shell closures
+always take their defaults).
+**Rule: set Shen-visible globals through `(set ...)` KLambda forms, never raw
+`value_set` — and unwrap both raw and `[number N]` forms when reading them back.
 
-**How the metacircular interp loads a `.kl` file at runtime** (the OS-load path):
-1. `interp-load-raw Path` (`load.shen:11`) reads the file via `read-file-raw`
-   (namespace-independent: just parses KLambda s-expressions).
-2. `interp-eval-all` (`load.shen:14`) feeds each parsed form to
-   `interp-eval-safe` (`trap-error`-wrapped).
-3. `interp-eval` (`toplevel.shen:9`) matches `[defun Name Args Body]`,
-   compiles via `kl->zinc (defun->lambda ...)` → `toplevel-interp`, and stores
-   `[Name Closure]` into the interp's `global-table` (namespace 2). Returns
-   `loaded` on success (`interp-eval-all` returns `loaded`).
-4. Because this all runs as bundled bytecode **on the C VM**, the deep recursion
-   (`read-file-raw → parse-exprs → parse-expr → parse-list → … → strlen-acc`)
-   exercises the precise-root shadow stack. The reduced bundle MUST be able to
-   compile every form it reads (see n-ary `and`/`or` fix below) or a form
-   compiles to `[global or]` and the load returns symbol `or` instead of
-   `loaded`.
+**How the metacircular interp registers a compiled `defun`:** `interp-eval`
+(`toplevel.shen`) matches `[defun Name Args Body]`, compiles via
+`kl->zinc (defun->lambda ...)` → `toplevel-interp`, and stores `[Name Closure]`
+into the interp's `global-table` (namespace 2). The flat-shen compiler's
+`shen->kl-forms` feeds each parsed form through `interp-eval` (singular); the
+shell boots its `shell/*.shen` sources through `shen_load_source` →
+`shen-read-file` → `shen->kl-forms` → `tc-hm-forms` → `interp-eval`.
 
-### n-ary `and`/`or` (compiler gotcha that broke runtime `.kl` load)
+### n-ary `and`/`or` (compiler gotcha)
 
 `kmacros` in `normalize.shen` must expand **n-ary** `and`/`or`, not just 2-arg:
 `read-atom-chars` uses a 5-arg `(or ...)`, `parse-atom` a 3-arg `(and ...)`.
 The 2-arg-only rules let these fall through to the general `[X | Y]` rule and
 compile to `[global or]`/`[global and]` + apply, which resolve to symbols at
-runtime → `appterm non-lambda` returning symbol `or`. This surfaced only when
-the OS-load probe first exercised `read-file-raw` (the built-in tests use the
-YACC parser, not `read-file-raw`). See the n-ary rules in `normalize.shen`.
+runtime → `appterm non-lambda` returning symbol `or`. See the n-ary rules in
+`normalize.shen`.
 
 ### Shen module system & package prefixing
 
@@ -442,30 +390,26 @@ YACC parser, not `read-file-raw`). See the n-ary rules in `normalize.shen`.
 - `.kl` files from shen-scheme are pre-compiled KLambda.  Most have the `shen.`
   prefix already baked in.  But `yacc.kl` defines `<e>`, `<!>`, `<end>` WITHOUT
   the prefix (generated by the YACC compiler, not the Shen compiler).
-- Our bundle mixes two compilation paths:
-  1. Our `.shen` tools (interp.shen, zinc.shen, etc.) — loaded via Shen's `load`,
-     which adds the `shen.` prefix → bytecode references `shen.<e>`
-  2. `.kl` files — loaded via `interp-load`, which stores closures under raw
-     names → definitions at `<e>` without prefix
-- **Fix**: the bundle serializer runs `shen.add-prefix-aliases` after all
-  interp-loads, creating `shen.<name>` entries for unprefixed closure names.
+- Our `.shen` tools (interp.shen, zinc.shen, etc.) are loaded via Shen's `load`,
+  which adds the `shen.` prefix → bytecode references `shen.<e>`
+- **Fix**: the bundle serializer runs `shen.add-prefix-aliases`, creating
+  `shen.<name>` entries for unprefixed closure names.
   Both `<e>` and `shen.<e>` resolve to the same closure.
-- **Do NOT add module prefix aliasing in the C VM** — it belongs at the Shen
-  pipeline level, during bundle creation.  The C VM should only consume
+- **Do NOT add module prefix aliasing in the VM** — it belongs at the Shen
+  pipeline level, during bundle creation.  The VM should only consume
   correctly-named bundles.  This applies especially to `=` and `deep_equal`:
   never make them `shen.`-prefix-aware; prefix consistency is enforced by the
   pipeline (see Primitive semantics above).
-- `interp-load` does NOT apply package prefixing itself (unlike Shen's
-  `eval-and-print` which goes through the reader).  The post-load aliasing step
-  in the serializer (`serialize-reduced.shen`) is the correct place to reconcile
-  the mismatch.
+- The serializer (`serialize-reduced.shen`) is the correct place to reconcile
+  any name-prefix mismatch.
 
 ## Bytecode decompiler (`zincdec`)
 
-Standalone binary for decompiling bundled closures. Four output formats:
+Standalone binary for decompiling bundled closures (`zig/src/zincdec_main.zig`).
+Four output formats:
 
 ```sh
-./zincdec globals.csexp <function-name> [--raw|--asm|--shen|--csexp]
+./zig/zig-out/bin/zincdec globals.csexp <function-name> [--raw|--asm|--shen|--csexp]
 ```
 
 | Flag | Format | Example |
@@ -475,17 +419,17 @@ Standalone binary for decompiling bundled closures. Four output formats:
 | `--shen` | Shen list for `interp.shen` | `[access 0]`, `[global +]`, `apply` |
 | `--csexp` | Raw wire format (round-trippable) | `(ra[1:n]1P[7:s]number?f[1:n]7...)` |
 
-Examples: `./zincdec globals.csexp +`, `./zincdec globals.csexp reverse --csexp`, `./zincdec globals.csexp shen.repl --shen`
+Examples: `zig build zincdec -p zig-out` then
+`./zig/zig-out/bin/zincdec globals.csexp +`,
+`./zig/zig-out/bin/zincdec globals.csexp reverse --csexp`,
+`./zig/zig-out/bin/zincdec globals.csexp shen.repl --shen`
 
-The old `./zincvm globals.csexp -d <name>` flag still works for quick inspection.
-- `read-file-raw` in `load.shen` parses `.kl` files without macro expansion
-  using `read-file-as-string` + recursive descent with cached `strlen`
-- `interp-load-raw` wraps `read-file-raw` for files with reader macro issues
-- `read-file-as-string` C primitive added to zincvm.c for native file I/O from VM
+## Flat-shen reader helpers (`load.shen`)
 
-## Raw s-expression parser (`load.shen`)
-
-- `read-file-raw Path` — reads file, parses all forms without macro expansion
+The bare helpers that the flat-shen compiler's `shen-parse-*` family (in
+shen-kl-helpers.shen) reuses live in `load.shen`: `parse-string`,
+`find-string-end`, `skip-comment`, `skip-ws`, `parse-num-str`, `strlen`,
+`chars->str`, plus the `ws-*?`/`digit-*?` char predicates and `str->num`.
 - Uses `(n->string N)` for all special chars (avoids Shen's `\` escape issues)
 - Shen 41.2 does NOT interpret `\n`/`\t`/`\r` in string literals — use `(n->string 10)` etc.
 - `\` in KLambda strings is literal (not escape) — `parse-string-chars` reads until `"`
@@ -499,18 +443,18 @@ The old `./zincvm globals.csexp -d <name>` flag still works for quick inspection
 - `gensym` — fresh symbol generation
 - `variable?` — predicate for KLambda variable symbols
 
-### Non-standard C extras (NOT part of KLambda; kept deliberately)
+### Non-standard extras (NOT part of KLambda; kept deliberately)
 
-- `c-strlen`, `char-code`, `substring` — added to the C VM (`prims[]`, `exec_primitive`)
-  for the `shen/load.shen` parser hot path only. They are **not** part of the
-  standard KLambda primitive set and are **not** called by the OS `.kl` files.
+- `c-strlen`, `char-code`, `substring` — added to the VM prim table
+  for the `shen/load.shen` parser hot path only (the flat-shen reader helpers).
+  They are **not** part of the standard KLambda primitive set.
   Kept (not removed) for the O(1) `strlen` / alloc-free `char-code` / O(k)
-  `substring` the pure-Shen fallbacks in `shen/load.shen` lack; removing them
-  makes the (already slow) OS-load noticeably slower. The pure-Shen fallbacks in
-  `shen/load.shen` are the canonical semantics. `read-file-as-string` and
-  `shen.fail!` are also non-standard names, but those are **required** by the OS
-  it loads (`reader.kl`/`init.kl` call `read-file-as-string`; `sys.kl:230` defines
-  `(defun fail () shen.fail!)`).
+  `substring` the pure-Shen fallbacks in `shen/load.shen` lack; the pure-Shen
+  fallbacks in `shen/load.shen` are the canonical semantics.
+  `read-file-as-string` and `shen.fail!` are also non-standard names, but
+  `read-file-as-string` is **required** by the flat-shen compiler's
+  `shen-read-file` (shen-kl-helpers.shen), which is how `shensh` boots
+  `shell/*.shen`.
 
 ## Shen pitfalls
 
@@ -522,32 +466,32 @@ The old `./zincvm globals.csexp -d <name>` flag still works for quick inspection
 - `.kl` files use raw KLambda constructs: `defun`, `lambda`, `let`, `cond`,
   `@p`, `where`, `freeze`, `thaw`, `cons?`, `=`, `if`, etc.
 
-## Self-hosting & C VM gotchas
+## Self-hosting & VM gotchas
 
-- `GLOBAL_TABLE_MAX` was 256 — bumped to 2048 to hold all ~1200 closures
-- `global_get` falls back to `val_prim(name)` for missing names — can cause
-  "unknown primitive" errors if a bundled closure overwrites a C primitive
+- The global table was sized generously to hold all ~1200 closures
+- A global lookup that falls back to the prim table for missing names can cause
+  "unknown primitive" errors if a bundled closure overwrites a primitive
   and then something expects the raw primitive
 - Bundled safe wrappers (safe.+, safe.open, safe.string? etc.) overwrite
-  C primitives in global table since `parse_bundle` runs after `init_globals`
-- `%%` escapes compile to `[prim X]` which calls `exec_primitive` directly,
+  primitives in the global table since bundle load runs after init
+- `%%` escapes compile to `[prim X]` which dispatches directly,
   bypassing the global table — so safe wrapper internals still work
-- Bytecode that needs an unchecked C primitive (bypassing safe-wrapper shadowing)
+- Bytecode that needs an unchecked primitive (bypassing safe-wrapper shadowing)
   uses the inline `OP_PRIM` dispatch (`P[4:s]open`, `P[7:s]eval-kl`, etc.) — the
-  same path `%%` escapes use. There is NO `raw.X` namespace; the C primitives are
+  same path `%%` escapes use. There is NO `raw.X` namespace; primitives are
   reached only via `OP_PRIM` (direct) or through a safe wrapper (global table).
 - `shen.repl`, `shen.read-evaluate-print`, `read`, `compile`, `eval-kl` are
   all in the bundle — the full Shen OS is available
 - `gensym`, `@p`, `fst`, `snd`, `variable?` — KLambda primitives added to
-  both `primitive?` (Shen side) and `exec_primitive` (C side)
+  both `primitive?` (Shen side) and the prim table (VM side)
 
 ## ZINC argument convention
 
 - **ZINC evaluates args RIGHT-TO-LEFT**: rightmost Shen arg pushed first
   (ends at stack bottom), leftmost pushed last (on top of stack)
-- All two-arg C primitives pop `a1` (top = leftmost arg) then `a2` (below =
+- All two-arg primitives pop `a1` (top = leftmost arg) then `a2` (below =
   rightmost arg). E.g., for `(- 5 3)`: stack `[3, 5]`, pop a1=5, a2=3,
-  compute `a1 - a2` = 5-3 = 2. `cons` does `val_cons(a1, a2)` = cons(left, right).
+  compute `a1 - a2` = 5-3 = 2. `cons` does cons(left, right).
 - `open` was the exception — had `dir`/`path` swapped, causing "open bad
   types" in bundled `load`. Fixed: pop `path` first, then `dir`
 - **When writing bytecode by hand**, push args in right-to-left order:
@@ -557,13 +501,9 @@ The old `./zincvm globals.csexp -d <name>` flag still works for quick inspection
   top-first (leftmost arg). Writing LTR (natural reading order) works
   for commutative ops (+, =, cons-as-pair) but silently produces wrong
   results for non-commutative ops (-, /, trap-error, write-byte).
-  This is the #1 recurring bug pattern. See tests 27-32 for examples.
-- Built-in tests use `m` (pushmark) before args; mark ends up at stack bottom,
-  not popped by `OP_APPLY` with `VAL_PRIM` (mark must be on top to be popped)
-- **Built-in tests**: 34 hand-written bytecode tests in `vm/zincvm.c`.
-  Tests 1-32 exercise apply ('p'), tests 33-38 exercise appterm ('t').
-  Built-in tests run without a bundle (`./zincvm`). Self-hosting tests
-  (10) + GC stress run with bundle (`./zincvm globals.csexp`).
+  This is the #1 recurring bug pattern. See the VM tests for examples.
+- The VM test suite uses `m` (pushmark) before args; mark ends up at stack bottom,
+  not popped by apply with a primitive (mark must be on top to be popped)
 - `appterm` ('t') and `apply` ('p') share identical stack layout:
   `[mark, argN..arg1, function]`. Difference: appterm reuses current frame
   (tail-call, pc=0), apply pushes new CallFrame. Both reject >64 args.
@@ -576,33 +516,21 @@ The old `./zincvm globals.csexp -d <name>` flag still works for quick inspection
 
 ## trap-error / primitive error handling
 
-Error handling uses a **per-catch-site linked list of stack-allocated `CatchFrame`
-structs** (commit `3ed45b1`). This replaced the earlier global `vm_error_jmp` +
-`error_jmp_stack[64]` + `te_push()/te_pop()` memcpy save/restore design, and the
-rescue `setjmp(vm_error_jmp)` at the top of `vm_exec_env`.
+Error handling uses a **per-catch-site chain** of error frames. The VM's
+`trap-error`/`eval-kl` and the front-end's REPL/init each install a catch
+frame that routes `simple-error` to the enclosing handler; an error raised
+outside any catch prints and aborts.
 
-- `CatchFrame { jmp_buf buf; Value error_val; int in_trap_error; struct CatchFrame *parent; }`
-  + a `vm_catch_chain` head + `vm_throw(msg)` (writes `error_val` into the chain
-  head, then `longjmp`s to its `buf`; if the chain is empty it prints and `abort()`s).
-- Each catch site (trap-error, eval-kl, run_test_timeout, main initialise + REPL,
-  self-hosting Tests A/B/C) declares a local `CatchFrame`, links it onto the chain,
-  and `setjmp(cf.buf)`. On the error path the frame is **unlinked first** so a
-  `simple-error` raised inside a handler propagates to the enclosing frame.
-- `simple-error` always `vm_throw`s to the current chain head. Inside a trap-error
-  BODY the frame's `in_trap_error=1`, so a `simple-error` raised in the body throws.
-  **C-level primitive type guards were removed** (the `ZINCVM_DEBUG` build and its
-  `PRIM_TYPE_ERROR` machinery are gone — the full OS bundle that needed them is
-  removed). Primary ownership of catchable runtime type errors is the Shen
-  safe-wrapper layer (`shen/primitives.shen`): each `safe.X` validates args and
-  raises a catchable `simple-error` before the raw primitive is called. The always-on
-  throw sites (not safe-wrapper-protected, not type guards) are: `simple-error`,
-  `fail`, `apply`/`appterm` non-callable + too-many-args, `env_pop`, `pos` OOB inside
-  `trap-error`, and eval-kl's catch.
-- `val_error` GC-allocates its message (no `strdup` leak).
-- The `alarm_jmp` (test TIMEOUT) and `repl_exit_jmp` (REPL EOF) mechanisms are
-  separate from the catch chain and unaffected.
-- This routes OOB access sentinels (tag=0,n=0 from empty-env vm_exec calls) through
-  error handlers, letting `bound?` correctly return false for unbound symbols.
+- `simple-error` always throws to the current chain head. Inside a trap-error
+  BODY the frame is marked in-trap, so a `simple-error` raised in the body throws.
+  **Primitive type guards were removed** — primary ownership of catchable
+  runtime type errors is the Shen safe-wrapper layer (`shen/primitives.shen`):
+  each `safe.X` validates args and raises a catchable `simple-error` before the
+  raw primitive is called. The always-on throw sites (not safe-wrapper-protected,
+  not type guards) are: `simple-error`, `fail`, `apply`/`appterm` non-callable +
+  too-many-args, `env_pop`, `pos` OOB inside `trap-error`, and eval-kl's catch.
+- This routes out-of-bounds access sentinels through error handlers, letting
+  `bound?` correctly return false for unbound symbols.
 
 ## ZINC calling convention (STANDARD — fully aligned)
 
@@ -628,7 +556,7 @@ relies on auto-push (see "Compiler changes" below).
 **Compiler changes:**
 - `shen/zinc.shen` (`zinc-c` and `zinc-t`): relies on auto-push. Multi-arg
   primitives and function calls emit bare operand sequences — no `push` opcode.
-- The `push` (`u`) opcode has been REMOVED from the C VM, the compiler pipeline
+- The `push` (`u`) opcode has been REMOVED from the VM, the compiler pipeline
   (compile.shen/util.shen/types.shen), and the metacircular interp. It is dead:
   the compiler never emits it, and the bundle/test bytecode contain no `u`.
   `pushmark` (`m`) remains and is still emitted by `zinc-c`/`zinc-t`.
@@ -670,18 +598,18 @@ remains the "current value" at every step, keeping all existing prim rules compa
   caller context saved as `[C E Rest]` return frame.
 - **Multi-arg `appterm`**: Same arg collection via `collect-apply-args`.
   Tail-call semantics: replaces saved stack in return frame (or starts fresh
-  at top level). Zero-arg check added (matches C VM).
-- **`collect-apply-args`**: depth-limited (max 64 args, matches C VM),
+  at top level). Zero-arg check added (matches the VM).
+- **`collect-apply-args`**: depth-limited (max 64 args, matches the VM),
   errors if mark is missing, signature `(list zinc-value) -> number -> (list zinc-value)`.
 - **Env ordering fix**: `(append (reverse Args) E1)` — newest bindings at
   head of env list, matching forward `lookup` in metacircular interp.
-  Equivalent to C VM's reverse-index `lookup_env`.
+  Equivalent to the VM's reverse-index `lookup_env`.
 
 ## REPL
 
-- `stinput`/`stoutput` C primitives added — return stdin/stdout VAL_STREAM.
-  Registered in init_globals so bundled closures find them via `global_get`.
-- `fflush(stdout)` in `write-byte` for piped output.
+- `stinput`/`stoutput` primitives added — return stdin/stdout streams.
+  Registered in init so bundled closures find them via the global table.
+- `write-byte` flushes for piped output.
 - `shen.initialise` (15-char name) must be called before `shen.repl`. Wraps
   `shen.initialise-environment` → `shen.initialise-lambda-forms` →
   `shen.initialise-signedfuncs`.
@@ -690,16 +618,13 @@ remains the "current value" at every step, keeping all existing prim rules compa
   a symbol" (caught by trap-error), second call returns false. In test mode
   (stdin at EOF), shen.repl returns false immediately.
 - **Key fixes enabling REPL:**
-  - `*stinput*`/`*stoutput*`/`*sterror*` initialized as VAL_STREAM globals after parse_bundle
+  - `*stinput*`/`*stoutput*`/`*sterror*` initialized as stream globals after bundle load
   - `write-byte` arg order fixed (ZINC RTL: byte first, stream last)
-  - CALL_STACK_DEPTH bumped from 8192 to 65536 (shen.initialise needs ~65K frames)
-  - GC heap at 256MB (64MB exhausted on non-ASan builds)
+  - Call-stack depth was bumped (shen.initialise needs ~65K frames)
   - Stack isolation per CallFrame (commit 00299cf)
   - read-byte/write-byte bypass stack for stream args (commit 6247571)
-  - trap-error jmp_buf save/restore to prevent use-after-return (commit 6247571)
-  - Tail-call mark cleanup in OP_RETURN/OP_APPTERM (commit 27bdcbe)
-- `shen.initialise` REPL bytecode: `(mn[1:n]0ug[15:s]shen.initialisep)`
-- `shen.repl` with input: `(mn[1:n]0P[9:s]emptylistus[7:s]successP[4:s]consug[9:s]shen.replp)`
+  - trap-error state save/restore to prevent use-after-return (commit 6247571)
+  - Tail-call mark cleanup in return/appterm (commit 27bdcbe)
 - Name confusion: `shen.initialise_environment` (underscore, 27 chars) is a
   DIFFERENT function — only resets shen.*call*/shen.*infs* counters. Called by
   shen.loop each iteration. Not the setup function.

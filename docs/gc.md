@@ -1,11 +1,19 @@
-# GC Plan for zincvm — moving generational collector
+# GC Design — moving generational collector
 
-Status: approved design. Companion doc: `moving-gc-validation.md` (advisor
-validation, hazards, full line references).
+Status: approved design, implemented. Companion doc: `moving-gc-validation.md`
+(advisor validation, hazards, full line references).
+
+> **Retargeting note:** this plan was designed against the deleted C-era VM
+> (`zincvm.c` / `gc.c`) and is now implemented by the custom Zig GC in
+> `zig/src/gc/` (`types.zig`, `heap.zig`, `collect.zig`, `scan.zig`,
+> `roots.zig`). The design (2-site write barrier, precise typed shadow stack,
+> nursery scavenge, Cheney drain invariant) is current; bare `zincvm.c:`-style
+> line numbers and `zinctest*` test-suite names below are C-era references kept
+> as a record. There is no Boehm/libgc dependency anywhere anymore.
 
 ## Why
 
-`vm/zincvm.c` currently uses Boehm GC (non-moving, conservative). Shen is a
+When this plan was written, the C VM used Boehm GC (non-moving, conservative). Shen is a
 purely functional language: the ONLY mutable heap values are **vectors**
 (mutable element array) and the **global table**. Everything else (cons, car,
 cdr, closures, symbols, strings, streams) is immutable.
@@ -15,11 +23,11 @@ unless something mutates. We exploit that to build a cheap moving generational
 collector with a **write barrier that fires at only two sites**.
 
 Confirmed mutation surface (independently traced):
-- `vm/zincvm.c:962` — `address->` primitive: `vec.vector.data[i] = val;` (the
-  only write to any GC-managed pointer array).
-- `vm/zincvm.c:358` — `global_set()`, the single funnel for global-table writes;
-  reached at runtime only via the `set` primitive (line 1161). Other `global_set`
-  calls are init/startup only.
+- the `address->` primitive (now `zig/src/vm/prims.zig`): `data[i] = val` on the
+  vector element array (the only write to any GC-managed pointer array).
+- `global_set()` (now `zig/src/vm/tables.zig`), the single funnel for
+  global-table writes; reached at runtime only via the `set` primitive. Other
+  `global_set` calls are init/startup only.
 
 ## Target design
 
@@ -45,7 +53,7 @@ Goals, in priority order:
 ## Phased implementation
 
 ### Phase 0 — Preparation (no GC change)
-Gate: `make test` still passes on Boehm.
+Gate (Boehm era): `make test` still passed on Boehm.
 
 - [ ] Add `volatile` to `Value` locals read after `longjmp`: `handler`
       (`trap-error`, ~line 969), `result` (`eval-kl`, ~line 1185),
@@ -63,7 +71,7 @@ Gate: `make test` still passes on Boehm.
 Gate: 34 release + 39 debug + self-hosting + 100K-cons stress +
 forwarding-pointer test.
 
-- [ ] Collector core (new `vm/gc.c` or inline): two mmap'd semi-spaces, bump
+- [ ] Collector core (the new collector; now `zig/src/gc/collect.zig`): two mmap'd semi-spaces, bump
       alloc, Cheney evacuation, forwarding via header word or address table.
 - [ ] Replace all `GC_MALLOC`/`GC_VALUE`/`GC_STR`/`GC_VALUE_ARRAY` with
       `gc_alloc`/`gc_alloc_atomic`; decide scanned-vs-atomic per site
@@ -71,7 +79,7 @@ forwarding-pointer test.
       atomic).
 - [ ] Root scanning: conservative C-stack scan with pinning of ambiguous
       roots + precise scan of the registered fixed roots.
-- [ ] Fix nested `val_cons` hazard (`vm/zincvm.c:161-163`): force stack spill
+- [ ] Fix nested `val_cons` hazard: force stack spill
       of the in-progress `Value v` across the second `gc_alloc`, or allocate
       both cells then write.
 - [ ] Block SIGALRM during GC (`sigprocmask`); `volatile` after `longjmp`.
@@ -124,7 +132,7 @@ NOT fixed by the Step 5 write barrier (the barrier only removes the O(heap) full
 old-gen scan cost per scavenge, not pinning behavior). Levers if it matters
 later: larger nursery, Step 5 barrier, precise roots.
 
-**Barrier site 1 — `address->` vector write (zincvm.c:912): DONE (Step 5).**
+**Barrier site 1 — `address->` vector write: DONE (Step 5).**
 ```c
 vec.vector.data[i] = val;
 if (vec.vector.data &&
@@ -147,8 +155,8 @@ test (`page > nursery_last`) silently misses these promoted-in-place arrays —
 exactly the case the barrier must cover. `gc_in_oldgen` therefore returns
 `space[page] == current_space`. (Diagnosed via gc_nursery_tests Test 6.)
 
-**Barrier site 2 — `global_set` (zincvm.c:358): DONE (dirty-globals bitset).**
-`global_table` is a precise typed walker scanned every collect (gc.c:437-461).
+**Barrier site 2 — `global_set`: DONE (dirty-globals bitset).**
+`global_table` is a precise typed walker scanned every collect.
 Post-4a.6 there is no conservative pinning or extra_roots — the typed walker
 scans only `.closure` fields, so there is no page-granular over-retention.
 The bitset reduces nursery-scavenge cost by skipping non-dirty globals:
@@ -160,7 +168,7 @@ lifecycle as dirty_vectors.  Fixed 256-byte bitset (GLOBAL_TABLE_MAX=2048 bits,
 no overflow path).  Instrumented via `gc_dirty_globals_fired` (0→1 transitions)
 and `gc_dirty_globals_scanned` (per-scavenge scan count).
 
-**Ordered steps (each gated by `make test && make run-bundle`):
+**Ordered steps (each gated by the C-era `make test && make run-bundle`; today `make test` / `make gate`):
 ** 1) [DONE] Add `NURSERY`+region+predicates (no behavior change); 2) [DONE] route
 `gc_alloc` to the nursery bump + `gc_alloc_oldgen` for large; 3) [DONE] teach
 `collect()` to evacuate nursery pages; 4) [DONE via Step 3] implement
@@ -192,9 +200,9 @@ old-gen full `collect()` now fire on independent, pre-emptive triggers:
   coupling is sequential promotion pressure.
 - **Instrumentation** (`gc.h` externs): `gc_preemptive_scavenge_count`,
   `gc_reactive_scavenge_count`, `gc_full_collect_count`. Test 7 in
-  `gc_nursery_tests()` (zinctest) burst-allocates 30K dead objects and asserts
+  `gc_nursery_tests()` (C-era zinctest suite) burst-allocates 30K dead objects and asserts
   the pre-emptive trigger fires while the reactive path never does. Probe
-  location is informational (the `-O0 -g` `zinctest-gc` build) and not a failure
+  location is informational (the C-era `-O0 -g` probe build) and not a failure
   criterion.
 
 **Top risks:** (1) `scavenge_to_space` — handled by the no-flip pin-in-place
@@ -231,7 +239,7 @@ deleted without losing any root:
   at `done:`; `argbuf` transient around each apply/appterm); `exec_primitive`
   (`val_cons` car+cdr, `trap-error` body+handler, `eval-kl` 7 intermediates +
   watermark, `error-to-string`, new `val_string_from` helper for tlstr/hdstr/pos);
-  load/init (`call_closure1/3`, `--repl`, self-hosting tests).
+  load/init (`call_closure1/3`, self-hosting tests).
 - **Typed walkers** replace the 2 conservative `extra_roots`: `global_table`
   scans only `.closure` (skips the strdup'd `.name`), `traced_code` scans each
   `Instr*`. Registered via `gc_register_global_table`/`gc_register_traced_code`.
@@ -256,8 +264,8 @@ machinery were DELETED from `collect()`/`collect_nursery()`; `gc_scan_roots` +
 the typed walkers are the SOLE authoritative root set. Also removed:
 `GC_ROOTS_DIFF` instrumentation, `STACKINC`/`stackbase`/`gc_reg_buf`, and
 `<setjmp.h>` from gc.c. `gc_init` no longer takes a `stack_base` param;
-`zincvm.c`/`zinctest.c` register typed walkers instead of `gc_set_extra_roots`.
-`gc_root_churn_test` (zinctest.c) is the standing post-flip missed-root
+the VM front-end registers typed walkers instead of `gc_set_extra_roots`.
+`gc_root_churn_test` (a standing post-flip missed-root test, now in the zig GC
 detector — a 5000-node nursery tree held only by a `ROOT_VALUE` precise root,
 run across 200K iterations of transient garbage + forced scavenges + full
 collects. Verified: 34/34 release, 39/39 debug, 34/34 UBSan, reduced bundle
@@ -297,7 +305,7 @@ objects fall through to `move_internal`. The Cheney drain is fed by an
 freshly-copied destination pages. After the drain ALL nursery pages are reset to
 `NURSERY` and the bump cursor rewound — the nursery is fully reusable every cycle.
 `dirty_vectors` stay correct via the existing clear-on-scavenge-end. Verified by
-zinctest Tests 9-13 (fully-reclaimed, copy-not-pin, deep-500-node-graph, no
+GC tests 9-13 (fully-reclaimed, copy-not-pin, deep-500-node-graph, no
 other_space, cyclic-old-gen-no-infinite-loop).
 
 **Phase 4c — BiBOP size-class pages (CLOSED, not-applicable — decided 2026-08-06).**
@@ -315,7 +323,7 @@ Rejected as net-negative for this collector. Rationale:
   every semi-space flip is O(live), for at most ~6% intra-page slack on a
   single class.
 Data-driven revisit is now possible: the `gc_alloc_class_count` histogram
-(printed by zinctest's `GC alloc classes:` line) counts allocation requests per
+(a per-GC-type-tag allocation histogram) counts allocation requests per
 GC type tag, so a future 4c decision can be based on observed per-class churn
 rather than conjecture.
 

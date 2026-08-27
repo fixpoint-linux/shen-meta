@@ -1,5 +1,0 @@
-f,stmt_id,base_var
-main,62,env_driver
-main,92,env_driver
-main,122,env_driver
-main,152,env_init

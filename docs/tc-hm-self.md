@@ -111,6 +111,6 @@ the accessor/inference layer as a known, uniform checker gap.
 
 ## Governance
 
-Opt-in, not gating — mirrors `make gc-verify` / `make bundle-verify`.  `tc-hm`
+Opt-in, not gating — mirrors `make bundle-verify`.  `tc-hm`
 and `tc-hm-self` are NOT in `make` / `make test`.  A regression in the passing
 subset is visible as a changing OK/FAIL count in `make tc-hm-self` output.

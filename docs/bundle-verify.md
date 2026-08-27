@@ -7,7 +7,7 @@ Status: **PLAN — Check A (safe subset) in progress. Check B (type-safety) expl
 Mechanically verify that the Shen meta-interpreter bundle (`globals.csexp`) is **in the safe
 subset** — i.e. every closure's bytecode uses only known opcodes, references only resolvable
 globals and allowlisted primitives, and every call site supplies **full arity** (no curried /
-partial-application calls, which crash the C VM with `apply non-callable`). Unlike gc-verify,
+partial-application calls, which crash the VM with `apply non-callable`).
 this is a **sound gate** (conservative-complete for the subset), not just a candidate generator.
 
 ## Verdict (from feasibility assessment, 2026-08-10)
@@ -36,15 +36,15 @@ shapes) are already flattened by `shen->kl`. So no single layer sees everything:
 
 **Input:** `globals.csexp` (411 KB, ~1269 closures). Each closure `(name (c(<flat instr stream>)))`.
 Wire format: atoms `[len:type]value` (type `s`/`n`/`S`/`b`); single-char opcodes
-(`vm/zinctypes.h:66-83`).
+(see AGENTS.md; defined in the Zig VM).
 
-**Opcode map** (from `vm/zinctypes.h`):
+**Opcode map** (single-char opcodes, see AGENTS.md; shared types now in `zig/src/gc/types.zig` + the Zig VM):
 `a` access, `g` global, `f` jmpf, `j` jmp, `t` appterm, `p` apply, `m` pushmark, `c` cur,
 `r` grab, `v` return, `e` let, `d` endlet, `n` number, `S` string, `s` symbol, `b` boolean,
 `P` prim. `OP_COUNT=17`.
 
-**Fact extractor** (`extract_bundle.py`, Python stdlib, mirrors gc-verify's `extract.py`
-no-deps discipline). `parse_bundle` in `vm/zincvm.c` is the reference decoder.
+**Fact extractor** (`extract_bundle.py`, Python stdlib). `parse_bundle` in
+`zig/src/vm/parser.zig` is the reference decoder.
 
 **Facts:**
 ```
@@ -79,8 +79,8 @@ env lists), not callables; concrete calls go to named globals (`lookup`, `lookup
 
 ## Check A2 — source-level (Datalog, different extractor)
 
-**Input:** the 9 `.shen` files. Extractor uses `read-file-raw` (`load.shen`) or a Python
-s-expr reader → CSV.
+**Input:** the 9 `.shen` files. Extractor uses a Python s-expr reader (mirroring
+`load.shen`'s `parse-string`/`find-string-end` semantics) → CSV.
 
 **Rules (sound gates for what survives compilation):**
 - `unsafe_construct` — head ∉ allowlist (define/lambda/let/if/and/or/do/set/where/`<-`/`%%`/
@@ -131,11 +131,11 @@ no refined types). Otherwise Phase 5 provides the real proof and subsumes it.
 
 ## Architecture / reuse
 
-Build `tools/bundle-verify/` as a **sibling** of `tools/gc-verify/`. Do NOT generalize the
-gc-verify extractor (csexp parser ≠ clang AST). Copy the **governance pattern**: Makefile
+`tools/bundle-verify/` is standalone (its predecessor `tools/gc-verify/` — a clang-AST
+GC verifier over the deleted C sources — has been removed entirely). Copy the **governance pattern**: Makefile
 `run`/`snapshot`/`selftest`/`clean` + `expected/` + `check_results.sh` (FAIL/WARN/OK) + the
 "verifier + candidate generator, NOT an oracle" framing. Wire as opt-in `make bundle-verify`
-(not part of `make`/`make test`/`make run-bundle`).
+(not part of `make`/`make test`/`make gate`).
 
 ## Phased rollout
 
@@ -154,7 +154,7 @@ gc-verify extractor (csexp parser ≠ clang AST). Copy the **governance pattern*
 the allowlist; all call sites full-arity (unconditionally if diagnostic empty, else modulo flow
 precision); no source constructs outside the subset; no non-linear / `@p` patterns.
 
-**It does NOT prove:** C VM correctness (gc-verify's job); `shen->kl` semantic correctness (a
+**It does NOT prove:** VM correctness (the deleted gc-verify tool's former job); `shen->kl` semantic correctness (a
 compiler bug could emit structurally-valid but wrong bytecode); GC/memory safety; type safety
 (orthogonal).
 

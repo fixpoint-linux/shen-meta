@@ -1,20 +1,17 @@
 (tc -)
 (load "shen/toplevel.shen")
 
-\* interp-load / interp-load-safe (the HOST-only read-file loaders) live in
-   shen/interp-load.shen, which the bundle builders do not load.  The runtime
-   self-hosting loader that stays here is interp-load-raw (read-file-raw ->
-   read-file-as-string, a real primitive). *\
-
-(define interp-load-raw
-  File -> (interp-eval-all (read-file-raw File)))
-
-(define interp-eval-all
-  [] -> loaded
-  [E | Rest] -> (do (interp-eval E) (interp-eval-all Rest)))
-
-(define interp-eval-safe
-  E -> (trap-error (interp-eval E) (/. X X)))
+\* The raw .kl OS loader family (interp-load-raw / interp-eval-all /
+   interp-eval-safe / read-file-raw and the parse-exprs / parse-expr /
+   parse-list / parse-list-tail / parse-list-literal / parse-atom /
+   scan-atom-end raw parser) has been REMOVED — the full Shen OS (.kl
+   kernel) runtime-load path is dead.  What stays here are the flat-shen
+   helper primitives that shen-kl-helpers.shen's shen-parse-* family and the
+   host build reuse: string prims (c-strlen / char-code / substring /
+   substring-h / strlen / strlen-acc / chars->str), char predicates
+   (digit-ch? / ws-ch? / ws-int? / digit-int?), number parsing
+   (str->num / str->num-acc / parse-num-str), and scanner helpers
+   (skip-comment / skip-ws / find-string-end / parse-string). *\
 
 \* Host-compile dummies for c-strlen / char-code / substring.  These exist so
    the HOST shen-scheme `load` (serialize-reduced.shen line 5) can compile this
@@ -128,105 +125,3 @@
   Str Pos Len ->
   (let End (find-string-end Str Pos Len)
     [(substring Str Pos (- End Pos)) (+ End 1)]))
-
-\* scan-atom-end: scan forward to atom delimiter, using char-code.  Returns
-   EndPos.  Delimiters: ws, (, ), ", \. *\
-(define scan-atom-end
-  Str Pos Len ->
-  (if (>= Pos Len)
-      Pos
-      (let N (char-code Str Pos)
-        (if (or (ws-int? N)
-                (= N 40)  \* ( *\
-                (= N 41)  \* ) *\
-                (= N 91)  \* [ *\
-                (= N 93)  \* ] *\
-                (= N 34)  \* " *\
-                (= N 92)) \* \ *\
-            Pos
-            (scan-atom-end Str (+ Pos 1) Len)))))
-
-\* parse-atom: substring slice + intern/number.  O(k), no char-list/reverse. *\
-(define parse-atom
-  Str Pos Len ->
-  (let End (scan-atom-end Str Pos Len)
-    (let Token (substring Str Pos (- End Pos))
-      (if (= Token "")
-          [(intern "") End]
-          (if (or (digit-int? (char-code Token 0))
-                  (and (> (c-strlen Token) 1)
-                       (= (char-code Token 0) 45)   \* '-' *\
-                       (digit-int? (char-code Token 1))))
-              [(parse-num-str Token) End]
-              (if (= Token "true")
-                  [true End]
-                  (if (= Token "false")
-                      [false End]
-                      [(intern Token) End])))))))
-
-(define parse-list-tail
-  Str Pos Len ->
-  (let P (skip-ws Str Pos Len)
-    (if (>= P Len)
-        (simple-error "unterminated list")
-        (if (= (char-code Str P) 41)  \* ) *\
-            [[] (+ P 1)]
-            (let Pair1 (parse-expr Str P Len)
-              (let First (hd Pair1)
-                (let AfterFirst (hd (tl Pair1))
-                  (let Pair2 (parse-list-tail Str AfterFirst Len)
-                    (let Rest (hd Pair2)
-                      (let AfterRest (hd (tl Pair2))
-                        [[First | Rest] AfterRest]))))))))))
-
-(define parse-list-literal
-  Str Pos Len ->
-  (let P (skip-ws Str Pos Len)
-    (if (>= P Len)
-        (simple-error "unterminated list literal")
-        (if (= (char-code Str P) 93)  \* ] *\
-            [[] (+ P 1)]
-            (let Pair1 (parse-expr Str P Len)
-              (let First (hd Pair1)
-                (let AfterFirst (hd (tl Pair1))
-                  (let Pair2 (parse-list-literal Str AfterFirst Len)
-                    (let Rest (hd Pair2)
-                      (let AfterRest (hd (tl Pair2))
-                        [[cons First Rest] AfterRest]))))))))))
-
-(define parse-list
-  Str Pos Len -> (parse-list-tail Str Pos Len))
-
-(define parse-expr
-  Str Pos Len ->
-  (let P (skip-ws Str Pos Len)
-    (if (>= P Len)
-        (simple-error "unexpected end of input")
-        (let N (char-code Str P)
-          (if (= N 40)  \* ( *\
-              (parse-list Str (+ P 1) Len)
-              (if (= N 41)  \* ) *\
-                  (simple-error "unexpected )")
-                  (if (= N 34)  \* " *\
-                      (parse-string Str (+ P 1) Len)
-                      (if (= N 91)  \* [ *\
-                          (parse-list-literal Str (+ P 1) Len)
-                          (parse-atom Str P Len)))))))))
-
-(define parse-exprs
-  Str Pos Len ->
-  (let P (skip-ws Str Pos Len)
-    (if (>= P Len)
-        [[] P]
-        (let Pair1 (parse-expr Str P Len)
-          (let Expr (hd Pair1)
-            (let NewPos (hd (tl Pair1))
-              (let Pair2 (parse-exprs Str NewPos Len)
-                (let Rest (hd Pair2)
-                  (let FinalPos (hd (tl Pair2))
-                    [[Expr | Rest] FinalPos])))))))))
-
-(define read-file-raw
-  Path -> (let Str (read-file-as-string Path)
-            (let Len (strlen Str)
-              (hd (parse-exprs Str 0 Len)))))

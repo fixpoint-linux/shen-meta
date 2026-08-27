@@ -2,35 +2,26 @@
 # ...except the shensh shell source (committed; it is NOT OS kernel .kl)
 !shell/*.kl
 *.o
-zincvm
-zincdec
-zinctest
-shensh
+# ...except the M0 zincdec diff fixtures (a directory named 'zincdec' would
+# collide with old C-binary ignore entries; the binaries themselves are gone —
+# the runtime is the Zig port, its artifacts are ignored below).
+!zig/tests/fixtures/zincdec/
 *.csexp
 /tmp/
 core.*
 .ape-*
 a.out
-zincvm-debug
-zinctest-debug
-zinctest-asan
-# cosmocc intermediate build products (Makefile extracts the .com.dbg ELF)
+# cosmocc intermediate build products (legacy, from the removed C build)
 *.ape
 *.ape.com.dbg
 *.ape.aarch64.elf
 *.com.dbg
 *.aarch64.elf
 *.aarch64
-# GC-safety verifier generated output
-tools/gc-verify/facts/
-tools/gc-verify/out/
-tools/gc-verify/__pycache__/
 # Bundle safe-subset verifier generated output
 tools/bundle-verify/facts/
 tools/bundle-verify/out/
 tools/bundle-verify/__pycache__/
-# scratch / build artifacts
-zinctest-osload*
 .exec_test/
 # fixpoint docs site build artifacts (shen-meta MFE site)
 node_modules/
@@ -38,7 +29,7 @@ elm-stuff/
 dist/
 vendor/@mfe/
 
-# Zig port build artifacts (shen/zig — the shensh-in-Zig port)
+# Zig port build artifacts (the sole runtime; zig/zig-out is the default -p prefix)
 zig/.zig-cache/
 zig/zig-out/
 zig/.scratch*

@@ -15,7 +15,7 @@
                 strings / numbers / interned symbols) - the metacircular
                 interp auto-tags primitive results (U1 finding); NEVER
                 hand-tag.  Plan encoding (decode_redir/decode_cmd in
-                vm/zincvm.c): Chain [op Pipeline] op in {seq,and,or};
+                zig/src/vm/execplan.zig): Chain [op Pipeline] op in {seq,and,or};
                 Cmd [Argv Redirs Sub] with Sub = [] plain | nested plan;
                 Redir [op fd target] with op in {in,out,append,dup,hdoc,
                 hstr} (gt->out, gtgt->append, lt->in), fd 0 for in/hdoc/
