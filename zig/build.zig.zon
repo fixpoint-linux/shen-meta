@@ -32,6 +32,13 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        // zinc-vm: the shared GC + ZINC VM executor package (extraction P3).
+        // Path dependency for local dev; planned to become a submodule/url
+        // dependency in a later phase.  Relative to this manifest (shen/zig),
+        // so ../../zinc-vm reaches the sibling repo under ~/projects.
+        .zinc_vm = .{
+            .path = "../../zinc-vm",
+        },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding
