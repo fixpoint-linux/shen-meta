@@ -7,3 +7,6 @@
 [submodule "vendor/dhake"]
 	path = vendor/dhake
 	url = https://github.com/fixpoint-linux/dhake.git
+[submodule "vendor/zinc-vm"]
+	path = vendor/zinc-vm
+	url = https://github.com/fixpoint-linux/zinc-vm.git
